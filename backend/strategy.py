@@ -71,13 +71,21 @@ def _validate(plan: dict) -> None:
     plan.setdefault("notes", "")
 
 
-def save_plan(plan: dict) -> None:
+def _plan_key(resume_id=None) -> str:
+    return f"collect_plan:{int(resume_id)}" if resume_id is not None else "collect_plan"
+
+
+def save_plan(plan: dict, resume_id=None) -> None:
     from .db import set_setting
-    set_setting("collect_plan", plan)
+    set_setting(_plan_key(resume_id), plan)
 
 
-def get_plan() -> dict:
+def get_plan(resume_id=None) -> dict:
     from .db import get_setting
-    return get_setting("collect_plan", {"searches": [], "companies": [],
-                                        "directions": [], "dictionary_patch": {},
-                                        "notes": ""})
+    default = {"searches": [], "companies": [], "directions": [],
+               "dictionary_patch": {}, "notes": ""}
+    plan = get_setting(_plan_key(resume_id), None)
+    if plan is None and resume_id is not None:
+        # 首次升级沿用旧计划，保存后即与简历独立。
+        plan = get_setting("collect_plan", None)
+    return plan or default

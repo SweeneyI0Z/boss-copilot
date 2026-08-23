@@ -124,6 +124,24 @@ def _type_and_send(cdp_cli, sid, info, text):
                   "windowsVirtualKeyCode": 13}, sid)
 
 
+def _confirm_sent(cdp_cli, sid, text: str) -> dict:
+    """只在消息气泡出现且输入框已清空时确认成功。"""
+    target = json.dumps(text, ensure_ascii=False)
+    js = f"""
+    (() => {{
+      const target = {target};
+      const roots = [...document.querySelectorAll(
+        '.chat-conversation, .chat-record, .message-content, .chat-message, .message-item')];
+      const found = roots.some(el => (el.innerText || '').includes(target));
+      const input = document.querySelector(
+        '.chat-input, textarea[placeholder*=说], [contenteditable=true], div[contenteditable]');
+      const value = input ? (input.value || input.innerText || '').trim() : '';
+      return JSON.stringify({{found, inputEmpty: value === ''}});
+    }})()
+    """
+    return _eval_json(cdp_cli, sid, js)
+
+
 def send_one(cdp_cli, sid, job_link: str, text: str) -> dict:
     """发送单条。返回 {ok, halt_reason?}。任何限制信号立即向上抛熔断。"""
     cdp_cli.send("Page.navigate", {"url": job_link}, sid)
@@ -154,13 +172,17 @@ def send_one(cdp_cli, sid, job_link: str, text: str) -> dict:
     if not info.get("found"):
         return {"ok": False, "error": "未找到聊天输入框"}
     _type_and_send(cdp_cli, sid, info, text)
-    time.sleep(2.0)
-    page = _page_text(cdp_cli, sid)
-    if LIMIT_PATTERNS.search(page):
-        return {"ok": False, "halt_reason": "发送后出现限制文案"}
-    after = _eval_json(cdp_cli, sid, FIND_INPUT_JS)
-    cleared = after.get("found") is True   # 输入框仍可用即视为流程完成
-    return {"ok": bool(cleared)}
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        time.sleep(1.0)
+        page = _page_text(cdp_cli, sid)
+        if LIMIT_PATTERNS.search(page):
+            return {"ok": False, "halt_reason": "发送后出现限制文案"}
+        confirmed = _confirm_sent(cdp_cli, sid, text)
+        if confirmed.get("found") and confirmed.get("inputEmpty"):
+            return {"ok": True, "confirmed": True}
+    return {"ok": False, "needs_review": True,
+            "error": "页面未出现可确认的已发送消息，请人工核验，系统不会自动重试"}
 
 
 def send_batch() -> dict:
@@ -183,7 +205,7 @@ def send_batch() -> dict:
         return {"ok": False, "error": "沟通号未登录：请到「账号管理」页打开登录页完成登录"}
 
     batch = greeting.pending_batch()
-    sent, skipped, failed = 0, [], []
+    sent, skipped, failed, needs_review = 0, [], [], []
     import websocket
 
     class _Cdp:
@@ -191,8 +213,9 @@ def send_batch() -> dict:
         def __init__(self):
             import urllib.request
             port = cdp.config.ACCOUNTS[account]["cdp_port"]
-            targets = json.loads(urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/json").read())
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            targets = json.loads(opener.open(
+                f"http://127.0.0.1:{port}/json", timeout=5).read())
             page = next((t for t in targets if t["type"] == "page"), None)
             self.ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=15)
             self.sid = 1
@@ -223,6 +246,12 @@ def send_batch() -> dict:
             if company_recently_sent(item["company"]):
                 skipped.append({**item, "why": "同公司30天内已发"})
                 continue
+            conn = get_db()
+            conn.execute(
+                "UPDATE greetings SET status='sending', delivery_channel='auto', "
+                "delivery_status='sending', updated_at=? WHERE id=?",
+                (now_iso(), item["id"]))
+            conn.commit()
             try:
                 result = send_one(cli, None, item["job_link"], item["chosen"])
             except (RuntimeError, OSError, websocket.WebSocketException) as e:
@@ -230,8 +259,9 @@ def send_batch() -> dict:
             conn = get_db()
             if result.get("ok"):
                 conn.execute(
-                    "UPDATE greetings SET status='sent', sent_at=? WHERE id=?",
-                    (now_iso(), item["id"]))
+                    "UPDATE greetings SET status='sent', sent_at=?, confirmed_at=?, "
+                    "delivery_channel='auto', delivery_status='confirmed', updated_at=? "
+                    "WHERE id=?", (now_iso(), now_iso(), now_iso(), item["id"]))
                 conn.execute(
                     "INSERT INTO sent_log(day, job_key, company, ok, created_at) "
                     "VALUES(?,?,?,?,?)",
@@ -244,9 +274,18 @@ def send_batch() -> dict:
                     halt(result["halt_reason"])
                     skipped.append({**item, "why": f"熔断: {result['halt_reason']}"})
                     break
+                if result.get("needs_review"):
+                    conn.execute(
+                        "UPDATE greetings SET status='needs_review', delivery_channel='auto', "
+                        "delivery_status='needs_review', error=?, updated_at=? WHERE id=?",
+                        ((result.get("error") or "待人工核验")[:200], now_iso(), item["id"]))
+                    conn.commit()
+                    needs_review.append({**item, "error": result.get("error")})
+                    break
                 conn.execute(
-                    "UPDATE greetings SET status='failed', error=? WHERE id=?",
-                    ((result.get("error") or "unknown")[:200], item["id"]))
+                    "UPDATE greetings SET status='failed', delivery_status='failed', "
+                    "error=?, updated_at=? WHERE id=?",
+                    ((result.get("error") or "unknown")[:200], now_iso(), item["id"]))
                 conn.commit()
                 failed.append({**item, "error": result.get("error")})
             gap = random.uniform(int(get_setting("send_gap_min_sec", 30)),
@@ -255,4 +294,4 @@ def send_batch() -> dict:
     finally:
         cli.close()
     return {"ok": True, "sent": sent, "skipped": skipped, "failed": failed,
-            "halted": halted_today()}
+            "needs_review": needs_review, "halted": halted_today()}

@@ -33,11 +33,17 @@ def make_client():
 def chat(messages, client=None, temperature=0.3, max_tokens=2000) -> str:
     """普通对话调用，返回文本。"""
     from .db import get_setting
-    cli = client or make_client()
-    resp = cli.chat.completions.create(
-        model=get_setting("llm_model"), messages=messages,
-        temperature=temperature, max_tokens=max_tokens)
-    return resp.choices[0].message.content or ""
+    try:
+        cli = client or make_client()
+        resp = cli.chat.completions.create(
+            model=get_setting("llm_model"), messages=messages,
+            temperature=temperature, max_tokens=max_tokens)
+        return resp.choices[0].message.content or ""
+    except LLMError:
+        raise
+    except Exception as e:
+        message = str(e).strip() or e.__class__.__name__
+        raise LLMError(f"LLM 调用失败：{message}") from e
 
 
 def test_connection(base_url: str, api_key: str, model: str, client=None) -> dict:

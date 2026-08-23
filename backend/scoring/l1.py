@@ -223,36 +223,97 @@ def score_job(job: dict, jd_text: str, dictionary: dict, expect: dict) -> dict:
 
 
 # ── 全量执行（只填空值；force=True 时重算并覆盖 L1 自身）──────────
-def run_l1(force: bool = False, keep_imported: bool = False) -> dict:
-    """keep_imported=True 时跳过 xlsx 导入的人工基线（l1_detail 含 source=imported）。"""
-    conn = get_db()
+def _merge_resume_dictionary(skill_profile: dict) -> dict:
+    """把全局规则词典与当前简历画像合并，避免多简历得到相同匹配分。"""
     dictionary = json.loads(
-        conn.execute("SELECT value FROM settings WHERE key='skill_dictionary'")
-        .fetchone()[0]) if conn.execute(
+        get_db().execute("SELECT value FROM settings WHERE key='skill_dictionary'")
+        .fetchone()[0]) if get_db().execute(
         "SELECT 1 FROM settings WHERE key='skill_dictionary'").fetchone() else \
         config.DEFAULT_SKILL_DICTIONARY
-    prof = conn.execute("SELECT expectations FROM profile WHERE id=1").fetchone()
-    expect = {**DEFAULT_EXPECT, **(json.loads(prof["expectations"] or "{}"))}
+    merged = {k: list(v) for k, v in dictionary.items()}
+    profile = skill_profile if isinstance(skill_profile, dict) else {}
+    for category in ("embedded", "comm_iot", "hardware", "ai_soft", "domain_algo",
+                     "half_weight"):
+        values = profile.get(category, [])
+        if isinstance(values, str):
+            values = [x.strip() for x in re.split(r"[,，|、\n]", values) if x.strip()]
+        if isinstance(values, list):
+            merged[category] = list(dict.fromkeys(merged.get(category, []) + values))
+    # 简单画像也可只维护一个 skills 数组；归入通用软件技能词典参与匹配。
+    generic = profile.get("skills", [])
+    if isinstance(generic, str):
+        generic = [x.strip() for x in re.split(r"[,，|、\n]", generic) if x.strip()]
+    if isinstance(generic, list):
+        merged["ai_soft"] = list(dict.fromkeys(merged.get("ai_soft", []) + generic))
+    return merged
 
+
+def _resume_context(resume_id: int) -> tuple:
+    from .. import resumes
+    resume = resumes.get_resume(resume_id)
+    expect = {**DEFAULT_EXPECT, **(resume.get("expectations") or {})}
+    dictionary = _merge_resume_dictionary(resume.get("skill_profile") or {})
+    return resume, expect, dictionary
+
+
+def run_l1(force: bool = False, keep_imported: bool = False,
+           resume_id: int = None, job_keys: list = None) -> dict:
+    """执行 L1。
+
+    未传 resume_id 时保留旧版写 jobs 的行为；显式传入时把结果写入
+    岗位×简历×修订表，导入基线只读且永不被引擎覆盖。
+    """
+    conn = get_db()
+    profile_mode = resume_id is not None
+    if profile_mode:
+        resume, expect, dictionary = _resume_context(int(resume_id))
+        revision = int(resume["revision"])
+    else:
+        dictionary = _merge_resume_dictionary({})
+        prof = conn.execute("SELECT expectations FROM profile WHERE id=1").fetchone()
+        expect = {**DEFAULT_EXPECT, **(json.loads(prof["expectations"] or "{}"))}
+        revision = None
+
+    where, args = ["j.status != 'excluded'"], []
+    if job_keys:
+        where.append("j.job_key IN (%s)" % ",".join("?" * len(job_keys)))
+        args.extend(job_keys)
     rows = conn.execute(
-        "SELECT j.job_key, j.*, d.jd FROM jobs j "
-        "LEFT JOIN job_details d ON d.job_key=j.job_key").fetchall()
+        "SELECT j.*, d.jd FROM jobs j LEFT JOIN job_details d ON d.job_key=j.job_key "
+        "WHERE " + " AND ".join(where), args).fetchall()
     scored = skipped = 0
     for r in rows:
         is_imported = "imported" in (r["l1_detail"] or "")
-        if keep_imported and is_imported:
-            skipped += 1
-            continue
-        if not force and r["l1_score"] is not None:
-            skipped += 1
-            continue
+        if profile_mode:
+            existing = conn.execute(
+                "SELECT l1_score FROM job_resume_scores WHERE job_key=? AND resume_id=? "
+                "AND resume_revision=?", (r["job_key"], resume_id, revision)).fetchone()
+            if not force and existing and existing["l1_score"] is not None:
+                skipped += 1
+                continue
+        else:
+            if keep_imported and is_imported:
+                skipped += 1
+                continue
+            if not force and r["l1_score"] is not None:
+                skipped += 1
+                continue
         result = score_job(dict(r), r["jd"] or "", dictionary, expect)
-        conn.execute(
-            "UPDATE jobs SET l1_score=?, l1_detail=?, match_rough=?, composite_rough=? "
-            "WHERE job_key=?",
-            (result["job_rough"],
-             json.dumps(result["l1_detail"], ensure_ascii=False),
-             result["match_rough"], result["composite_rough"], r["job_key"]))
+        detail_json = json.dumps(result["l1_detail"], ensure_ascii=False)
+        if profile_mode:
+            from .. import resumes
+            resumes.save_job_score(
+                r["job_key"], resume_id=resume_id, resume_revision=revision,
+                l1_score=result["job_rough"], l1_detail=result["l1_detail"],
+                match_rough=result["match_rough"],
+                composite_rough=result["composite_rough"], l1_source="engine")
+        else:
+            conn.execute(
+                "UPDATE jobs SET l1_score=?, l1_detail=?, match_rough=?, composite_rough=? "
+                "WHERE job_key=?",
+                (result["job_rough"], detail_json, result["match_rough"],
+                 result["composite_rough"], r["job_key"]))
         scored += 1
     conn.commit()
-    return {"scored": scored, "skipped": skipped, "total": len(rows)}
+    return {"scored": scored, "skipped": skipped, "total": len(rows),
+            "resume_id": resume_id, "resume_revision": revision}

@@ -74,7 +74,39 @@ def write_profile(body: ProfileIn):
     current = resumes.get_default_resume()
     updated = resumes.save_revision(
         current["id"], body.resume_text, expectations=body.expectations)
-    return {"ok": True, "resume": updated}
+    rescore = _rescore_resume(updated) if updated["revision"] != current["revision"] else None
+    return {"ok": True, "resume": updated, "rescore": rescore}
+
+
+_resume_score_state = {"running": False, "resume_id": None, "result": None}
+
+
+def _rescore_resume(resume: dict) -> dict:
+    """保存简历后同步重算 L1；收藏岗位 L2 在后台重评。"""
+    from . import llm as llm_mod
+    l1_result = scoring_l1.run_l1(force=True, resume_id=resume["id"])
+    favorite_keys = [row["job_key"] for row in get_db().execute(
+        "SELECT job_key FROM jobs WHERE favorite_at IS NOT NULL AND status='active'")]
+    background = bool(favorite_keys and llm_mod.configured())
+    if background and not _resume_score_state["running"]:
+        import threading
+
+        def _run():
+            from .scoring import l2 as scoring_l2
+            try:
+                _resume_score_state["result"] = scoring_l2.run_l2(
+                    limit=len(favorite_keys), only_missing=False,
+                    resume_id=resume["id"], job_keys=favorite_keys, force=True)
+            except Exception as e:
+                _resume_score_state["result"] = {"error": str(e)[:300]}
+            finally:
+                _resume_score_state["running"] = False
+
+        _resume_score_state.update({"running": True, "resume_id": resume["id"],
+                                    "result": None})
+        threading.Thread(target=_run, daemon=True).start()
+    return {"l1": l1_result, "favorite_l2_background": background,
+            "favorite_jobs": len(favorite_keys)}
 
 
 # ── 多简历档案 ──────────────────────────────────────────────────
@@ -89,10 +121,11 @@ def resumes_list(include_archived: bool = False):
 def resumes_create(body: dict):
     from . import resumes
     try:
-        return resumes.create_resume(
+        created = resumes.create_resume(
             body.get("name", ""), body.get("resume_text", ""),
             body.get("expectations"), body.get("skill_profile"),
             body.get("boss_resume_label", ""), bool(body.get("make_default")))
+        return {**created, "rescore": _rescore_resume(created)}
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -112,7 +145,11 @@ def resumes_update(resume_id: int, body: dict):
     allowed = {k: v for k, v in body.items() if k in {
         "name", "resume_text", "expectations", "skill_profile", "boss_resume_label"}}
     try:
-        return resumes.update_resume(resume_id, **allowed)
+        before = resumes.get_resume(resume_id)
+        updated = resumes.update_resume(resume_id, **allowed)
+        if updated["revision"] != before["revision"]:
+            updated["rescore"] = _rescore_resume(updated)
+        return updated
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -143,6 +180,20 @@ def resumes_default(resume_id: int):
         return resumes.set_default(resume_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+@app.post("/api/resumes/{resume_id}/rescore")
+def resumes_rescore(resume_id: int):
+    from . import resumes
+    try:
+        return _rescore_resume(resumes.get_resume(resume_id))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/resume-score/status")
+def resumes_rescore_status():
+    return dict(_resume_score_state)
 
 
 # ── 总览与岗位用户状态 ──────────────────────────────────────────
@@ -222,6 +273,28 @@ def application_confirm(job_key: str, body: dict = None):
         return applications.confirm_application(job_key, (body or {}).get("resume_id"))
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+@app.post("/api/applications/{job_key}/probe")
+def application_probe(job_key: str, body: dict = None):
+    from . import applications, platform_status
+    row = get_db().execute(
+        "SELECT job_link FROM jobs WHERE job_key=?", (job_key,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "岗位不存在")
+    result = platform_status.probe_job_page(row["job_link"])
+    if result.get("risk"):
+        from . import sender
+        sender.halt(result.get("hint", "平台状态探测出现风控信号"))
+    try:
+        saved = applications.record_probe_result(
+            job_key, (body or {}).get("resume_id"),
+            platform_confirmed=result.get("status") == "platform_confirmed",
+            evidence=result.get("evidence", ""), error=result.get("hint", ""))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    saved["probe"] = result
+    return saved
 
 
 @app.put("/api/applications/{job_key}")
@@ -418,8 +491,12 @@ def runs():
 
 @app.post("/api/score/l1")
 def run_l1(body: dict = None):
-    force = bool((body or {}).get("force"))
-    return scoring_l1.run_l1(force=force)
+    body = body or {}
+    resume_id = body.get("resume_id")
+    return scoring_l1.run_l1(
+        force=bool(body.get("force")),
+        resume_id=int(resume_id) if resume_id else None,
+        job_keys=body.get("job_keys"))
 
 
 @app.post("/api/score/l2")
@@ -430,7 +507,12 @@ def run_l2(body: dict = None):
     if not llm_mod.configured():
         raise HTTPException(400, "LLM 未配置：请在「设置」页填写 BYOK 信息")
     try:
-        return scoring_l2.run_l2(limit=int(body.get("limit", 10)))
+        resume_id = body.get("resume_id")
+        return scoring_l2.run_l2(
+            limit=int(body.get("limit", 10)),
+            only_missing=not bool(body.get("force")),
+            resume_id=int(resume_id) if resume_id else None,
+            job_keys=body.get("job_keys"), force=bool(body.get("force")))
     except llm_mod.LLMError as e:
         raise HTTPException(400, str(e))
 
@@ -438,28 +520,33 @@ def run_l2(body: dict = None):
 # ── AI 采集策略 ─────────────────────────────────────────────────
 
 @app.get("/api/strategy")
-def get_strategy():
-    return strategy.get_plan()
+def get_strategy(resume_id: Optional[int] = None):
+    return strategy.get_plan(resume_id)
 
 
 @app.post("/api/strategy/generate")
-def gen_strategy():
+def gen_strategy(body: dict = None):
     from . import llm as llm_mod
+    from . import resumes
     if not llm_mod.configured():
         raise HTTPException(400, "LLM 未配置：请在「设置」页填写 BYOK 信息")
-    prof = get_db().execute("SELECT resume_text, expectations FROM profile WHERE id=1").fetchone()
+    resume_id = (body or {}).get("resume_id")
     try:
-        plan = strategy.generate_plan(prof["resume_text"],
-                                      json.loads(prof["expectations"] or "{}"))
+        prof = resumes.get_default_resume() if not resume_id else resumes.get_resume(resume_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    try:
+        plan = strategy.generate_plan(prof["resume_text"], prof["expectations"])
     except llm_mod.LLMError as e:
         raise HTTPException(400, str(e))
-    strategy.save_plan(plan)
+    strategy.save_plan(plan, prof["id"])
     return plan
 
 
 @app.put("/api/strategy")
 def save_strategy(body: dict):
-    strategy.save_plan(body)
+    resume_id = body.pop("resume_id", None)
+    strategy.save_plan(body, resume_id)
     return {"ok": True}
 
 
@@ -516,7 +603,9 @@ def sync_refresh():
 def sync_rescore():
     """简历/词典变更后：L1 重算（保留 xlsx 导入基线）+ P 级变化报告。"""
     from . import sync as sync_mod
-    result = scoring_l1.run_l1(force=True, keep_imported=True)
+    from . import resumes
+    resume = resumes.get_default_resume()
+    result = scoring_l1.run_l1(force=True, resume_id=resume["id"])
     return {**result, "report": sync_mod.rescore_report()}
 
 
@@ -526,7 +615,8 @@ def sync_rescore():
 def greeting_generate(body: dict):
     from . import greeting, llm as llm_mod
     try:
-        return greeting.generate(body.get("job_key", ""))
+        return greeting.generate(body.get("job_key", ""),
+                                 resume_id=body.get("resume_id"))
     except llm_mod.LLMError as e:
         raise HTTPException(400, str(e))
 
@@ -541,7 +631,22 @@ def greetings_list(status: str = ""):
 def greeting_approve(gid: int, body: dict):
     from . import greeting, llm as llm_mod
     try:
-        return greeting.approve(gid, int(body.get("index", 0)))
+        return greeting.approve(gid, int(body.get("index", 0)),
+                                body.get("chosen_text", ""))
+    except llm_mod.LLMError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.put("/api/greetings/{gid}")
+def greeting_update(gid: int, body: dict):
+    return greeting_approve(gid, body)
+
+
+@app.post("/api/greetings/{gid}/confirm-manual")
+def greeting_confirm_manual(gid: int, body: dict = None):
+    from . import greeting, llm as llm_mod
+    try:
+        return greeting.confirm_manual(gid, (body or {}).get("chosen_text", ""))
     except llm_mod.LLMError as e:
         raise HTTPException(400, str(e))
 
@@ -598,7 +703,9 @@ def interview_start(body: dict):
     if not llm_mod.configured():
         raise HTTPException(400, "LLM 未配置：请在「设置」页填写 BYOK 信息")
     try:
-        return interview.start(body.get("job_key", ""))
+        from . import resumes
+        resume_id = body.get("resume_id") or resumes.get_default_resume()["id"]
+        return interview.start(body.get("job_key", ""), resume_id=resume_id)
     except llm_mod.LLMError as e:
         raise HTTPException(400, str(e))
 

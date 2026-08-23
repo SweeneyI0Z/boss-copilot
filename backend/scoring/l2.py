@@ -50,12 +50,22 @@ T3 交叉岗:   S1嵌入式基础35 S2 AI应用能力35 S3交叉场景价值30�
 E1_HINT = "已上市:万人12/千人11/其他10；D轮+→10；不需要融资:千人+10/百人8/几十人7/0-20人5；B/C轮8-10；A轮6-8；天使/未融资3-6"
 
 
-def _resume_digest() -> str:
-    row = get_db().execute("SELECT resume_text FROM profile WHERE id=1").fetchone()
-    text = (row["resume_text"] or "").strip()
+def _resume_digest(resume_id: int = None) -> tuple:
+    if resume_id is None:
+        row = get_db().execute(
+            "SELECT resume_text, expectations FROM profile WHERE id=1").fetchone()
+        text = (row["resume_text"] or "").strip()
+        expectations = json.loads(row["expectations"] or "{}")
+        revision = None
+    else:
+        from .. import resumes
+        row = resumes.get_resume(int(resume_id))
+        text = (row.get("resume_text") or "").strip()
+        expectations = row.get("expectations") or {}
+        revision = int(row["revision"])
     if len(text) < 50:
         raise llm.LLMError("简历未填写或过短：请先在「简历档案」粘贴简历（L2 精评以简历为基线）")
-    return text[:3000]
+    return text[:3000], expectations, revision
 
 
 def build_messages(job: dict, jd: str, resume: str, l1_detail: dict, expect: dict) -> list:
@@ -97,46 +107,84 @@ def finalize(result: dict, cap: float) -> dict:
     return result
 
 
-def score_job_llm(job_key: str, client=None) -> dict:
+def score_job_llm(job_key: str, client=None, resume_id: int = None,
+                  force: bool = False) -> dict:
     conn = get_db()
     row = conn.execute(
         "SELECT j.*, d.jd FROM jobs j LEFT JOIN job_details d ON d.job_key=j.job_key "
         "WHERE j.job_key=?", (job_key,)).fetchone()
     if row is None:
         raise llm.LLMError(f"岗位不存在: {job_key}")
-    resume = _resume_digest()
-    l1_detail = json.loads(row["l1_detail"] or "{}")
-    expect = {"salary_max": 30}
+    resume, expect, revision = _resume_digest(resume_id)
+    profile_score = None
+    if resume_id is not None:
+        from .. import resumes
+        profile_score = resumes.get_job_score(job_key, resume_id, revision)
+    l1_detail = (profile_score or {}).get("l1_detail") or \
+        json.loads(row["l1_detail"] or "{}")
+    expect = {"salary_max": 30, **expect}
     result = llm.chat_json(build_messages(dict(row), row["jd"] or "", resume,
                                           l1_detail, expect), client=client)
     result = finalize(result, cap=float(l1_detail.get("cap", 100)))
     result["engine"] = "l2-llm"
-    cur = conn.execute(
-        "UPDATE jobs SET job_score=?, match_score=?, composite=?, priority=?, "
-        "l2_detail=?, l2_source='llm', last_seen_at=? WHERE job_key=? AND composite IS NULL",
-        (result["job_score"], result["match_score"], result["composite"],
-         result["priority"], json.dumps(result, ensure_ascii=False),
-         now_iso(), job_key))
-    if cur.rowcount == 0:
-        raise llm.LLMError("该岗位已有 L2 评分，未覆盖（需 force 重评）")
+    if resume_id is not None:
+        existing = profile_score and profile_score.get("composite") is not None
+        if existing and not force:
+            raise llm.LLMError("该简历修订已有 L2 评分，未覆盖（需 force 重评）")
+        from .. import resumes
+        resumes.save_job_score(
+            job_key, resume_id=resume_id, resume_revision=revision,
+            job_score=result["job_score"], match_score=result["match_score"],
+            composite=result["composite"], priority=result["priority"],
+            l2_detail=result, l2_source="llm", l2_stale=False)
+    else:
+        cur = conn.execute(
+            "UPDATE jobs SET job_score=?, match_score=?, composite=?, priority=?, "
+            "l2_detail=?, l2_source='llm', last_seen_at=? WHERE job_key=? AND composite IS NULL",
+            (result["job_score"], result["match_score"], result["composite"],
+             result["priority"], json.dumps(result, ensure_ascii=False),
+             now_iso(), job_key))
+        if cur.rowcount == 0:
+            raise llm.LLMError("该岗位已有 L2 评分，未覆盖（需 force 重评）")
     conn.commit()
+    result["resume_id"] = resume_id
+    result["resume_revision"] = revision
     return result
 
 
-def run_l2(limit: int = 10, only_missing: bool = True, client=None) -> dict:
+def run_l2(limit: int = 10, only_missing: bool = True, client=None,
+           resume_id: int = None, job_keys: list = None, force: bool = False) -> dict:
     """对 L1 综合粗分 Top N 且无 L2 的岗位精评。"""
     conn = get_db()
-    where = "composite IS NULL" if only_missing else "1=1"
-    rows = conn.execute(
-        f"SELECT job_key FROM jobs WHERE status='active' AND {where} "
-        "AND composite_rough IS NOT NULL "
-        "ORDER BY composite_rough DESC LIMIT ?", (limit,)).fetchall()
+    if resume_id is None:
+        where = "composite IS NULL" if only_missing else "1=1"
+        rows = conn.execute(
+            f"SELECT job_key FROM jobs WHERE status='active' AND {where} "
+            "AND composite_rough IS NOT NULL "
+            "ORDER BY composite_rough DESC LIMIT ?", (limit,)).fetchall()
+    else:
+        from .. import resumes
+        revision = resumes.current_revision(resume_id)
+        conditions, args = ["j.status='active'", "s.composite_rough IS NOT NULL"], []
+        if only_missing and not force:
+            conditions.append("(s.composite IS NULL OR s.l2_stale=1)")
+        if job_keys:
+            conditions.append("j.job_key IN (%s)" % ",".join("?" * len(job_keys)))
+            args.extend(job_keys)
+        args.extend([int(resume_id), int(revision), int(limit)])
+        rows = conn.execute(
+            "SELECT j.job_key FROM jobs j JOIN job_resume_scores s ON s.job_key=j.job_key "
+            "WHERE " + " AND ".join(conditions) +
+            " AND s.resume_id=? AND s.resume_revision=? "
+            "ORDER BY s.composite_rough DESC LIMIT ?", args).fetchall()
     done, failed = [], []
     for r in rows:
         try:
-            res = score_job_llm(r["job_key"], client=client)
+            res = score_job_llm(r["job_key"], client=client, resume_id=resume_id,
+                                force=force)
             done.append({"job_key": r["job_key"], "title": res.get("summary", "")[:40],
                          "composite": res["composite"], "priority": res["priority"]})
         except llm.LLMError as e:
             failed.append({"job_key": r["job_key"], "error": str(e)[:120]})
-    return {"scored": len(done), "failed": failed, "items": done}
+    return {"scored": len(done), "failed": failed, "items": done,
+            "resume_id": resume_id}

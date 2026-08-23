@@ -35,24 +35,35 @@ REPORT_SYSTEM = """你是面试复盘教练。根据完整模拟面试记录输�
  "closing_tips": ["临场建议"]"""
 
 
-def _job_context(job_key: str) -> tuple:
+def _job_context(job_key: str, resume_id: int = None) -> tuple:
     conn = get_db()
     row = conn.execute(
         "SELECT j.*, d.jd FROM jobs j LEFT JOIN job_details d ON d.job_key=j.job_key "
         "WHERE j.job_key=?", (job_key,)).fetchone()
     if row is None:
         raise llm.LLMError(f"岗位不存在: {job_key}")
-    prof = conn.execute("SELECT resume_text FROM profile WHERE id=1").fetchone()
-    resume = (prof["resume_text"] or "").strip()
+    if resume_id is None:
+        prof = conn.execute("SELECT resume_text FROM profile WHERE id=1").fetchone()
+        resume = (prof["resume_text"] or "").strip()
+        revision = None
+    else:
+        from . import resumes
+        prof = resumes.get_resume(int(resume_id))
+        resume = (prof.get("resume_text") or "").strip()
+        revision = int(prof["revision"])
     if len(resume) < 50:
         raise llm.LLMError("简历未填写：模拟面试以简历为对照基线")
-    return row, resume
+    return row, resume, revision
 
 
-def start(job_key: str, client=None) -> dict:
+def start(job_key: str, client=None, resume_id: int = None) -> dict:
     """生成出题计划并创建面试会话。"""
-    row, resume = _job_context(job_key)
+    row, resume, revision = _job_context(job_key, resume_id)
     l2 = json.loads(row["l2_detail"] or "{}")
+    if resume_id is not None:
+        from . import resumes
+        score = resumes.get_job_score(job_key, resume_id, revision) or {}
+        l2 = score.get("l2_detail") or l2
     gaps = json.dumps(l2.get("gaps", []), ensure_ascii=False)
     user = (f"# 岗位\n{row['title']} | {row['company']} | {row['salary']}\n"
             f"JD：{(row['jd'] or '')[:2000]}\n\n"
@@ -69,10 +80,13 @@ def start(job_key: str, client=None) -> dict:
                    "probe": questions[0].get("probe", ""),
                    "q_index": 0, "asked_at": now_iso()}]
     cur = conn.execute(
-        "INSERT INTO interviews(job_key, status, transcript, created_at) VALUES(?,?,?,?)",
-        (job_key, "active", json.dumps(transcript, ensure_ascii=False), now_iso()))
+        "INSERT INTO interviews(job_key, status, transcript, created_at, resume_id, "
+        "resume_revision) VALUES(?,?,?,?,?,?)",
+        (job_key, "active", json.dumps(transcript, ensure_ascii=False), now_iso(),
+         resume_id, revision))
     conn.commit()
     return {"id": cur.lastrowid, "job_key": job_key, "title": row["title"],
+            "resume_id": resume_id, "resume_revision": revision,
             "total_questions": len(questions),
             "first_question": questions[0]["q"]}
 
@@ -99,7 +113,7 @@ def answer(session_id: int, text: str, client=None) -> dict:
     transcript.append({"role": "candidate", "content": text.strip(),
                        "answered_at": now_iso()})
     conn = get_db()
-    job, resume = _job_context(row["job_key"])
+    job, resume, _ = _job_context(row["job_key"], row["resume_id"])
     asked = _questions_of(transcript)
     history = "\n".join(
         f"[{'面试官' if t['role'] == 'interviewer' else '我'}] {t['content']}"
@@ -144,7 +158,7 @@ def finish(session_id: int, client=None) -> dict:
         f"[{'面试官' if t['role'] == 'interviewer' else '我'}] {t['content']}"
         for t in transcript if t.get("role") in ("interviewer", "candidate")
         and t.get("content"))
-    job, resume = _job_context(row["job_key"])
+    job, resume, _ = _job_context(row["job_key"], row["resume_id"])
     user = (f"# 岗位\n{job['title']} | {job['company']} | {job['salary']}\n\n"
             f"# 我的简历（节选）\n{resume[:1500]}\n\n# 面试记录\n{history}")
     report = llm.chat_json([{"role": "system", "content": REPORT_SYSTEM},
@@ -159,13 +173,15 @@ def finish(session_id: int, client=None) -> dict:
 def get(session_id: int) -> dict:
     row, transcript = _load(session_id)
     return {"id": row["id"], "job_key": row["job_key"], "status": row["status"],
+            "resume_id": row["resume_id"], "resume_revision": row["resume_revision"],
             "transcript": transcript,
             "report": json.loads(row["report"] or "{}")}
 
 
 def list_sessions() -> list:
     rows = get_db().execute(
-        "SELECT i.id, i.job_key, i.status, i.created_at, j.title, j.company "
+        "SELECT i.id, i.job_key, i.status, i.created_at, i.resume_id, "
+        "i.resume_revision, j.title, j.company "
         "FROM interviews i JOIN jobs j ON j.job_key=i.job_key "
         "ORDER BY i.id DESC LIMIT 20").fetchall()
     return [dict(r) for r in rows]
