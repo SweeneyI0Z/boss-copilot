@@ -1,4 +1,4 @@
-"""boss-copilot 全局配置：路径、双账号 profile、默认护栏参数。"""
+"""boss-copilot 全局配置：路径、账号 profile、默认护栏参数。"""
 import os
 from pathlib import Path
 
@@ -6,17 +6,19 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("BOSS_COPILOT_HOME", Path.home() / ".boss-copilot"))
 DB_PATH = DATA_DIR / "copilot.db"
 
-# ── 双账号 CDP 隔离（互不连累：采集号承担风控，账号A只做沟通投递）──
+# ── 账号 CDP 隔离（双账号时采集号承担风控，沟通号只做沟通投递）──
 ACCOUNTS = {
     # 采集号：复用 boss-zhipin-scraper 的隔离 profile 与端口
     "collect": {
-        "label": "采集号（搜索/公司/详情采集，风控风险集中于此）",
+        "label": "采集号",
+        "description": "搜索、公司与详情采集，风控风险集中于此",
         "profile_dir": Path.home() / ".boss-zhipin-scraper" / "chrome-profile",
         "cdp_port": 9222,
     },
-    # 账号A：真实沟通投递号，独立 profile，仅发送/消息时使用
+    # 沟通号：真实沟通投递号；单账号模式下也承担采集
     "account_a": {
-        "label": "账号A（真实沟通投递，只在发送与消息时启动）",
+        "label": "沟通号",
+        "description": "发送招呼语与收发消息",
         "profile_dir": DATA_DIR / "chrome-profile-a",
         "cdp_port": 9223,
     },
@@ -29,6 +31,8 @@ DEFAULT_SETTINGS = {
     "llm_base_url": "",
     "llm_api_key": "",
     "llm_model": "",
+    # 账号管理：关闭后，采集和沟通统一使用沟通号
+    "dual_account_enabled": True,
     # 发送护栏
     "send_daily_limit": 40,        # 每日招呼语发送上限（人工确认模式下的软上限）
     "send_daily_hard_cap": 110,    # 硬顶（BOSS 120 软限制前必须停）

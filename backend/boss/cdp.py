@@ -1,4 +1,4 @@
-"""双账号 CDP 管理：采集号(9222) 与 账号A(9223) 的启动/健康/登录引导。
+"""账号 CDP 管理：采集号(9222) 与沟通号(9223) 的启动/健康/登录引导。
 
 原则（沿 boss-zhipin-scraper 惯例）：
 - 只按隔离 user-data-dir 精准启停，绝不触碰用户主 Chrome
@@ -32,6 +32,21 @@ def is_running(port: int) -> bool:
 def browser_version(port: int) -> str:
     data = _http_get_json(f"http://127.0.0.1:{port}/json/version") or {}
     return data.get("Browser", "")
+
+
+def dual_account_enabled() -> bool:
+    """是否启用采集号与沟通号隔离；历史安装默认保持双账号行为。"""
+    from ..db import get_setting
+    return get_setting("dual_account_enabled", True) is not False
+
+
+def account_for(purpose: str) -> str:
+    """按用途选择账号；单账号模式统一使用沟通号。"""
+    if purpose == "communication":
+        return "account_a"
+    if purpose == "collect":
+        return "collect" if dual_account_enabled() else "account_a"
+    raise ValueError(f"unknown account purpose: {purpose}")
 
 
 def launch(account: str, wait_sec: float = 15) -> dict:
@@ -74,12 +89,21 @@ def stop(account: str) -> dict:
 
 
 def status() -> dict:
+    collect_account = account_for("collect")
+    communication_account = account_for("communication")
     out = {}
     for name, conf in config.ACCOUNTS.items():
         running = is_running(conf["cdp_port"])
+        roles = []
+        if name == collect_account:
+            roles.append("采集")
+        if name == communication_account:
+            roles.append("沟通")
         out[name] = {
             "label": conf["label"], "port": conf["cdp_port"],
+            "description": conf.get("description", ""),
             "profile": str(conf["profile_dir"]),
+            "roles": roles, "enabled": bool(roles),
             "running": running,
             "browser": browser_version(conf["cdp_port"]) if running else "",
         }
@@ -88,11 +112,11 @@ def status() -> dict:
 
 # ── 登录引导（静止页面模式）────────────────────────────────────────
 
-def _ws_eval(port: int, sid: str, js: str):
+def _ws_eval(port: int, target_id: str, js: str):
     """在指定 session 上执行 JS 并取值（websocket-client 延迟导入）。"""
     import websocket
     targets = _http_get_json(f"http://127.0.0.1:{port}/json") or []
-    page = next((t for t in targets if t.get("type") == "page"), None)
+    page = next((t for t in targets if t.get("id") == target_id), None)
     if not page:
         return None
     ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=10)
@@ -125,17 +149,19 @@ def open_login_page(account: str) -> dict:
 
 
 def login_state(account: str) -> dict:
-    """轻量登录态探测：只看首页 DOM 特征（不调任何 BOSS API，账号A零足迹）。
+    """轻量登录态探测：只看页面 DOM 特征（不调任何 BOSS API，沟通号零足迹）。
 
     判据：已登录首页会出现用户头像/昵称区；未登录则顶部有「登录」按钮。
     """
     conf = config.ACCOUNTS[account]
     if not is_running(conf["cdp_port"]):
-        return {"account": account, "running": False, "logged_in": None}
+        return {"account": account, "running": False, "logged_in": None,
+                "hint": "Chrome 未启动，请先点击「启动」或「打开登录页」"}
     import websocket
     targets = _http_get_json(f"http://127.0.0.1:{conf['cdp_port']}/json") or []
-    page = next((t for t in targets if t.get("type") == "page"), None)
-    if page and "zhipin.com" in (page.get("url") or ""):
+    page = next((t for t in targets
+                 if t.get("type") == "page" and "zhipin.com" in (t.get("url") or "")), None)
+    if page:
         js = ("(function(){var u=document.querySelector('[class*=user] img,"
               "[class*=avatar],.geek-name');var l=document.querySelector("
               "'[class*=login],a[href*=login]');"
@@ -143,7 +169,13 @@ def login_state(account: str) -> dict:
         try:
             val = _ws_eval(conf["cdp_port"], page["id"], js)
             d = json.loads(val) if val else {}
-            logged = bool(d.get("user")) and not d.get("loginBtn")
+            if d.get("user"):
+                logged = True
+            elif d.get("loginBtn"):
+                logged = False
+            else:
+                return {"account": account, "running": True, "logged_in": None,
+                        "hint": "页面尚未加载完成或无法识别，请稍后重试"}
             return {"account": account, "running": True, "logged_in": logged,
                     "hint": "" if logged else "请在打开的窗口中登录"}
         except (OSError, ValueError, KeyError):

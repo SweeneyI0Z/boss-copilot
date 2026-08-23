@@ -1,4 +1,4 @@
-"""发送器：账号A Chrome(9223) 上以真人节奏发送已批准的招呼语。
+"""发送器：沟通号 Chrome 上以真人节奏发送已批准的招呼语。
 
 护栏（不可跳过）：
 - 每日上限（settings.send_daily_limit）与硬顶（send_daily_hard_cap）
@@ -18,7 +18,6 @@ from datetime import date, datetime
 from .boss import cdp
 from .db import get_db, get_setting, now_iso, set_setting
 
-ACCOUNT = "account_a"
 COMPANY_DEDUP_DAYS = 30
 
 FIND_CHAT_BTN_JS = """
@@ -175,12 +174,13 @@ def send_batch() -> dict:
     already = sent_today()
     if already >= hard:
         return {"ok": False, "halted": True, "reason": f"已达硬顶 {hard}"}
-    st = cdp.launch(ACCOUNT)
+    account = cdp.account_for("communication")
+    st = cdp.launch(account)
     if not st.get("ok"):
-        return {"ok": False, "error": "账号A Chrome 启动失败"}
-    login = cdp.login_state(ACCOUNT)
+        return {"ok": False, "error": "沟通号 Chrome 启动失败"}
+    login = cdp.login_state(account)
     if login.get("logged_in") is not True:
-        return {"ok": False, "error": "账号A 未登录：请到「双账号」页打开登录页完成登录"}
+        return {"ok": False, "error": "沟通号未登录：请到「账号管理」页打开登录页完成登录"}
 
     batch = greeting.pending_batch()
     sent, skipped, failed = 0, [], []
@@ -190,7 +190,7 @@ def send_batch() -> dict:
         """薄封装：按需建一个前台标签页 session。"""
         def __init__(self):
             import urllib.request
-            port = cdp.config.ACCOUNTS[ACCOUNT]["cdp_port"]
+            port = cdp.config.ACCOUNTS[account]["cdp_port"]
             targets = json.loads(urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/json").read())
             page = next((t for t in targets if t["type"] == "page"), None)

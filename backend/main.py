@@ -35,8 +35,25 @@ def read_settings():
 def write_settings(body: dict):
     for k, v in body.items():
         if k in config.DEFAULT_SETTINGS:
+            if k == "dual_account_enabled" and not isinstance(v, bool):
+                raise HTTPException(400, "dual_account_enabled 必须是布尔值")
             set_setting(k, v)
     return {"ok": True}
+
+
+class LLMTestIn(BaseModel):
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+
+
+@app.post("/api/llm/test")
+def test_llm_connection(body: LLMTestIn):
+    from . import llm
+    try:
+        return llm.test_connection(body.base_url, body.api_key, body.model)
+    except llm.LLMError as e:
+        raise HTTPException(400, str(e))
 
 
 class ProfileIn(BaseModel):
@@ -293,7 +310,7 @@ def greeting_skip(gid: int):
 
 @app.post("/api/greeting/send-batch")
 def greeting_send_batch():
-    """后台线程发送 approved 批次（账号A，全护栏）。"""
+    """后台线程发送 approved 批次（沟通号，全护栏）。"""
     from . import sender
     import threading
 
@@ -405,7 +422,7 @@ def interview_list():
     return interview.list_sessions()
 
 
-# ── 双账号 ──────────────────────────────────────────────────────
+# ── 账号管理 ────────────────────────────────────────────────────
 
 @app.get("/api/accounts")
 def accounts():

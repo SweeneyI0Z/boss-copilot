@@ -1,4 +1,4 @@
-"""在线采集执行器：调 boss-zhipin-scraper（采集号 9222），后台线程串行执行。
+"""在线采集执行器：调 boss-zhipin-scraper，后台线程串行执行。
 
 执行链：确保采集 Chrome 启动 → subprocess 跑 scraper → 导入结果 →
 打 origin_query 标签 →（同步模式）同词缺失判下架 + HR 活跃度剔除。
@@ -58,10 +58,11 @@ def _finish_run(run_id: int, stats: dict) -> None:
         _state["current"] = ""
 
 
-def _run_scraper(args: list, timeout: int) -> str:
+def _run_scraper(args: list, timeout: int, cdp_port: int) -> str:
     """跑 scraper 子进程，返回 stdout 摘要（用于日志）。"""
     proc = subprocess.run(
-        [str(SCRAPER_PY), str(SCRAPER_SCRIPT)] + args,
+        [str(SCRAPER_PY), str(SCRAPER_SCRIPT)] + args
+        + ["--cdp-port", str(cdp_port)],
         cwd=str(SCRAPER_DIR), capture_output=True, text=True,
         timeout=timeout, env={"PYTHONUNBUFFERED": "1",
                               "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
@@ -79,13 +80,14 @@ def _touched_keys(since_iso: str) -> set:
     return {r["job_key"] for r in rows}
 
 
-def _execute_one(search: dict, sync_mode: bool, since_iso: str, report: dict) -> None:
+def _execute_one(search: dict, sync_mode: bool, since_iso: str,
+                 report: dict, cdp_port: int) -> None:
     kw = search["keyword"]
     city = search.get("city", "深圳")
     pages = int(search.get("pages", 3))
     _log(f"采集: 「{kw}」 {city} {pages}页 …")
     args = ["--keyword", kw, "--city", city, "--pages", str(pages), "--no-detail"]
-    out = _run_scraper(args, timeout=pages * 150 + 300)
+    out = _run_scraper(args, timeout=pages * 150 + 300, cdp_port=cdp_port)
     _log(out)
     since = since_iso
     stats = importer.import_scraper_json(str(RESULT_DIR))
@@ -101,7 +103,7 @@ def _execute_one(search: dict, sync_mode: bool, since_iso: str, report: dict) ->
     _log(f"「{kw}」完成: 导入 {stats['created']} 新 / 刷新 {stats['updated']}, 涉及 {len(touched)} 岗")
 
 
-def _execute_company(c: dict, report: dict) -> None:
+def _execute_company(c: dict, report: dict, cdp_port: int) -> None:
     name = c.get("name") or c.get("url") or ""
     _log(f"公司定向采集: {name} …（需要 brandId 或公司页 URL，跳过仅有名字的项）")
     bid = c.get("brand_id") or c.get("url")
@@ -110,7 +112,7 @@ def _execute_company(c: dict, report: dict) -> None:
         return
     pages = int(c.get("pages", 5))
     out = _run_scraper(["--company", str(bid), "--pages", str(pages), "--no-detail"],
-                       timeout=pages * 150 + 300)
+                       timeout=pages * 150 + 300, cdp_port=cdp_port)
     _log(out)
     since = now_iso()
     stats = importer.import_scraper_json(str(RESULT_DIR))
@@ -125,18 +127,21 @@ def _worker(kind: str, tasks: list, sync_mode: bool) -> None:
     report = {"items": [], "touched": 0, "delisted_jobs": 0}
     since_iso = now_iso()
     try:
-        st = cdp.launch("collect")
-        _log(f"采集号 Chrome: {'已启动' if st.get('ok') else st.get('error', '启动失败')}")
+        account = cdp.account_for("collect")
+        account_label = cdp.config.ACCOUNTS[account]["label"]
+        cdp_port = cdp.config.ACCOUNTS[account]["cdp_port"]
+        st = cdp.launch(account)
+        _log(f"{account_label} Chrome: {'已启动' if st.get('ok') else st.get('error', '启动失败')}")
         if not st.get("ok"):
-            raise RuntimeError("采集号 Chrome 无法启动（CDP 未就绪）")
+            raise RuntimeError(f"{account_label} Chrome 无法启动（CDP 未就绪）")
         for i, t in enumerate(tasks):
             if _state.get("cancel"):
                 _log("已取消")
                 break
             if t.get("type") == "company":
-                _execute_company(t, report)
+                _execute_company(t, report, cdp_port)
             else:
-                _execute_one(t, sync_mode, since_iso, report)
+                _execute_one(t, sync_mode, since_iso, report, cdp_port)
             if i < len(tasks) - 1:
                 _log(f"任务间隔等待 {ITEM_GAP_SEC}s …")
                 time.sleep(ITEM_GAP_SEC)

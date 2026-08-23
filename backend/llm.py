@@ -7,6 +7,7 @@
 """
 import json
 import re
+import time
 
 
 class LLMError(Exception):
@@ -37,6 +38,35 @@ def chat(messages, client=None, temperature=0.3, max_tokens=2000) -> str:
         model=get_setting("llm_model"), messages=messages,
         temperature=temperature, max_tokens=max_tokens)
     return resp.choices[0].message.content or ""
+
+
+def test_connection(base_url: str, api_key: str, model: str, client=None) -> dict:
+    """用页面当前填写的配置发起最小对话，不读取或写入已保存设置。"""
+    base_url = (base_url or "").strip()
+    api_key = (api_key or "").strip()
+    model = (model or "").strip()
+    missing = [name for name, value in (("Base URL", base_url), ("API Key", api_key),
+                                        ("模型", model)) if not value]
+    if missing:
+        raise LLMError("请先填写：" + "、".join(missing))
+
+    started = time.perf_counter()
+    try:
+        if client is None:
+            from openai import OpenAI
+            client = OpenAI(base_url=base_url, api_key=api_key, timeout=20)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "请只回复 OK"}],
+            temperature=0,
+            max_tokens=8,
+        )
+        reply = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        message = str(e).strip() or e.__class__.__name__
+        raise LLMError(f"LLM 连接失败：{message}") from e
+    return {"ok": True, "model": model, "reply": reply[:80],
+            "latency_ms": round((time.perf_counter() - started) * 1000)}
 
 
 def extract_json(text: str):

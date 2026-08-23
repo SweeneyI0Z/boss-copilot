@@ -11,7 +11,7 @@ const api = {
 const route = ref(location.hash.slice(1) || '/jobs')
 const nav = [
   ['/jobs', '岗位列表'], ['/jobcard', '作战卡'], ['/collect', '采集中心'],
-  ['/greetings', '招呼语'], ['/messages', '消息'], ['/profile', '简历档案'], ['/accounts', '双账号'], ['/settings', '设置'],
+  ['/greetings', '招呼语'], ['/messages', '消息'], ['/profile', '简历档案'], ['/accounts', '账号管理'], ['/settings', '设置'],
 ]
 window.addEventListener('hashchange', () => { route.value = location.hash.slice(1) || '/jobs' })
 
@@ -45,8 +45,11 @@ const JobsView = {
       catch (e) { alert('L2 失败：' + e.message) }
       scoring.value = false
     }
+    function openJob(j) {
+      window.location.hash = '#/jobcard?key=' + encodeURIComponent(j.job_key)
+    }
     const pages = computed(() => Math.ceil(total.value / PAGE))
-    return { items, total, counts, q, status, sort, page, loading, scoring, load, pages, runL1, runL2,
+    return { items, total, counts, q, status, sort, page, loading, scoring, load, pages, runL1, runL2, openJob,
       search: () => { page.value = 0; load() },
       prev: () => { page.value--; load() }, next: () => { page.value++; load() } }
   },
@@ -73,8 +76,9 @@ const JobsView = {
     <table>
       <thead><tr><th>岗位</th><th>薪资</th><th>经验/学历</th><th>公司</th><th>L2综合</th><th>匹配</th><th>P级</th><th>HR活跃</th><th>状态</th></tr></thead>
       <tbody>
-        <tr v-for="j in items" :key="j.job_key" style="cursor:pointer"
-            @click="location.hash='#/jobcard?key='+j.job_key">
+        <tr v-for="j in items" :key="j.job_key" class="job-row" tabindex="0" role="link"
+            title="查看岗位详情与 JD" @click="openJob(j)" @keyup.enter="openJob(j)"
+            @keyup.space.prevent="openJob(j)">
           <td style="max-width:260px"><b>{{j.title}}</b><div class="muted">{{j.location}}</div></td>
           <td>{{j.salary}}</td>
           <td class="muted">{{j.experience}}<br>{{j.degree}}</td>
@@ -203,7 +207,7 @@ const MessagesView = {
       busy.value = ''; load()
     }
     async function doSend(c, reply) {
-      if (!confirm('确认发送这条回复（账号A）？\n\n' + reply)) return
+      if (!confirm('确认使用沟通号发送这条回复？\n\n' + reply)) return
       busy.value = 'send'
       const r = await api.post('/api/chat/send', { conversation_id: c.id, reply })
       busy.value = ''
@@ -214,10 +218,10 @@ const MessagesView = {
   },
   template: `
   <div>
-    <h2>消息中心 <span class="muted">账号A 会话 · AI 起草 + 人工点发</span>
+    <h2>消息中心 <span class="muted">沟通号会话 · AI 起草 + 人工点发</span>
       <button class="primary" style="margin-left:10px" :disabled="busy" @click="doPoll">{{busy==='poll'?'轮询中…':'轮询会话'}}</button>
     </h2>
-    <div v-if="!convs.length" class="card muted">暂无会话——先「轮询会话」（需账号A 已登录）。</div>
+    <div v-if="!convs.length" class="card muted">暂无会话——先「轮询会话」（需沟通号已登录）。</div>
     <div v-for="c in convs" :key="c.id" class="card">
       <div class="row">
         <b class="grow">{{c.boss_name}}</b>
@@ -246,7 +250,7 @@ const GreetingsView = {
     async function approve(g, i) { await api.post('/api/greetings/' + g.id + '/approve', { index: i }); refresh() }
     async function skip(g) { await api.post('/api/greetings/' + g.id + '/skip'); refresh() }
     async function sendBatch() {
-      if (!confirm('发送所有已批准招呼语（账号A，随机间隔30-90秒，每日上限受护栏控制）。确认？')) return
+      if (!confirm('使用沟通号发送所有已批准招呼语（随机间隔30-90秒，每日上限受护栏控制）。确认？')) return
       const r = await api.post('/api/greeting/send-batch')
       if (!r.ok) alert(r.error || '启动失败')
       loadSt()
@@ -263,7 +267,7 @@ const GreetingsView = {
       <span v-if="st.halted_today" class="bad">⚠ 已熔断：{{st.halt_reason}}</span>
       <span v-if="st.sending" class="warn">● 发送执行中…</span>
       <span class="grow"></span>
-      <button class="primary" :disabled="st.sending || st.halted_today" @click="sendBatch">发送已批准批次（账号A）</button>
+      <button class="primary" :disabled="st.sending || st.halted_today" @click="sendBatch">使用沟通号发送已批准批次</button>
     </div>
     <div v-if="st.last_result" class="muted" style="margin-top:8px">上次结果：{{JSON.stringify(st.last_result).slice(0,300)}}</div>
     </div>
@@ -516,35 +520,80 @@ const ProfileView = {
   </div>`
 }
 
-// ── 页面：双账号 ─────────────────────────────────────────────────
+// ── 页面：账号管理 ───────────────────────────────────────────────
 const AccountsView = {
   setup() {
-    const accounts = ref({})
-    async function load() { accounts.value = await api.get('/api/accounts') }
+    const accounts = ref({}), dualEnabled = ref(true), modeBusy = ref(false)
+    const loginStates = reactive({}), checking = ref('')
+    const visibleAccounts = computed(() => Object.fromEntries(
+      Object.entries(accounts.value).filter(([, account]) => account.enabled)))
+    async function load() {
+      const [accountData, settings] = await Promise.all([
+        api.get('/api/accounts'), api.get('/api/settings')
+      ])
+      accounts.value = accountData
+      dualEnabled.value = settings.dual_account_enabled !== false
+    }
     onMounted(load)
     const refresh = () => load()
     async function launch(name) { await api.post('/api/accounts/' + name + '/launch'); load() }
     async function loginPage(name) { const r = await api.post('/api/accounts/' + name + '/login-page'); alert(r.ok ? '已打开登录页，请在弹出的 Chrome 中登录' : r.error); load() }
-    async function loginState(name) { const r = await api.get('/api/accounts/' + name + '/login-state'); alert(JSON.stringify(r)) }
+    async function loginState(name) {
+      checking.value = name
+      try {
+        const r = await api.get('/api/accounts/' + name + '/login-state')
+        if (!r.running) loginStates[name] = { kind: 'bad', text: r.hint || 'Chrome 未启动' }
+        else if (r.logged_in === true) loginStates[name] = { kind: 'ok', text: '已登录' }
+        else if (r.logged_in === false) loginStates[name] = { kind: 'warn', text: r.hint || '未登录' }
+        else loginStates[name] = { kind: 'warn', text: r.hint || '暂时无法判断登录态' }
+      } catch (e) {
+        loginStates[name] = { kind: 'bad', text: '检测失败：' + e.message }
+      } finally { checking.value = '' }
+    }
     async function stop(name) { await api.post('/api/accounts/' + name + '/stop'); load() }
-    return { accounts, refresh, launch, loginPage, loginState, stop }
+    async function changeMode(event) {
+      const desired = event.target.checked
+      dualEnabled.value = desired
+      modeBusy.value = true
+      try {
+        await api.put('/api/settings', { dual_account_enabled: desired })
+        accounts.value = await api.get('/api/accounts')
+      } catch (e) {
+        dualEnabled.value = !desired
+        alert('账号模式保存失败：' + e.message)
+      } finally { modeBusy.value = false }
+    }
+    return { visibleAccounts, dualEnabled, modeBusy, loginStates, checking,
+      refresh, launch, loginPage, loginState, stop, changeMode }
   },
   template: `
   <div>
-    <h2>双账号管理 <button @click="refresh">刷新</button></h2>
-    <div class="card" v-for="(a,name) in accounts">
+    <h2>账号管理 <button @click="refresh">刷新</button></h2>
+    <div class="card">
+      <div class="row">
+        <div class="grow"><b>双账号模式</b>
+          <div class="muted">开启后采集号与沟通号隔离；关闭后统一使用沟通号采集和沟通。</div></div>
+        <label class="switch" :class="{disabled: modeBusy}">
+          <input type="checkbox" :checked="dualEnabled" :disabled="modeBusy" @change="changeMode">
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+          <span>{{dualEnabled?'已开启':'已关闭'}}</span>
+        </label>
+      </div>
+    </div>
+    <div class="card" v-for="(a,name) in visibleAccounts" :key="name">
       <div class="row">
         <div class="grow"><b>{{a.label}}</b>
-          <div class="muted">{{a.profile}} · CDP :{{a.port}}</div></div>
+          <span class="tag" v-for="role in a.roles" :key="role">{{role}}</span>
+          <div class="muted">{{a.description}} · {{a.profile}} · CDP :{{a.port}}</div></div>
         <span :class="a.running?'ok':'bad'">{{a.running?'运行中':'未启动'}}</span>
       </div>
       <div class="row" style="margin-top:10px">
         <button @click="launch(name)">启动</button>
         <button @click="loginPage(name)">打开登录页</button>
-        <button @click="loginState(name)">检测登录态</button>
+        <button :disabled="checking===name" @click="loginState(name)">{{checking===name?'检测中…':'检测登录态'}}</button>
         <button @click="stop(name)">停止</button>
+        <span v-if="loginStates[name]" :class="loginStates[name].kind">{{loginStates[name].text}}</span>
       </div>
-      <div class="muted" style="margin-top:6px">采集号承担所有采集动作的风控风险；账号A只在发送招呼语/收发消息时启动。</div>
     </div>
   </div>`
 }
@@ -553,12 +602,24 @@ const AccountsView = {
 const SettingsView = {
   setup() {
     const s = reactive({}), loaded = ref(false), saved = ref(false)
+    const testing = ref(false), testResult = ref(null)
     onMounted(async () => { Object.assign(s, await api.get('/api/settings')); loaded.value = true })
     async function save() {
       await api.put('/api/settings', JSON.parse(JSON.stringify(s)))
       saved.value = true; setTimeout(() => saved.value = false, 1500)
     }
-    return { s, loaded, saved, save }
+    async function testLlm() {
+      testing.value = true; testResult.value = null
+      try {
+        const r = await api.post('/api/llm/test', {
+          base_url: s.llm_base_url, api_key: s.llm_api_key, model: s.llm_model
+        })
+        testResult.value = { ok: true, text: `连接成功 · ${r.model} · ${r.latency_ms} ms${r.reply ? ' · ' + r.reply : ''}` }
+      } catch (e) {
+        testResult.value = { ok: false, text: e.message }
+      } finally { testing.value = false }
+    }
+    return { s, loaded, saved, testing, testResult, save, testLlm }
   },
   template: `
   <div v-if="loaded">
@@ -567,8 +628,12 @@ const SettingsView = {
       <div class="row" style="margin-bottom:8px"><span class="muted" style="width:90px">Base URL</span><input v-model="s.llm_base_url" placeholder="https://api.deepseek.com/v1"></div>
       <div class="row" style="margin-bottom:8px"><span class="muted" style="width:90px">API Key</span><input v-model="s.llm_api_key" type="password" placeholder="sk-…"></div>
       <div class="row"><span class="muted" style="width:90px">模型</span><input v-model="s.llm_model" placeholder="deepseek-chat / gpt-4o-mini / …"></div>
+      <div class="row" style="margin-top:10px">
+        <button :disabled="testing" @click="testLlm">{{testing?'测试中…':'测试连通性'}}</button>
+        <span v-if="testResult" :class="testResult.ok?'ok':'bad'">{{testResult.text}}</span>
+      </div>
     </div>
-    <div class="card"><h3>发送护栏（账号A）</h3>
+    <div class="card"><h3>发送护栏（沟通号）</h3>
       <div class="dims">
         <div class="dim"><span class="muted">每日上限</span><input type="number" v-model.number="s.send_daily_limit"></div>
         <div class="dim"><span class="muted">硬顶</span><input type="number" v-model.number="s.send_daily_hard_cap"></div>

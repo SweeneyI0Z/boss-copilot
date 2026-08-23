@@ -1,4 +1,4 @@
-"""消息中心：账号A 聊天页轮询（DOM 快照）+ AI 草稿 + 人工点发。
+"""消息中心：沟通号聊天页轮询（DOM 快照）+ AI 草稿 + 人工点发。
 
 策略（经 spike 验证）：
 - 会话列表 = .friend-content-warp；点开后右侧 .chat-conversation 即完整消息历史
@@ -14,8 +14,6 @@ import time
 from . import llm
 from .boss import cdp
 from .db import get_db, now_iso
-
-ACCOUNT = "account_a"
 
 LIST_PROBE = """
 (() => { const els = document.querySelectorAll('.friend-content-warp');
@@ -41,13 +39,14 @@ DRAFT_SYSTEM = """你是求职沟通助手。根据我与招聘方的聊天记�
 
 
 class ChatSession:
-    """账号A 聊天页的一个后台标签页会话（焦点仿真）。"""
+    """沟通号聊天页的一个后台标签页会话（焦点仿真）。"""
 
-    def __init__(self):
+    def __init__(self, account=None):
         import urllib.request
         import websocket
-        cdp.launch(ACCOUNT)
-        port = cdp.config.ACCOUNTS[ACCOUNT]["cdp_port"]
+        self.account = account or cdp.account_for("communication")
+        cdp.launch(self.account)
+        port = cdp.config.ACCOUNTS[self.account]["cdp_port"]
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         ver = json.loads(opener.open(f"http://127.0.0.1:{port}/json/version").read())
         self.ws = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=20)
@@ -98,10 +97,11 @@ def _conv_key(title: str) -> str:
 
 def poll(max_conversations: int = 8) -> dict:
     """轮询会话并落库。返回统计。"""
-    login = cdp.login_state(ACCOUNT)
+    account = cdp.account_for("communication")
+    login = cdp.login_state(account)
     if login.get("logged_in") is not True:
-        return {"ok": False, "error": "账号A 未登录（到「双账号」页登录后再轮询）"}
-    s = ChatSession()
+        return {"ok": False, "error": "沟通号未登录（到「账号管理」页登录后再轮询）"}
+    s = ChatSession(account)
     stats = {"conversations": 0, "new_snapshots": 0}
     tid = sid = None
     try:
@@ -200,16 +200,17 @@ def _latest_msg_id(conversation_id: int) -> int:
 
 def approve_and_send(conversation_id: int, reply_text: str) -> dict:
     """人工点发：点开会话 → 输入框注入 → 回车。带基础间隔保护。"""
-    login = cdp.login_state(ACCOUNT)
+    account = cdp.account_for("communication")
+    login = cdp.login_state(account)
     if login.get("logged_in") is not True:
-        return {"ok": False, "error": "账号A 未登录"}
+        return {"ok": False, "error": "沟通号未登录"}
     conn = get_db()
     conv = conn.execute("SELECT * FROM conversations WHERE id=?",
                         (conversation_id,)).fetchone()
     if conv is None:
         return {"ok": False, "error": "会话不存在"}
     from .sender import FIND_INPUT_JS, _type_and_send
-    s = ChatSession()
+    s = ChatSession(account)
     tid = sid = None
     try:
         tid, sid = s.open_chat()
