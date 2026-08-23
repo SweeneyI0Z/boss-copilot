@@ -37,8 +37,16 @@ const JobsView = {
       catch (e) { alert('L1 失败：' + e.message) }
       scoring.value = false
     }
+    async function runL2() {
+      const n = prompt('对 L1 综合粗分 Top N 且无 L2 的岗位精评（每条约一次 LLM 调用），N =', '10')
+      if (!n) return
+      scoring.value = true
+      try { const r = await api.post('/api/score/l2', { limit: parseInt(n) }); alert('L2 精评完成：' + JSON.stringify(r)); load() }
+      catch (e) { alert('L2 失败：' + e.message) }
+      scoring.value = false
+    }
     const pages = computed(() => Math.ceil(total.value / PAGE))
-    return { items, total, counts, q, status, sort, page, loading, scoring, load, pages, runL1,
+    return { items, total, counts, q, status, sort, page, loading, scoring, load, pages, runL1, runL2,
       search: () => { page.value = 0; load() },
       prev: () => { page.value--; load() }, next: () => { page.value++; load() } }
   },
@@ -58,7 +66,8 @@ const JobsView = {
       </select>
       <button class="primary" @click="search">筛选</button>
       <span class="grow"></span>
-      <button :disabled="scoring" @click="runL1">{{scoring?'评分中…':'运行 L1 评分'}}</button>
+      <button :disabled="scoring" @click="runL2">{{scoring?'评分中…':'L2 精评 (LLM)'}}</button>
+      <button :disabled="scoring" @click="runL1">运行 L1 评分</button>
     </div></div>
     <div class="card" style="padding:0 10px">
     <table>
@@ -117,17 +126,35 @@ const JobCardView = {
         <a v-if="job.job_link" :href="job.job_link" target="_blank">原职位页 ↗</a>
       </div>
     </div>
-    <div class="grid2" v-if="job.l2_detail && job.l2_detail.dims">
-      <div class="card"><h3>L2 评分明细（{{job.l2_detail.type}} · {{job.l2_source==='imported'?'导入基线':'LLM'}}）</h3>
-        <div class="dims">
+    <div class="grid2" v-if="job.l2_detail">
+      <div class="card"><h3>L2 评分明细（{{job.l2_detail.type || '—'}} · {{job.l2_source==='imported'?'导入基线':'LLM 精评'}}）</h3>
+        <div class="dims" v-if="job.l2_detail.dims">
           <div class="dim" v-for="(v,k) in job.l2_detail.dims"><span class="muted">{{k}}</span><b>{{v}}</b></div>
         </div>
         <p v-if="job.l2_detail.summary" style="margin-top:12px">{{job.l2_detail.summary}}</p>
         <p v-if="job.l2_detail.advice" class="ok" style="margin-top:8px">💡 {{job.l2_detail.advice}}</p>
+        <div v-if="job.l2_detail.greeting_angle" class="muted" style="margin-top:8px">招呼语切入点：{{job.l2_detail.greeting_angle}}</div>
       </div>
-      <div class="card"><h3>L1 电算明细</h3>
-        <pre class="jd">{{JSON.stringify(job.l1_detail,null,1)}}</pre>
+      <div class="card">
+        <h3>优势 / GAP / 简历建议</h3>
+        <div v-if="job.l2_detail.strengths && job.l2_detail.strengths.length">
+          <div class="ok" style="margin:4px 0">✓ 突出优势</div>
+          <ul style="padding-left:18px"><li v-for="s in job.l2_detail.strengths">{{s}}</li></ul>
+        </div>
+        <div v-if="job.l2_detail.gaps && job.l2_detail.gaps.length" style="margin-top:10px">
+          <div class="warn" style="margin:4px 0">△ 待补 GAP</div>
+          <ul style="padding-left:18px">
+            <li v-for="g in job.l2_detail.gaps">{{g.gap || g}}<div class="muted">→ {{g.action}}</div></li>
+          </ul>
+        </div>
+        <div v-if="job.l2_detail.resume_advice" class="card" style="margin-top:10px;background:var(--panel2)">
+          📄 简历定制：{{job.l2_detail.resume_advice}}
+        </div>
+        <div v-if="!job.l2_detail.strengths && !job.l2_detail.gaps" class="muted">（导入基线无明细，可用 L2 精评重算补充）</div>
       </div>
+    </div>
+    <div class="card"><h3>L1 电算明细</h3>
+      <pre class="jd">{{JSON.stringify(job.l1_detail,null,1)}}</pre>
     </div>
     <div class="card"><h3>职位描述（JD）</h3>
       <pre class="jd">{{job.jd || '（暂无，采集详情后展示）'}}</pre></div>
@@ -139,9 +166,9 @@ const JobCardView = {
 const CollectView = {
   setup() {
     const xlsxPath = ref(''), jsonDir = ref(''), busy = ref(''), result = ref(null), runs = ref([])
+    const plan = ref(null), planText = ref(''), genBusy = ref(false), planSaved = ref(false)
     async function doImport(kind) {
-      busy.value = kind
-      result.value = null
+      busy.value = kind; result.value = null
       try {
         result.value = await api.post(kind === 'xlsx' ? '/api/import/xlsx' : '/api/import/json',
           kind === 'xlsx' ? { path: xlsxPath.value } : { dir: jsonDir.value })
@@ -149,12 +176,40 @@ const CollectView = {
       } catch (e) { result.value = { error: e.message } }
       busy.value = ''
     }
-    onMounted(async () => { runs.value = await api.get('/api/runs') })
-    return { xlsxPath, jsonDir, busy, result, runs, doImport }
+    async function loadPlan() {
+      plan.value = await api.get('/api/strategy')
+      planText.value = JSON.stringify(plan.value, null, 1)
+    }
+    async function genPlan() {
+      genBusy.value = true
+      try { plan.value = await api.post('/api/strategy/generate'); planText.value = JSON.stringify(plan.value, null, 1) }
+      catch (e) { alert('生成失败：' + e.message) }
+      genBusy.value = false
+    }
+    async function savePlan() {
+      try { await api.put('/api/strategy', JSON.parse(planText.value)); planSaved.value = true; setTimeout(()=>planSaved.value=false, 1500) }
+      catch (e) { alert('保存失败（JSON 格式错误？）：' + e.message) }
+    }
+    onMounted(async () => { runs.value = await api.get('/api/runs'); loadPlan() })
+    return { xlsxPath, jsonDir, busy, result, runs, doImport, plan, planText, genBusy, planSaved, genPlan, savePlan }
   },
   template: `
   <div>
     <h2>采集中心</h2>
+    <div class="card">
+      <h3>AI 采集策略（根据简历智能生成搜索计划）</h3>
+      <div class="row" style="margin-bottom:8px">
+        <button class="primary" :disabled="genBusy" @click="genPlan">{{genBusy?'生成中（LLM）…':'根据简历生成策略'}}</button>
+        <span class="muted">需先在「简历档案」粘贴简历、在「设置」配置 LLM</span>
+      </div>
+      <textarea v-model="planText" style="min-height:180px" spellcheck="false"></textarea>
+      <div class="row" style="margin-top:8px">
+        <button :disabled="!planText" @click="savePlan">保存计划</button>
+        <span v-if="planSaved" class="ok">已保存 ✓</span>
+        <span class="grow"></span>
+        <span class="muted" v-if="plan && plan.searches">搜索词 {{plan.searches.length}} 组 · 定向公司 {{(plan.companies||[]).length}} 家</span>
+      </div>
+    </div>
     <div class="card">
       <h3>导入岗位表格（xlsx）</h3>
       <div class="row">
@@ -179,7 +234,7 @@ const CollectView = {
         <td class="muted">{{JSON.stringify(r.stats)}}</td></tr>
       </tbody></table>
     </div>
-    <div class="card muted">在线采集（关键词搜索 / 公司定向 / 同步刷新）在后续里程碑接入。</div>
+    <div class="card muted">按计划在线采集与同步刷新在 M4 接入。</div>
   </div>`
 }
 

@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from . import config
 from . import importer
+from . import strategy
 from .boss import cdp
 from .db import get_all_settings, get_db, init_db, now_iso, set_setting
 from .scoring import l1 as scoring_l1
@@ -158,6 +159,47 @@ def runs():
 def run_l1(body: dict = None):
     force = bool((body or {}).get("force"))
     return scoring_l1.run_l1(force=force)
+
+
+@app.post("/api/score/l2")
+def run_l2(body: dict = None):
+    from .scoring import l2 as scoring_l2
+    from . import llm as llm_mod
+    body = body or {}
+    if not llm_mod.configured():
+        raise HTTPException(400, "LLM 未配置：请在「设置」页填写 BYOK 信息")
+    try:
+        return scoring_l2.run_l2(limit=int(body.get("limit", 10)))
+    except llm_mod.LLMError as e:
+        raise HTTPException(400, str(e))
+
+
+# ── AI 采集策略 ─────────────────────────────────────────────────
+
+@app.get("/api/strategy")
+def get_strategy():
+    return strategy.get_plan()
+
+
+@app.post("/api/strategy/generate")
+def gen_strategy():
+    from . import llm as llm_mod
+    if not llm_mod.configured():
+        raise HTTPException(400, "LLM 未配置：请在「设置」页填写 BYOK 信息")
+    prof = get_db().execute("SELECT resume_text, expectations FROM profile WHERE id=1").fetchone()
+    try:
+        plan = strategy.generate_plan(prof["resume_text"],
+                                      json.loads(prof["expectations"] or "{}"))
+    except llm_mod.LLMError as e:
+        raise HTTPException(400, str(e))
+    strategy.save_plan(plan)
+    return plan
+
+
+@app.put("/api/strategy")
+def save_strategy(body: dict):
+    strategy.save_plan(body)
+    return {"ok": True}
 
 
 # ── 双账号 ──────────────────────────────────────────────────────
