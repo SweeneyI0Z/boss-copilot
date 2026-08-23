@@ -27,8 +27,9 @@ def _job_dict(row) -> dict:
 
 def detect_headhunter(company: str, hr_title: str = "", native_flag=None) -> tuple[bool, str]:
     """按原生字段、HR 职位、匿名公司名的优先级判断猎头岗位。"""
-    if native_flag is not None:
-        return bool(native_flag), "平台原生标志" if native_flag else "平台原生标志：否"
+    # 多信号采用 OR 语义；原生 false 不能压过明确的 HR/公司名信号。
+    if native_flag:
+        return True, "平台原生标志"
     if "猎头" in (hr_title or ""):
         return True, "招聘者职位包含“猎头”"
     if _HEADHUNTER_COMPANY_RE.fullmatch((company or "").strip()):

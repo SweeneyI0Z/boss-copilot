@@ -260,41 +260,103 @@ def import_json(body: dict):
 # ── 岗位 ────────────────────────────────────────────────────────
 
 @app.get("/api/jobs")
-def list_jobs(status: Optional[str] = None, q: str = "", source: str = "",
-              sort: str = "composite", limit: int = 50, offset: int = 0):
+def list_jobs(status: Optional[str] = "active", q: str = "", source: str = "",
+              keyword: str = "", favorite: str = "all", headhunter: str = "all",
+              resume_id: Optional[int] = None, sort: str = "composite",
+              limit: int = 50, offset: int = 0):
+    from . import resumes
+    try:
+        resume = resumes.get_default_resume() if resume_id is None else \
+            resumes.get_resume(resume_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     where, args = ["1=1"], []
-    if status:
-        where.append("status=?")
+    if status in (None, "", "active"):
+        where.append("j.status='active'")
+    elif status == "archived":
+        where.append("j.status IN ('delisted','hr_inactive')")
+    elif status != "all":
+        if status not in ("delisted", "hr_inactive", "excluded"):
+            raise HTTPException(400, "status 无效")
+        where.append("j.status=?")
         args.append(status)
     if source:
-        where.append("source=?")
+        where.append("j.source=?")
         args.append(source)
     if q:
-        where.append("(title LIKE ? OR company LIKE ?)")
+        where.append("(j.title LIKE ? OR j.company LIKE ?)")
         args += [f"%{q}%", f"%{q}%"]
+    if keyword:
+        where.append("EXISTS (SELECT 1 FROM job_collection_hits h WHERE h.job_key=j.job_key "
+                     "AND h.keyword LIKE ?)")
+        args.append(f"%{keyword}%")
+    if favorite == "only":
+        where.append("j.favorite_at IS NOT NULL")
+    elif favorite == "exclude":
+        where.append("j.favorite_at IS NULL")
+    elif favorite != "all":
+        raise HTTPException(400, "favorite 必须是 all/only/exclude")
+    hunter_expr = "COALESCE(j.headhunter_override,j.is_headhunter)"
+    if headhunter == "only":
+        where.append(f"{hunter_expr}=1")
+    elif headhunter == "exclude":
+        where.append(f"{hunter_expr}=0")
+    elif headhunter != "all":
+        raise HTTPException(400, "headhunter 必须是 all/only/exclude")
     cond = " AND ".join(where)
 
-    order = {"composite": "composite DESC, composite_rough DESC, l1_score DESC",
-             "l1": "composite_rough DESC, l1_score DESC",
-             "match": "match_score DESC, match_rough DESC",
-             "salary": "salary_max DESC",
-             "recent": "last_seen_at DESC"}.get(sort, "composite DESC")
+    order = {"composite": "current_composite DESC, current_composite_rough DESC",
+             "l1": "current_composite_rough DESC, current_l1_score DESC",
+             "job": "current_job_score DESC, current_l1_score DESC",
+             "match": "current_match_score DESC, current_match_rough DESC",
+             "salary": "j.salary_max DESC",
+             "recent": "j.last_seen_at DESC"}.get(sort, "current_composite DESC")
     conn = get_db()
-    total = conn.execute(f"SELECT COUNT(*) c FROM jobs WHERE {cond}", args).fetchone()["c"]
+    total = conn.execute(
+        f"SELECT COUNT(*) c FROM jobs j WHERE {cond}", args).fetchone()["c"]
+    score_exists = "s.job_key IS NOT NULL"
     rows = conn.execute(
-        f"SELECT job_key, title, company, salary, salary_max, experience, degree, location,"
-        f" industry, scale, stage, hr_active, source, status, l1_score, match_rough,"
-        f" composite_rough, job_score, match_score, composite, priority"
-        f" FROM jobs WHERE {cond} ORDER BY {order} LIMIT ? OFFSET ?",
-        args + [limit, offset]).fetchall()
+        f"SELECT j.job_key, j.title, j.company, j.salary, j.salary_max, j.experience, "
+        f"j.degree, j.location, j.industry, j.scale, j.stage, j.hr_active, j.source, "
+        f"j.status, j.last_seen_at, j.job_link, j.favorite_at, j.is_headhunter, "
+        f"j.headhunter_reason, j.headhunter_override, {hunter_expr} effective_headhunter, "
+        f"CASE WHEN {score_exists} THEN s.l1_score ELSE j.l1_score END current_l1_score, "
+        f"CASE WHEN {score_exists} THEN s.match_rough ELSE j.match_rough END current_match_rough, "
+        f"CASE WHEN {score_exists} THEN s.composite_rough ELSE j.composite_rough END current_composite_rough, "
+        f"CASE WHEN {score_exists} THEN s.job_score ELSE j.job_score END current_job_score, "
+        f"CASE WHEN {score_exists} THEN s.match_score ELSE j.match_score END current_match_score, "
+        f"CASE WHEN {score_exists} THEN s.composite ELSE j.composite END current_composite, "
+        f"CASE WHEN {score_exists} THEN s.priority ELSE j.priority END current_priority "
+        f"FROM jobs j LEFT JOIN job_resume_scores s ON s.job_key=j.job_key "
+        f"AND s.resume_id=? AND s.resume_revision=? WHERE {cond} "
+        f"ORDER BY {order} LIMIT ? OFFSET ?",
+        [resume["id"], resume["revision"], *args,
+         max(1, min(int(limit), 500)), max(0, int(offset))]).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        for source_name, target_name in (
+                ("current_l1_score", "l1_score"),
+                ("current_match_rough", "match_rough"),
+                ("current_composite_rough", "composite_rough"),
+                ("current_job_score", "job_score"),
+                ("current_match_score", "match_score"),
+                ("current_composite", "composite"),
+                ("current_priority", "priority")):
+            item[target_name] = item.pop(source_name)
+        item["is_favorite"] = bool(item.get("favorite_at"))
+        item["effective_headhunter"] = bool(item.get("effective_headhunter"))
+        items.append(item)
     counts = conn.execute(
         "SELECT status, COUNT(*) c FROM jobs GROUP BY status").fetchall()
-    return {"total": total, "items": [dict(r) for r in rows],
-            "status_counts": {r["status"]: r["c"] for r in counts}}
+    return {"total": total, "items": items,
+            "status_counts": {r["status"]: r["c"] for r in counts},
+            "resume_id": resume["id"], "resume_revision": resume["revision"]}
 
 
 @app.get("/api/jobs/{job_key}")
-def job_detail(job_key: str):
+def job_detail(job_key: str, resume_id: Optional[int] = None):
+    from . import applications, resumes
     conn = get_db()
     job = conn.execute("SELECT * FROM jobs WHERE job_key=?", (job_key,)).fetchone()
     if job is None:
@@ -302,6 +364,13 @@ def job_detail(job_key: str):
     detail = conn.execute(
         "SELECT jd, skill_tags, fetched_at FROM job_details WHERE job_key=?",
         (job_key,)).fetchone()
+    try:
+        resume = resumes.get_default_resume() if resume_id is None else \
+            resumes.get_resume(resume_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    current_score = resumes.get_job_score(job_key, resume["id"], resume["revision"])
+    baseline = resumes.get_job_baseline(job_key)
     out = dict(job)
     for f in ("l1_detail", "l2_detail"):
         try:
@@ -310,6 +379,25 @@ def job_detail(job_key: str):
             out[f] = {}
     out["jd"] = detail["jd"] if detail else ""
     out["skill_tags"] = detail["skill_tags"] if detail else ""
+    out["fetched_at"] = detail["fetched_at"] if detail else None
+    if current_score:
+        for field in ("l1_score", "l1_detail", "match_rough", "composite_rough",
+                      "job_score", "match_score", "composite", "priority",
+                      "l2_detail", "l2_source", "l2_stale"):
+            out[field] = current_score.get(field)
+    out["current_score"] = current_score
+    out["baseline"] = baseline
+    out["imported_baseline"] = baseline
+    out["resume"] = {"id": resume["id"], "name": resume["name"],
+                     "revision": resume["revision"]}
+    out["favorite"] = bool(out.get("favorite_at"))
+    out["is_favorite"] = out["favorite"]
+    out["effective_headhunter"] = bool(
+        out.get("is_headhunter") if out.get("headhunter_override") is None
+        else out.get("headhunter_override"))
+    out["headhunter_manual"] = (None if out.get("headhunter_override") is None
+                                else bool(out.get("headhunter_override")))
+    out["application"] = applications.get_application(job_key, resume["id"])
     return out
 
 
