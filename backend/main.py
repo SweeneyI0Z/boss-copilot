@@ -259,6 +259,76 @@ def sync_rescore():
     return {**result, "report": sync_mod.rescore_report()}
 
 
+# ── 招呼语 ──────────────────────────────────────────────────────
+
+@app.post("/api/greeting/generate")
+def greeting_generate(body: dict):
+    from . import greeting, llm as llm_mod
+    try:
+        return greeting.generate(body.get("job_key", ""))
+    except llm_mod.LLMError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/greetings")
+def greetings_list(status: str = ""):
+    from . import greeting
+    return greeting.list_queue(status or None) if status else greeting.list_queue()
+
+
+@app.post("/api/greetings/{gid}/approve")
+def greeting_approve(gid: int, body: dict):
+    from . import greeting, llm as llm_mod
+    try:
+        return greeting.approve(gid, int(body.get("index", 0)))
+    except llm_mod.LLMError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/greetings/{gid}/skip")
+def greeting_skip(gid: int):
+    from . import greeting
+    return greeting.skip(gid)
+
+
+@app.post("/api/greeting/send-batch")
+def greeting_send_batch():
+    """后台线程发送 approved 批次（账号A，全护栏）。"""
+    from . import sender
+    import threading
+
+    global _send_state
+    if getattr(_send_state, "running", False):
+        return {"ok": False, "error": "已有发送批次在执行"}
+
+    def _run():
+        try:
+            _send_state.result = sender.send_batch()
+        except Exception as e:  # 线程兜底：任何异常都可见
+            _send_state.result = {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]}
+        _send_state.running = False
+
+    _send_state.running = True
+    _send_state.result = None
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "note": "发送已在后台执行，间隔 30-90s/条；结果见发送状态"}
+
+
+@app.get("/api/greeting/send-status")
+def greeting_send_status():
+    from . import sender
+    from .db import get_setting
+    st = getattr(_send_state, "result", None)
+    return {"sending": getattr(_send_state, "running", False),
+            "last_result": st,
+            "halted_today": sender.halted_today(),
+            "halt_reason": get_setting("send_halt_reason", ""),
+            "sent_today": sender.sent_today()}
+
+
+_send_state = type("S", (), {"running": False, "result": None})()
+
+
 # ── 双账号 ──────────────────────────────────────────────────────
 
 @app.get("/api/accounts")

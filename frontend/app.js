@@ -11,7 +11,7 @@ const api = {
 const route = ref(location.hash.slice(1) || '/jobs')
 const nav = [
   ['/jobs', '岗位列表'], ['/jobcard', '作战卡'], ['/collect', '采集中心'],
-  ['/profile', '简历档案'], ['/accounts', '双账号'], ['/settings', '设置'],
+  ['/greetings', '招呼语'], ['/profile', '简历档案'], ['/accounts', '双账号'], ['/settings', '设置'],
 ]
 window.addEventListener('hashchange', () => { route.value = location.hash.slice(1) || '/jobs' })
 
@@ -96,16 +96,80 @@ const JobsView = {
   </div>`
 }
 
+// ── 页面：招呼语队列 ─────────────────────────────────────────────
+const GreetingsView = {
+  setup() {
+    const items = ref([]), tab = ref('draft'), st = ref({})
+    async function load() {
+      items.value = await api.get('/api/greetings' + (tab.value ? '?status=' + tab.value : ''))
+    }
+    async function loadSt() { try { st.value = await api.get('/api/greeting/send-status') } catch (e) {} }
+    onMounted(() => { load(); loadSt() })
+    function refresh() { load(); loadSt() }
+    async function approve(g, i) { await api.post('/api/greetings/' + g.id + '/approve', { index: i }); refresh() }
+    async function skip(g) { await api.post('/api/greetings/' + g.id + '/skip'); refresh() }
+    async function sendBatch() {
+      if (!confirm('发送所有已批准招呼语（账号A，随机间隔30-90秒，每日上限受护栏控制）。确认？')) return
+      const r = await api.post('/api/greeting/send-batch')
+      if (!r.ok) alert(r.error || '启动失败')
+      loadSt()
+    }
+    setInterval(refresh, 15000)
+    return { items, tab, st, approve, skip, sendBatch, refresh,
+      switchTab: t => { tab.value = t; load() } }
+  },
+  template: `
+  <div>
+    <h2>招呼语队列</h2>
+    <div class="card"><div class="row">
+      <span>今日已发 <b>{{st.sent_today ?? '—'}}</b> 条</span>
+      <span v-if="st.halted_today" class="bad">⚠ 已熔断：{{st.halt_reason}}</span>
+      <span v-if="st.sending" class="warn">● 发送执行中…</span>
+      <span class="grow"></span>
+      <button class="primary" :disabled="st.sending || st.halted_today" @click="sendBatch">发送已批准批次（账号A）</button>
+    </div>
+    <div v-if="st.last_result" class="muted" style="margin-top:8px">上次结果：{{JSON.stringify(st.last_result).slice(0,300)}}</div>
+    </div>
+    <div class="card"><div class="row" style="margin-bottom:10px">
+      <button :class="{primary: tab===t}" v-for="t in ['draft','approved','sent','failed','skipped']" :key="t" @click="switchTab(t)">{{t}}</button>
+    </div>
+    <div v-for="g in items" :key="g.id" class="card" style="background:var(--panel2)">
+      <div class="row">
+        <div class="grow"><b>{{g.title}}</b> <span class="muted">{{g.company}} · {{g.salary}} · {{g.priority}}</span></div>
+        <span class="tag">{{g.status}}</span>
+      </div>
+      <div v-for="(v,i) in g.variants" :key="i" class="row" style="margin-top:8px">
+        <input type="radio" :name="'g'+g.id" :checked="g.chosen===v" @change="approve(g,i)" :disabled="g.status!=='draft' && g.status!=='approved'">
+        <span class="grow">{{v}}</span>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <span class="muted" v-if="g.status==='approved'">已选定，等待发送</span>
+        <span class="ok" v-if="g.status==='sent'">已发送 {{(g.sent_at||'').slice(0,16)}}</span>
+        <span class="bad" v-if="g.status==='failed'">失败：{{g.error}}</span>
+        <span class="grow"></span>
+        <button v-if="g.status==='draft'" @click="skip(g.id)">跳过</button>
+      </div>
+    </div>
+    <div v-if="!items.length" class="muted">暂无{{tab}}条目——到「作战卡」页为岗位生成招呼语</div>
+    </div>
+  </div>`
+}
+
 // ── 页面：作战卡（岗位详情）─────────────────────────────────────
 const JobCardView = {
   setup() {
     const job = ref(null), err = ref('')
     const key = () => new URLSearchParams(location.hash.split('?')[1] || '').get('key')
+    async function genGreeting() {
+      try { const r = await api.post('/api/greeting/generate', { job_key: key() })
+        alert('已生成 ' + r.variants.length + ' 个变体（' + r.source + '），到「招呼语」页选择发送')
+      } catch (e) { alert('生成失败：' + e.message) }
+    }
     onMounted(async () => {
       try { job.value = await api.get('/api/jobs/' + encodeURIComponent(key())) }
       catch (e) { err.value = e.message }
     })
-    return { job, err }
+    return { job, err, genGreeting }
   },
   template: `
   <div v-if="job">
@@ -133,6 +197,10 @@ const JobCardView = {
         </div>
         <p v-if="job.l2_detail.summary" style="margin-top:12px">{{job.l2_detail.summary}}</p>
         <p v-if="job.l2_detail.advice" class="ok" style="margin-top:8px">💡 {{job.l2_detail.advice}}</p>
+        <div class="row" style="margin-top:14px">
+          <button class="primary" @click="genGreeting">✍ 生成招呼语（3 个变体）</button>
+          <a href="#/greetings" class="muted">去队列选择发送 →</a>
+        </div>
         <div v-if="job.l2_detail.greeting_angle" class="muted" style="margin-top:8px">招呼语切入点：{{job.l2_detail.greeting_angle}}</div>
       </div>
       <div class="card">
@@ -388,6 +456,7 @@ const App = {
     const view = computed(() => {
       const r = route.value
       if (r.startsWith('/jobcard')) return JobCardView
+      if (r.startsWith('/greetings')) return GreetingsView
       if (r.startsWith('/collect')) return CollectView
       if (r.startsWith('/profile')) return ProfileView
       if (r.startsWith('/accounts')) return AccountsView
