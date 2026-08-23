@@ -1,6 +1,6 @@
 # boss-copilot · 求职作战室
 
-简历驱动的 BOSS直聘全流程助手：**采集 → 评分（L1 电算 + L2 LLM 精评）→ 作战卡 → 招呼语 → 发送 → 消息管理 → 模拟面试**。本地 Web 应用，数据全部在 `~/.boss-copilot/`。
+简历驱动的 BOSS直聘求职作战室：**采集 → 多简历评分 → 收藏工作台 → 招呼语 → BOSS 平台确认 → 数据分析 → 模拟面试**。本地 Web 应用，数据全部在 `~/.boss-copilot/`。
 
 整合自：`boss-zhipin-scraper`（采集引擎，含 `--company` 公司定向）、`boss-helper`（发送/消息/护栏设计参考）、用户自有《岗位筛选评分规则》（L1/L2 全量落码）。
 
@@ -8,25 +8,33 @@
 
 ```bash
 cd ~/project/boss-copilot
-.venv/bin/python -m unittest discover tests   # 回归（83 例，必须全绿）
+.venv/bin/python -m unittest discover tests -v   # 回归（155 例，必须全绿）
 .venv/bin/uvicorn backend.main:app --port 8787
 # 浏览器打开 http://127.0.0.1:8787
 ```
 
 ## 首次配置（按顺序）
 
-1. **设置**：填 LLM BYOK（OpenAI 兼容：Base URL / API Key / 模型，如 DeepSeek），可先点「测试连通性」验证
-2. **简历档案**：粘贴简历全文（L2 精评、招呼语、模拟面试都以它为基线）
-3. **采集中心**：导入 xlsx 岗位表（`~/Desktop/深圳_…岗位JD详情….xlsx`）或「根据简历生成策略」后按计划采集
-4. **岗位列表**：「运行 L1 评分」→「L2 精评 (LLM)」
-5. **账号管理**：按需开启双账号模式；开启时分别为采集号(9222)与沟通号(9223)登录，关闭时只需登录沟通号
+1. **设置**：填 LLM BYOK（OpenAI 兼容），也可先使用 L1、导入和人工流程
+2. **简历档案**：建立一份或多份简历，维护期望、技能画像和 BOSS 简历标签
+3. **账号管理**：双账号时采集号负责只读采集，沟通号只用于受护栏保护的自动招呼和按需状态核验
+4. **采集中心**：配置关键词、全局城市和筛选条件，等待岗位列表与全部缺失 JD 采集完成
+5. **岗位列表**：展开 JD 后收藏或排除；收藏岗位进入「收藏工作台」切换简历比较评分
+6. **招呼语**：优先复制并到 BOSS 原平台人工发送，也可选择受全部护栏保护的自动批次
+
+## 与 BOSS 原平台配合
+
+- 本应用负责采集、分析、评分、收藏、招呼语生成和流程记录；最终发送与结果核验以 BOSS 原平台为准。
+- 「已打招呼」只统计自动确认成功或用户在 BOSS 发送后人工确认的记录。
+- 「已投递」只统计岗位页明确显示“简历已发送”或用户人工确认的记录；unknown 不计数。
+- 消息中心、历史会话同步和 AI 回复已下线：DOM 快照无法可靠保证完整历史和全部消息。
 
 ## 账号管理
 
 | 账号 | Chrome profile | CDP | 用途 |
 |------|----------------|-----|------|
 | 采集号 | `~/.boss-copilot/chrome-profile-collect` | 9222 | 全部采集（风控风险集中于此） |
-| 沟通号 | `~/.boss-copilot/chrome-profile-communication` | 9223 | 招呼语发送与消息收发；单账号模式下也负责采集 |
+| 沟通号 | `~/.boss-copilot/chrome-profile-communication` | 9223 | 招呼语发送与按需投递核验；单账号模式下也负责采集 |
 
 双账号模式默认开启，以保持原有的风控隔离行为。关闭后，采集脚本与沟通功能都连接沟通号的 9223 端口。挂系统代理（Clash 等）时后端已自动对 localhost CDP 绕过代理。
 
@@ -49,6 +57,10 @@ cd ~/project/boss-copilot
 | M5 | 招呼语生成/队列/发送（沟通号 UI 级操作 + 全护栏） | 847a127 |
 | M6 | 消息中心（DOM 快照轮询 + AI 草稿 + 人工点发） | cdd9c82 |
 | M7 | 模拟面试（出题/追问点评/报告） | 0de7372 |
+| M9 | 多简历/不可变评分基线/收藏排除/可靠状态模型 | b7aa1fc |
+| M10 | 总览看板/行内 JD/收藏工作台/新前端 | 0caf997 |
+| M11 | 多简历评分/三版招呼语/平台协同投递 | 2ab779b |
+| M12 | 模块化采集/精确来源归因/数据分析 | 本次提交 |
 
 ## 发送护栏（不可关闭）
 
@@ -57,7 +69,7 @@ cd ~/project/boss-copilot
 ## 开发规矩（强约束）
 
 1. **每个功能必须带测试用例**；任何 `backend/`、`frontend/` 改动后必须全量回归：
-   `.venv/bin/python -m unittest discover tests`（60 例全绿才可提交）
+   `.venv/bin/python -m unittest discover tests -v`
 2. **里程碑 = 一次 git commit**（Conventional Commits）
 3. 数据永不物理删除：岗位用状态机（active/delisted/hr_inactive/excluded）
 4. 导入的评分是基线，引擎评分不覆盖基线（`keep_imported`）
@@ -76,18 +88,21 @@ backend/
   scoring/l1.py  L1 电算评分（《岗位筛选评分规则》全量落码）
   scoring/l2.py  L2 LLM 精评（LLM 只出维度分，算术代码合成）
   strategy.py    AI 采集策略（简历→搜索计划）
-  greeting.py    招呼语生成（LLM 3 变体/模板兜底）+ 队列状态机
+  resumes.py     多简历、修订与岗位×简历评分
+  dashboard.py   总览统计与缓存系统状态
+  analytics.py   只基于可靠采集来源的数据分析
+  greeting.py    三版招呼语（LLM/模板兜底）+ 队列状态机
   sender.py      沟通号发送器（UI 级操作 + 护栏 + 熔断）
-  chatpoll.py    消息中心（DOM 快照 + AI 草稿 + 点发）
   interview.py   模拟面试 agent
   boss/cdp.py    账号 CDP 管理（单/双账号切换 + 代理绕过）
 frontend/        无构建 Vue3（app.js 单文件 + vendored vue.esm）
-tests/           83 个单测 + spike 脚本（spike_m5/m6_*）
+tests/           155 个单测 + 真实登录态只读 spike 脚本
 ```
 
 ## 已知边界
 
-- 发送/消息依赖沟通号登录态；未登录时相应接口优雅拒绝
-- 消息方向（HR 说的 vs 我说的）在 DOM 快照中不做结构化区分，AI 草稿以整段上下文理解
+- 自动招呼与按需投递状态探测依赖沟通号；未登录时优雅拒绝，推荐直接去 BOSS 原平台操作
+- 平台投递探测只认明确完成态，失败保持 unknown；不会读取或同步聊天历史
 - 公司页采集的岗位缺 industry/JD 字段时 L1 命中率记 0，补详情后重算即恢复
-- LLM 未配置时：L1/导入/队列可用，L2/策略/招呼语(LLM)/草稿/面试降级并提示
+- LLM 未配置时：L1/导入/采集/人工流程可用，L2/策略/招呼语(LLM)/面试降级并提示
+- 数据分析只统计 M12 新来源关系；旧 `origin_query` 数据需重新采集后才进入可靠样本

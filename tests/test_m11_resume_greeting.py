@@ -1,6 +1,7 @@
 """M11 多简历评分、招呼语修订与平台协同证据。"""
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,9 +15,9 @@ from backend import config  # noqa: E402
 config.DATA_DIR = Path(_TEST_HOME)
 config.DB_PATH = Path(_TEST_HOME) / "copilot.db"
 
-from backend import greeting, main, platform_status, resumes, strategy  # noqa: E402
-from backend.db import get_db, init_db, now_iso, set_setting  # noqa: E402
-from backend.scoring import l1  # noqa: E402
+from backend import greeting, llm, main, platform_status, resumes, sender, strategy  # noqa: E402
+from backend.db import get_db, get_setting, init_db, now_iso, set_setting  # noqa: E402
+from backend.scoring import l1, l2  # noqa: E402
 
 
 def _fake_client(content):
@@ -82,6 +83,65 @@ class ResumeScoringTests(unittest.TestCase):
         self.assertTrue(old["l2_stale"])
         self.assertIsNone(resumes.get_job_score("m11", self.a["id"], changed["revision"]))
 
+    def test_same_job_resume_cannot_run_concurrent_l2(self):
+        resumes.save_job_score(
+            "m11", self.a["id"], self.a["revision"], l1_score=70,
+            composite_rough=70, l1_detail={"cap": 100}, l1_source="engine")
+        started, release = threading.Event(), threading.Event()
+        response = ('{"dims":{"A":10},"s":{"S1":60},"adjust":[],'
+                    '"summary":"完成","advice":"正常投"}')
+
+        def create(**kwargs):
+            started.set()
+            release.wait(2)
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=response))])
+
+        client = SimpleNamespace(chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create)))
+        errors = []
+
+        def first_call():
+            try:
+                l2.score_job_llm("m11", client=client, resume_id=self.a["id"], force=True)
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=first_call)
+        thread.start()
+        self.assertTrue(started.wait(1))
+        with self.assertRaisesRegex(llm.LLMError, "正在进行"):
+            l2.score_job_llm("m11", client=client, resume_id=self.a["id"], force=True)
+        release.set()
+        thread.join(2)
+        self.assertFalse(errors)
+
+    def test_l2_finishing_after_resume_update_is_saved_stale(self):
+        resumes.save_job_score(
+            "m11", self.a["id"], self.a["revision"], l1_score=70,
+            composite_rough=70, l1_detail={"cap": 100}, l1_source="engine")
+        started, release = threading.Event(), threading.Event()
+        response = ('{"dims":{"A":10},"s":{"S1":60},"adjust":[],'
+                    '"summary":"旧修订结果","advice":"正常投"}')
+
+        def create(**kwargs):
+            started.set()
+            release.wait(2)
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=response))])
+
+        client = SimpleNamespace(chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create)))
+        thread = threading.Thread(target=lambda: l2.score_job_llm(
+            "m11", client=client, resume_id=self.a["id"], force=True))
+        thread.start()
+        self.assertTrue(started.wait(1))
+        resumes.update_resume(self.a["id"], resume_text="更新中的简历" * 20)
+        release.set()
+        thread.join(2)
+        old = resumes.get_job_score("m11", self.a["id"], self.a["revision"])
+        self.assertTrue(old["l2_stale"])
+
 
 class GreetingWorkflowTests(unittest.TestCase):
     def setUp(self):
@@ -102,6 +162,7 @@ class GreetingWorkflowTests(unittest.TestCase):
             "m11", client=_fake_client(response), resume_id=self.resume["id"])
         self.assertEqual(generated["variant_labels"],
                          ["专业完整版", "精简版", "技术聚焦版"])
+        self.assertEqual(len(generated["variants"]), 3)
         self.assertEqual(generated["resume_revision"], self.resume["revision"])
         greeting.approve(generated["id"], chosen_text="人工编辑后的招呼语")
         confirmed = greeting.confirm_manual(generated["id"])
@@ -120,14 +181,60 @@ class GreetingWorkflowTests(unittest.TestCase):
         resumes.update_resume(self.resume["id"], resume_text="新版简历正文" * 20)
         self.assertEqual(greeting.pending_batch(), [])
 
+    def test_omitted_resume_still_binds_default_revision(self):
+        response = ('{"professional":"专业版","concise":"精简版",'
+                    '"technical":"技术版"}')
+        generated = greeting.generate("m11", client=_fake_client(response))
+        self.assertEqual(generated["resume_id"], self.resume["id"])
+        self.assertEqual(generated["resume_revision"], self.resume["revision"])
+
 
 class ReliabilityBoundaryTests(unittest.TestCase):
+    def test_settings_cannot_relax_hard_send_guards(self):
+        _reset()
+        main.write_settings({
+            "send_daily_limit": 999, "send_daily_hard_cap": 999,
+            "send_gap_min_sec": 0, "send_gap_max_sec": 999,
+        })
+        self.assertEqual(get_setting("send_daily_hard_cap"), 110)
+        self.assertEqual(get_setting("send_daily_limit"), 110)
+        self.assertEqual(get_setting("send_gap_min_sec"), 30)
+        self.assertEqual(get_setting("send_gap_max_sec"), 90)
+
     def test_platform_probe_only_accepts_explicit_completed_state(self):
         self.assertEqual(platform_status.classify_application_text(
             "发送简历 继续沟通")["status"], "unknown")
         result = platform_status.classify_application_text("在线简历已发送")
         self.assertEqual(result["status"], "platform_confirmed")
         self.assertTrue(platform_status.classify_application_text("需要安全验证")["risk"])
+
+    def test_platform_transport_failure_degrades_to_unknown(self):
+        with patch.object(platform_status.cdp, "launch", return_value={"ok": True}), \
+                patch.object(platform_status.cdp, "login_state",
+                             return_value={"logged_in": True}), \
+                patch.object(platform_status, "_BrowserSession",
+                             side_effect=RuntimeError("websocket timeout")):
+            result = platform_status.probe_job_page("https://www.zhipin.com/job_detail/x.html")
+        self.assertEqual(result["status"], "unknown")
+        self.assertIn("探测失败", result["hint"])
+
+    def test_archived_resume_cannot_create_new_artifacts(self):
+        _reset()
+        _job("archived")
+        first = resumes.create_resume("待归档", "完整正文" * 20, make_default=True)
+        resumes.create_resume("保留简历", "另一份正文" * 20)
+        resumes.archive_resume(first["id"])
+        with self.assertRaises(ValueError):
+            l1.run_l1(force=True, resume_id=first["id"])
+        with self.assertRaises(ValueError):
+            resumes.save_job_score("archived", first["id"], l1_score=1)
+        with self.assertRaises(llm.LLMError):
+            greeting.generate("archived", resume_id=first["id"])
+
+    def test_sender_source_enables_focus_emulation(self):
+        import inspect
+        self.assertIn("Emulation.setFocusEmulationEnabled",
+                      inspect.getsource(sender.send_batch))
 
     def test_collect_plan_is_isolated_by_resume(self):
         strategy.save_plan({"searches": [{"keyword": "固件"}]}, resume_id=1)

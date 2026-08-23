@@ -162,15 +162,16 @@ def match_rough(job: dict, jd_text: str, dictionary: dict, cap: float,
                 expect: dict) -> tuple:
     text = " ".join([job.get("title") or "", job.get("skills") or "",
                      (jd_text or "")[:1500]])
-    half = set(dictionary.get("half_weight", []))
+    half = {str(word) for word in dictionary.get("half_weight", [])}
     hits = 0.0
     per_cat = {}
-    for cat in ("embedded", "comm_iot", "hardware", "ai_soft", "domain_algo"):
+    for cat in ("embedded", "comm_iot", "hardware", "ai_soft", "domain_algo", "general"):
         words = dictionary.get(cat, [])
         cat_hits = 0.0
         for w in words:
-            if w.lower() in text.lower():
-                cat_hits += 0.5 if w in half else 1.0
+            word = str(w)
+            if word.lower() in text.lower():
+                cat_hits += 0.5 if word in half else 1.0
         per_cat[cat] = round(cat_hits, 1)
         hits += cat_hits
     coverage = min(hits / 14.0, 1.0)          # 14 个加权命中即视为满覆盖（可调参数）
@@ -224,33 +225,49 @@ def score_job(job: dict, jd_text: str, dictionary: dict, expect: dict) -> dict:
 
 # ── 全量执行（只填空值；force=True 时重算并覆盖 L1 自身）──────────
 def _merge_resume_dictionary(skill_profile: dict) -> dict:
-    """把全局规则词典与当前简历画像合并，避免多简历得到相同匹配分。"""
-    dictionary = json.loads(
+    """构造当前简历技能词典；空画像才沿用旧版单简历基线。"""
+    legacy_dictionary = json.loads(
         get_db().execute("SELECT value FROM settings WHERE key='skill_dictionary'")
         .fetchone()[0]) if get_db().execute(
         "SELECT 1 FROM settings WHERE key='skill_dictionary'").fetchone() else \
         config.DEFAULT_SKILL_DICTIONARY
-    merged = {k: list(v) for k, v in dictionary.items()}
     profile = skill_profile if isinstance(skill_profile, dict) else {}
+    if not profile:
+        return {k: list(v) for k, v in legacy_dictionary.items()}
+    merged = {category: [] for category in
+              ("embedded", "comm_iot", "hardware", "ai_soft", "domain_algo",
+               "general", "half_weight")}
     for category in ("embedded", "comm_iot", "hardware", "ai_soft", "domain_algo",
                      "half_weight"):
         values = profile.get(category, [])
         if isinstance(values, str):
             values = [x.strip() for x in re.split(r"[,，|、\n]", values) if x.strip()]
         if isinstance(values, list):
-            merged[category] = list(dict.fromkeys(merged.get(category, []) + values))
-    # 简单画像也可只维护一个 skills 数组；归入通用软件技能词典参与匹配。
+            merged[category] = list(dict.fromkeys(values))
+    # 简单画像的 skills 属于通用命中，不能全部误归类为 AI 技能。
     generic = profile.get("skills", [])
     if isinstance(generic, str):
         generic = [x.strip() for x in re.split(r"[,，|、\n]", generic) if x.strip()]
     if isinstance(generic, list):
-        merged["ai_soft"] = list(dict.fromkeys(merged.get("ai_soft", []) + generic))
+        merged["general"] = list(dict.fromkeys(generic))
+    seen = set()
+    for category in ("embedded", "comm_iot", "hardware", "ai_soft", "domain_algo",
+                     "general"):
+        unique = []
+        for word in merged[category]:
+            marker = str(word).lower()
+            if marker not in seen:
+                unique.append(word)
+                seen.add(marker)
+        merged[category] = unique
     return merged
 
 
 def _resume_context(resume_id: int) -> tuple:
     from .. import resumes
     resume = resumes.get_resume(resume_id)
+    if resume.get("archived"):
+        raise ValueError("已归档简历不能用于新评分")
     expect = {**DEFAULT_EXPECT, **(resume.get("expectations") or {})}
     dictionary = _merge_resume_dictionary(resume.get("skill_profile") or {})
     return resume, expect, dictionary
@@ -286,7 +303,7 @@ def run_l1(force: bool = False, keep_imported: bool = False,
         is_imported = "imported" in (r["l1_detail"] or "")
         if profile_mode:
             existing = conn.execute(
-                "SELECT l1_score FROM job_resume_scores WHERE job_key=? AND resume_id=? "
+                "SELECT l1_score,composite FROM job_resume_scores WHERE job_key=? AND resume_id=? "
                 "AND resume_revision=?", (r["job_key"], resume_id, revision)).fetchone()
             if not force and existing and existing["l1_score"] is not None:
                 skipped += 1
@@ -302,11 +319,16 @@ def run_l1(force: bool = False, keep_imported: bool = False,
         detail_json = json.dumps(result["l1_detail"], ensure_ascii=False)
         if profile_mode:
             from .. import resumes
+            score_fields = {
+                "l1_score": result["job_rough"], "l1_detail": result["l1_detail"],
+                "match_rough": result["match_rough"],
+                "composite_rough": result["composite_rough"], "l1_source": "engine",
+            }
+            if not existing or existing["composite"] is None:
+                score_fields["priority"] = result["priority_rough"]
             resumes.save_job_score(
                 r["job_key"], resume_id=resume_id, resume_revision=revision,
-                l1_score=result["job_rough"], l1_detail=result["l1_detail"],
-                match_rough=result["match_rough"],
-                composite_rough=result["composite_rough"], l1_source="engine")
+                **score_fields)
         else:
             conn.execute(
                 "UPDATE jobs SET l1_score=?, l1_detail=?, match_rough=?, composite_rough=? "

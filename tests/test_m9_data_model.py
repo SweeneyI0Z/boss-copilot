@@ -57,6 +57,7 @@ class SchemaMigrationTests(unittest.TestCase):
     def test_legacy_profile_scores_greeting_and_interview_migrate_once(self):
         conn = get_db()
         conn.execute("DELETE FROM resumes")
+        conn.execute("DELETE FROM settings WHERE key='legacy_score_migration_completed'")
         conn.execute(
             "UPDATE profile SET resume_text=?, expectations=?",
             ("旧版简历正文", '{"city":"深圳"}'))
@@ -110,11 +111,73 @@ class ResumeTests(unittest.TestCase):
         profile = get_db().execute("SELECT * FROM profile WHERE id=1").fetchone()
         self.assertEqual(profile["resume_text"], "新的简历正文")
 
+    def test_restart_never_migrates_legacy_score_into_new_revision(self):
+        default = resumes.get_default_resume()
+        resumes.save_job_score(
+            "j1", default["id"], l1_score=70, composite=80, l2_source="llm")
+        changed = resumes.update_resume(default["id"], resume_text="第二版简历正文")
+        self.assertEqual(changed["revision"], 2)
+        init_db()
+        self.assertIsNone(resumes.get_job_score("j1", default["id"], 2))
+        self.assertEqual(resumes.get_job_score("j1", default["id"], 1)["composite"], 80)
+
+    def test_restart_never_moves_new_default_scores_to_legacy_resume(self):
+        legacy = resumes.get_default_resume()
+        second = resumes.create_resume("第二份", "Python 项目", make_default=True)
+        _job("j2")
+        resumes.save_job_score("j2", second["id"], l1_score=92, composite=92,
+                               l2_source="llm")
+        init_db()
+        self.assertIsNone(resumes.get_job_score("j2", legacy["id"], 1))
+        self.assertEqual(resumes.get_job_score("j2", second["id"], 1)["composite"], 92)
+
     def test_metadata_update_does_not_increment_revision(self):
         default = resumes.get_default_resume()
         changed = resumes.update_resume(
             default["id"], name="主简历", boss_resume_label="BOSS在线简历")
         self.assertEqual(changed["revision"], default["revision"])
+
+    def test_plain_text_profile_fields_are_preserved(self):
+        resume = resumes.create_resume(
+            "文本画像", "正文", expectations="深圳，期望30K",
+            skill_profile="Python，STM32\nAgent")
+        self.assertEqual(resume["expectations"], {"notes": "深圳，期望30K"})
+        self.assertEqual(resume["skill_profile"],
+                         {"skills": ["Python", "STM32", "Agent"]})
+
+    def test_missing_skill_profile_is_derived_from_resume_text(self):
+        resume = resumes.create_resume(
+            "自动画像", "使用 Python、FastAPI 开发 Agent，并负责 STM32 固件")
+        self.assertTrue(resume["skill_profile"]["derived"])
+        self.assertIn("Python", resume["skill_profile"]["ai_soft"])
+        self.assertIn("STM32", resume["skill_profile"]["embedded"])
+
+    def test_derived_profile_refreshes_when_resume_text_changes(self):
+        resume = resumes.create_resume("自动画像", "Python FastAPI Agent")
+        changed = resumes.update_resume(
+            resume["id"], resume_text="STM32 固件 嵌入式",
+            skill_profile=resume["skill_profile"])
+        self.assertNotIn("ai_soft", changed["skill_profile"])
+        self.assertIn("STM32", changed["skill_profile"]["embedded"])
+
+    def test_manual_profile_edit_overrides_automatic_derivation(self):
+        resume = resumes.create_resume("自动画像", "Python FastAPI Agent")
+        changed = resumes.update_resume(
+            resume["id"], resume_text="STM32 固件",
+            skill_profile={**resume["skill_profile"], "skills": ["自定义能力"]})
+        self.assertNotIn("derived", changed["skill_profile"])
+        self.assertEqual(changed["skill_profile"]["skills"], ["自定义能力"])
+
+    def test_json_array_profile_input_is_preserved(self):
+        resume = resumes.create_resume(
+            "数组画像", "正文", expectations='["深圳", "30K"]',
+            skill_profile='["Python", "STM32"]')
+        self.assertEqual(resume["expectations"], {"notes": ["深圳", "30K"]})
+        self.assertEqual(resume["skill_profile"], {"skills": ["Python", "STM32"]})
+
+    def test_skill_profile_rejects_non_string_array_items(self):
+        with self.assertRaisesRegex(ValueError, "只接受字符串"):
+            resumes.create_resume("错误画像", "正文", skill_profile=["STM32", 51])
 
     def test_default_switch_and_soft_archive(self):
         first = resumes.get_default_resume()
@@ -199,6 +262,15 @@ class ApplicationAndDashboardTests(unittest.TestCase):
             "j1", second["id"])["status"], "manual_confirmed")
         self.assertEqual(applications.get_application("j1")["status"], "unknown")
 
+    def test_dashboard_counts_each_confirmed_resume_delivery(self):
+        default = resumes.get_default_resume()
+        second = resumes.create_resume("第二份")
+        applications.confirm_application("j1", default["id"])
+        applications.confirm_application("j1", second["id"])
+        metrics = dashboard.get_dashboard()["metrics"]["applications"]
+        self.assertEqual(metrics["total"], 2)
+        self.assertEqual(metrics["manual_confirmed"], 2)
+
     def test_dashboard_counts_confirmed_facts_and_cached_status(self):
         default = resumes.get_default_resume()
         job_state.favorite_job("j1")
@@ -226,6 +298,17 @@ class ApplicationAndDashboardTests(unittest.TestCase):
         self.assertEqual(data["metrics"]["applications"]["total"], 1)
         self.assertEqual(data["metrics"]["greetings"]["total"], 1)
         self.assertEqual(data["system"]["color"], "green")
+
+    def test_dashboard_file_freshness_prefers_source_time_over_import_time(self):
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO collect_runs(kind,params,stats,started_at,finished_at,status,"
+            "data_source_at) VALUES('xlsx_import','{}','{}',?,?, 'succeeded',?)",
+            (now_iso(), now_iso(), "2020-01-01T00:00:00+08:00"))
+        conn.commit()
+        collection = dashboard.get_dashboard()["system"]["collection"]
+        self.assertEqual(collection["file_data_at"], "2020-01-01T00:00:00+08:00")
+        self.assertTrue(collection["stale"])
 
 
 if __name__ == "__main__":

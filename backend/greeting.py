@@ -6,10 +6,10 @@ from .db import get_db, now_iso
 
 SYSTEM_PROMPT = """你是求职沟通专家，为一个岗位写 BOSS直聘 打招呼开场白。
 
-硬性要求：
-1. professional 为 150-220 字的专业完整版，接近用户给出的完整经历概述
-2. concise 为 80-120 字的精简版，保留最强匹配点
-3. technical 为 120-180 字的技术聚焦版，突出与 JD 直接相关的技术链路
+写作要求：
+1. professional 为专业完整版，建议 150-220 字，接近用户给出的完整经历概述
+2. concise 为精简版，建议 80-120 字，保留最强匹配点
+3. technical 为技术聚焦版，建议 120-180 字，突出与 JD 直接相关的技术链路
 4. 开头自然表达对具体岗位感兴趣，结尾礼貌邀请进一步沟通
 5. 不虚构简历里没有的经历，不堆砌 JD 关键词，不使用夸张承诺
 只输出 JSON。"""
@@ -17,18 +17,39 @@ SYSTEM_PROMPT = """你是求职沟通专家，为一个岗位写 BOSS直聘 打�
 SCHEMA = """{"professional":"专业完整版","concise":"精简版","technical":"技术聚焦版"}"""
 VARIANT_LABELS = ["专业完整版", "精简版", "技术聚焦版"]
 
-# 无 LLM 时的兜底模板（greeting_angle 来自 L2；再兜底用岗位名）
-FALLBACK = ("您好，我对贵司的「{title}」很感兴趣。我具备与岗位相关的{angle}经验，"
-            "希望有机会结合具体业务进一步沟通，谢谢！")
+# 无 LLM 或缺少某个版本时使用不虚构经历的安全文案。
+def _fallback_variants(title: str, angle: str) -> list[str]:
+    title = title[:20]
+    angle = angle[:24]
+    raw = [
+        (f"您好，我对贵司的「{title}」很感兴趣。从岗位描述看，工作重点与{angle}方向相关。"
+         "我希望结合简历中的真实经历，进一步介绍自己在需求分析、方案设计、功能开发、"
+         "联调测试和持续迭代中的具体职责，以及项目里的技术取舍、问题处理和最终交付结果。"
+         "对于暂未覆盖的要求，我也会如实说明能力边界和学习计划。希望有机会了解团队现阶段"
+        "的业务目标、协作方式和岗位最需要解决的问题，并进一步沟通，谢谢！"),
+        (f"您好，我对贵司的「{title}」很感兴趣。从 JD 看，岗位重点涉及{angle}。"
+         "希望有机会结合岗位需求，进一步介绍简历里真实记录的职责、技术方案和交付结果，也期待了解团队当前重点，谢谢！"),
+        (f"您好，我关注到贵司正在招聘「{title}」。从 JD 看，岗位重点涉及{angle}。"
+         "我希望重点沟通简历中与此相关的技术实践，包括实际负责的模块、方案选择、联调测试、"
+         "问题定位和迭代交付；对尚未覆盖的能力要求也会如实说明。期待进一步了解具体业务场景、"
+         "技术栈和团队当前最需要解决的问题，谢谢！"),
+    ]
+    return raw
 
 
 def _resume_context(resume_id=None):
     conn = get_db()
     if resume_id is None:
         prof = conn.execute("SELECT resume_text FROM profile WHERE id=1").fetchone()
-        return (prof["resume_text"] or "").strip(), None, None
+        # 兼容旧 profile 直接写入，但新记录仍绑定默认简历修订，不能绕过失效检查。
+        from . import resumes
+        default = resumes.get_default_resume()
+        return ((prof["resume_text"] or default.get("resume_text") or "").strip(),
+                int(default["id"]), int(default["revision"]))
     from . import resumes
     prof = resumes.get_resume(int(resume_id))
+    if prof.get("archived"):
+        raise llm.LLMError("已归档简历不能用于生成招呼语")
     return (prof.get("resume_text") or "").strip(), int(prof["id"]), int(prof["revision"])
 
 
@@ -66,16 +87,15 @@ def generate(job_key: str, client=None, resume_id: int = None) -> dict:
             variants = [v.strip() for v in candidates if isinstance(v, str) and v.strip()]
         except llm.LLMError:
             variants = None
+    fallback_variants = _fallback_variants(
+        row["title"], angle or f"{row['title'][:12]}相关")
     if not variants:
         source = "template"
-        key = angle[:18] if angle else f"{row['title'][:12]}相关"
-        base = FALLBACK.format(title=row["title"][:20], angle=key)
-        variants = [base, base.replace("希望有机会结合具体业务进一步沟通", "方便的话想进一步了解岗位需求"),
-                    base.replace("具备与岗位相关的", "在项目中积累了与岗位相关的")]
+        variants = fallback_variants
+    else:
+        variants = [variants[index] if index < len(variants) and variants[index]
+                    else fallback_variants[index] for index in range(3)]
     variants = variants[:3]
-    while len(variants) < 3:
-        variants.append(variants[-1] if variants else FALLBACK.format(
-            title=row["title"][:20], angle=row["title"][:12]))
 
     if resume_id is None:
         exist = conn.execute("SELECT id FROM greetings WHERE job_key=? AND resume_id IS NULL "
@@ -189,6 +209,6 @@ def pending_batch() -> list:
         "j.title, j.company, j.job_link FROM greetings g "
         "JOIN jobs j ON j.job_key=g.job_key LEFT JOIN resumes r ON r.id=g.resume_id "
         "WHERE g.status='approved' AND j.status='active' "
-        "AND (g.resume_id IS NULL OR g.resume_revision=r.revision) "
+        "AND g.resume_id IS NOT NULL AND g.resume_revision=r.revision "
         "ORDER BY j.composite DESC").fetchall()
     return [dict(r) for r in rows]

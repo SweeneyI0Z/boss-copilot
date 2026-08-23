@@ -191,8 +191,8 @@ def send_batch() -> dict:
     if halted_today():
         return {"ok": False, "halted": True,
                 "reason": get_setting("send_halt_reason", "今天已熔断")}
-    limit = int(get_setting("send_daily_limit", 40))
-    hard = int(get_setting("send_daily_hard_cap", 110))
+    hard = min(110, max(1, int(get_setting("send_daily_hard_cap", 110))))
+    limit = min(hard, max(1, int(get_setting("send_daily_limit", 40))))
     already = sent_today()
     if already >= hard:
         return {"ok": False, "halted": True, "reason": f"已达硬顶 {hard}"}
@@ -219,6 +219,7 @@ def send_batch() -> dict:
             page = next((t for t in targets if t["type"] == "page"), None)
             self.ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=15)
             self.sid = 1
+            self.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
 
         def send(self, method, params, sid=None):
             self.sid += 1
@@ -271,6 +272,12 @@ def send_batch() -> dict:
                 sent += 1
             else:
                 if result.get("halt_reason"):
+                    conn.execute(
+                        "UPDATE greetings SET status='needs_review', delivery_channel='auto', "
+                        "delivery_status='needs_review', error=?, updated_at=? WHERE id=?",
+                        ((result["halt_reason"] or "风控后待核验")[:200], now_iso(),
+                         item["id"]))
+                    conn.commit()
                     halt(result["halt_reason"])
                     skipped.append({**item, "why": f"熔断: {result['halt_reason']}"})
                     break
@@ -288,8 +295,9 @@ def send_batch() -> dict:
                     ((result.get("error") or "unknown")[:200], now_iso(), item["id"]))
                 conn.commit()
                 failed.append({**item, "error": result.get("error")})
-            gap = random.uniform(int(get_setting("send_gap_min_sec", 30)),
-                                 int(get_setting("send_gap_max_sec", 90)))
+            gap_min = min(90, max(30, int(get_setting("send_gap_min_sec", 30))))
+            gap_max = min(90, max(gap_min, int(get_setting("send_gap_max_sec", 90))))
+            gap = random.uniform(gap_min, gap_max)
             time.sleep(gap)
     finally:
         cli.close()

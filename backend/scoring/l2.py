@@ -4,6 +4,7 @@
 所有算术（岗位分求和、匹配度合成、综合分、P级）由代码计算，保证确定性。
 """
 import json
+import threading
 
 from .. import llm
 from ..db import get_db, now_iso
@@ -48,6 +49,8 @@ T3 交叉岗:   S1嵌入式基础35 S2 AI应用能力35 S3交叉场景价值30�
 }}"""
 
 E1_HINT = "已上市:万人12/千人11/其他10；D轮+→10；不需要融资:千人+10/百人8/几十人7/0-20人5；B/C轮8-10；A轮6-8；天使/未融资3-6"
+_INFLIGHT = set()
+_INFLIGHT_LOCK = threading.Lock()
 
 
 def _resume_digest(resume_id: int = None) -> tuple:
@@ -60,6 +63,8 @@ def _resume_digest(resume_id: int = None) -> tuple:
     else:
         from .. import resumes
         row = resumes.get_resume(int(resume_id))
+        if row.get("archived"):
+            raise llm.LLMError("已归档简历不能用于新评分")
         text = (row.get("resume_text") or "").strip()
         expectations = row.get("expectations") or {}
         revision = int(row["revision"])
@@ -109,6 +114,21 @@ def finalize(result: dict, cap: float) -> dict:
 
 def score_job_llm(job_key: str, client=None, resume_id: int = None,
                   force: bool = False) -> dict:
+    """同一岗位×简历在单进程内只允许一个 L2 调用，避免并发随机覆盖。"""
+    claim = (job_key, int(resume_id) if resume_id is not None else None)
+    with _INFLIGHT_LOCK:
+        if claim in _INFLIGHT:
+            raise llm.LLMError("该岗位与简历正在进行 L2 评分，请勿重复提交")
+        _INFLIGHT.add(claim)
+    try:
+        return _score_job_llm(job_key, client=client, resume_id=resume_id, force=force)
+    finally:
+        with _INFLIGHT_LOCK:
+            _INFLIGHT.discard(claim)
+
+
+def _score_job_llm(job_key: str, client=None, resume_id: int = None,
+                   force: bool = False) -> dict:
     conn = get_db()
     row = conn.execute(
         "SELECT j.*, d.jd FROM jobs j LEFT JOIN job_details d ON d.job_key=j.job_key "
@@ -120,6 +140,8 @@ def score_job_llm(job_key: str, client=None, resume_id: int = None,
     if resume_id is not None:
         from .. import resumes
         profile_score = resumes.get_job_score(job_key, resume_id, revision)
+        if profile_score and profile_score.get("composite") is not None and not force:
+            raise llm.LLMError("该简历修订已有 L2 评分，未覆盖（需 force 重评）")
     l1_detail = (profile_score or {}).get("l1_detail") or \
         json.loads(row["l1_detail"] or "{}")
     expect = {"salary_max": 30, **expect}
@@ -128,15 +150,12 @@ def score_job_llm(job_key: str, client=None, resume_id: int = None,
     result = finalize(result, cap=float(l1_detail.get("cap", 100)))
     result["engine"] = "l2-llm"
     if resume_id is not None:
-        existing = profile_score and profile_score.get("composite") is not None
-        if existing and not force:
-            raise llm.LLMError("该简历修订已有 L2 评分，未覆盖（需 force 重评）")
         from .. import resumes
-        resumes.save_job_score(
+        resumes.save_l2_result(
             job_key, resume_id=resume_id, resume_revision=revision,
             job_score=result["job_score"], match_score=result["match_score"],
             composite=result["composite"], priority=result["priority"],
-            l2_detail=result, l2_source="llm", l2_stale=False)
+            l2_detail=result, l2_source="llm")
     else:
         cur = conn.execute(
             "UPDATE jobs SET job_score=?, match_score=?, composite=?, priority=?, "

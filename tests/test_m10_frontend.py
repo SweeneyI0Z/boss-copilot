@@ -44,10 +44,12 @@ class FrontendWorkspaceTests(unittest.TestCase):
         self.assertIn("自动发送为次级方式", self.source)
 
     def test_collect_modules_and_native_charts_are_present(self):
-        for text in ("省份 / 城市", "至少填写一个关键词并选择一个城市", "关键词×城市组合",
+        for text in ("省份 / 城市", "至少填写一个关键词或一个公司 URL / brandId", "关键词×城市组合",
                      "列表采集", "JD 详情", "仅重试缺失 JD"):
             self.assertIn(text, self.source)
         self.assertIn("combinations.value > 20", self.source)
+        self.assertIn("const hasTasks", self.source)
+        self.assertIn("status.run_id", self.source)
         self.assertIn("const SvgBars", self.source)
         self.assertIn('<svg viewBox="0 0 100 12"', self.source)
         self.assertNotIn("chart.js", self.source.lower())

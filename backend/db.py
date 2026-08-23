@@ -310,39 +310,67 @@ def _migrate_legacy_data(conn: sqlite3.Connection) -> None:
         "UPDATE resumes SET is_default=CASE WHEN id=? THEN 1 ELSE 0 END "
         "WHERE archived_at IS NULL", (default_id,))
 
-    default = conn.execute("SELECT * FROM resumes WHERE id=?", (default_id,)).fetchone()
-    revision = default["revision"]
-    rows = conn.execute(
-        "SELECT * FROM jobs WHERE l1_score IS NOT NULL OR job_score IS NOT NULL "
-        "OR match_score IS NOT NULL OR composite IS NOT NULL").fetchall()
-    for row in rows:
-        l1_source = _json_source(row["l1_detail"], "legacy")
-        l2_source = row["l2_source"] or "legacy"
-        ts = row["last_seen_at"] or now_iso()
+    # legacy profile 的迁移目标一经确定就保持不变；后续切换默认简历或提升修订号
+    # 时，重启不能把 jobs 旧镜像灌入另一份简历的当前修订。
+    marker = conn.execute(
+        "SELECT value FROM settings WHERE key='legacy_profile_resume_id'").fetchone()
+    try:
+        legacy_resume_id = int(json.loads(marker["value"])) if marker else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        legacy_resume_id = None
+    legacy_resume = conn.execute(
+        "SELECT * FROM resumes WHERE id=?", (legacy_resume_id,)).fetchone() \
+        if legacy_resume_id else None
+    if legacy_resume is None:
+        legacy_resume_id = default_id
+        legacy_resume = conn.execute(
+            "SELECT * FROM resumes WHERE id=?", (legacy_resume_id,)).fetchone()
         conn.execute(
-            "INSERT OR IGNORE INTO job_resume_scores("
-            "job_key, resume_id, resume_revision, l1_score, l1_detail, match_rough, "
-            "composite_rough, l1_source, job_score, match_score, composite, priority, "
-            "l2_detail, l2_source, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (row["job_key"], default_id, revision, row["l1_score"],
-             row["l1_detail"] or "{}", row["match_rough"], row["composite_rough"],
-             l1_source, row["job_score"], row["match_score"], row["composite"],
-             row["priority"] or "", row["l2_detail"] or "{}", l2_source, ts, ts))
-        if l1_source == "imported" or l2_source == "imported":
+            "INSERT INTO settings(key,value) VALUES('legacy_profile_resume_id',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (json.dumps(legacy_resume_id),))
+    revision = 1
+    completed = conn.execute(
+        "SELECT value FROM settings WHERE key='legacy_score_migration_completed'").fetchone()
+    try:
+        migration_done = bool(json.loads(completed["value"])) if completed else False
+    except (TypeError, ValueError, json.JSONDecodeError):
+        migration_done = False
+    if not migration_done:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE l1_score IS NOT NULL OR job_score IS NOT NULL "
+            "OR match_score IS NOT NULL OR composite IS NOT NULL").fetchall()
+        for row in rows:
+            l1_source = _json_source(row["l1_detail"], "legacy")
+            l2_source = row["l2_source"] or "legacy"
+            ts = row["last_seen_at"] or now_iso()
             conn.execute(
-                "INSERT OR IGNORE INTO job_score_baselines("
-                "job_key, l1_score, l1_detail, match_rough, composite_rough, job_score, "
-                "match_score, composite, priority, l2_detail, imported_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (row["job_key"], row["l1_score"], row["l1_detail"] or "{}",
-                 row["match_rough"], row["composite_rough"], row["job_score"],
-                 row["match_score"], row["composite"], row["priority"] or "",
-                 row["l2_detail"] or "{}", ts))
+                "INSERT OR IGNORE INTO job_resume_scores("
+                "job_key, resume_id, resume_revision, l1_score, l1_detail, match_rough, "
+                "composite_rough, l1_source, job_score, match_score, composite, priority, "
+                "l2_detail, l2_source, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (row["job_key"], legacy_resume_id, revision, row["l1_score"],
+                 row["l1_detail"] or "{}", row["match_rough"], row["composite_rough"],
+                 l1_source, row["job_score"], row["match_score"], row["composite"],
+                 row["priority"] or "", row["l2_detail"] or "{}", l2_source, ts, ts))
+            if l1_source == "imported" or l2_source == "imported":
+                conn.execute(
+                    "INSERT OR IGNORE INTO job_score_baselines("
+                    "job_key, l1_score, l1_detail, match_rough, composite_rough, job_score, "
+                    "match_score, composite, priority, l2_detail, imported_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (row["job_key"], row["l1_score"], row["l1_detail"] or "{}",
+                     row["match_rough"], row["composite_rough"], row["job_score"],
+                     row["match_score"], row["composite"], row["priority"] or "",
+                     row["l2_detail"] or "{}", ts))
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES('legacy_score_migration_completed','true') "
+            "ON CONFLICT(key) DO UPDATE SET value='true'")
 
     conn.execute(
         "UPDATE greetings SET resume_id=?, resume_revision=? "
-        "WHERE resume_id IS NULL", (default_id, revision))
+        "WHERE resume_id IS NULL", (legacy_resume_id, revision))
     conn.execute(
         "UPDATE greetings SET delivery_channel='auto' "
         "WHERE delivery_channel='' AND status IN "
@@ -360,7 +388,7 @@ def _migrate_legacy_data(conn: sqlite3.Connection) -> None:
         "WHERE updated_at IS NULL")
     conn.execute(
         "UPDATE interviews SET resume_id=?, resume_revision=? WHERE resume_id IS NULL",
-        (default_id, revision))
+        (legacy_resume_id, revision))
 
 
 def init_db() -> None:

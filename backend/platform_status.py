@@ -100,13 +100,16 @@ def probe_job_page(job_link: str, wait_sec: int = 12) -> dict:
             if classified.get("status") == "platform_confirmed" or classified.get("risk"):
                 return classified
         return classify_application_text(latest)
-    except (OSError, RuntimeError, KeyError, ValueError) as error:
+    except Exception as error:  # WebSocket 超时/断连也必须优雅降级为 unknown
         return {"status": "unknown", "hint": f"平台状态探测失败：{error}"[:200]}
     finally:
         if browser and target_id:
             try:
                 browser.call("Target.closeTarget", {"targetId": target_id})
-            except (OSError, RuntimeError):
+            except Exception:
                 pass
         if browser:
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                pass

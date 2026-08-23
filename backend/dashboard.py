@@ -96,7 +96,7 @@ def _collection_status(collector_state: dict = None) -> dict:
         "SELECT data_source_at, finished_at FROM collect_runs "
         "WHERE kind IN ('xlsx_import','json_import') AND finished_at IS NOT NULL "
         "ORDER BY id DESC LIMIT 1").fetchone()
-    file_at = _latest_time(file_row["data_source_at"], file_row["finished_at"]) if file_row else None
+    file_at = (file_row["data_source_at"] or file_row["finished_at"]) if file_row else None
     latest = _latest_time(online, file_at)
     moment = _parse_time(latest)
     stale = True
@@ -146,10 +146,10 @@ def get_dashboard(collector_state: dict = None) -> dict:
         "jobs", "favorite_at IS NOT NULL", "favorite_at")
     applications = _simple_period_counts(
         "applications", "status IN ('platform_confirmed','manual_confirmed')",
-        "confirmed_at", "job_key")
+        "confirmed_at")
     for status in ("platform_confirmed", "manual_confirmed"):
         applications[status] = conn.execute(
-            "SELECT COUNT(DISTINCT job_key) c FROM applications WHERE status=?",
+            "SELECT COUNT(*) c FROM applications WHERE status=?",
             (status,)).fetchone()["c"]
     greetings = _greeting_counts()
     accounts = _account_status()
@@ -172,7 +172,7 @@ def get_dashboard(collector_state: dict = None) -> dict:
         },
         "quick_links": [
             {"label": "岗位列表", "route": "#/jobs"},
-            {"label": "收藏作战台", "route": "#/cards"},
+            {"label": "收藏作战台", "route": "#/jobcard"},
             {"label": "采集中心", "route": "#/collect"},
             {"label": "简历档案", "route": "#/profile"},
             {"label": "数据分析", "route": "#/analytics"},

@@ -1,5 +1,6 @@
 """boss-copilot FastAPI 入口：数据 API + 前端静态托管。"""
 import json
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -12,7 +13,7 @@ from . import config
 from . import importer
 from . import strategy
 from .boss import cdp
-from .db import get_all_settings, get_db, init_db, now_iso, set_setting
+from .db import get_all_settings, get_db, get_setting, init_db, now_iso, set_setting
 from .scoring import l1 as scoring_l1
 
 app = FastAPI(title="boss-copilot")
@@ -23,6 +24,11 @@ FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
 def _startup():
     config.migrate_legacy_data()
     init_db()
+    # 上次进程退出时遗留的运行中任务不可能继续，明确标为中断。
+    get_db().execute(
+        "UPDATE collect_runs SET status='interrupted',finished_at=?,phase='finished' "
+        "WHERE finished_at IS NULL AND status='running'", (now_iso(),))
+    get_db().commit()
 
 
 # ── 设置 / 档案 ──────────────────────────────────────────────────
@@ -34,7 +40,29 @@ def read_settings():
 
 @app.put("/api/settings")
 def write_settings(body: dict):
-    for k, v in body.items():
+    normalized = dict(body)
+    if "send_daily_hard_cap" in normalized:
+        normalized["send_daily_hard_cap"] = min(110, max(1, int(
+            normalized["send_daily_hard_cap"])))
+    hard_cap = int(normalized.get(
+        "send_daily_hard_cap", get_setting("send_daily_hard_cap", 110)))
+    if "send_daily_limit" in normalized:
+        normalized["send_daily_limit"] = min(hard_cap, max(1, int(
+            normalized["send_daily_limit"])))
+    elif "send_daily_hard_cap" in normalized:
+        normalized["send_daily_limit"] = min(
+            hard_cap, max(1, int(get_setting("send_daily_limit", 40))))
+    if "send_gap_min_sec" in normalized:
+        normalized["send_gap_min_sec"] = min(90, max(30, int(
+            normalized["send_gap_min_sec"])))
+    if "send_gap_max_sec" in normalized:
+        normalized["send_gap_max_sec"] = min(90, max(30, int(
+            normalized["send_gap_max_sec"])))
+    gap_min = int(normalized.get("send_gap_min_sec", get_setting("send_gap_min_sec", 30)))
+    gap_max = int(normalized.get("send_gap_max_sec", get_setting("send_gap_max_sec", 90)))
+    if gap_min > gap_max:
+        normalized["send_gap_max_sec"] = gap_min
+    for k, v in normalized.items():
         if k in config.DEFAULT_SETTINGS:
             if k == "dual_account_enabled" and not isinstance(v, bool):
                 raise HTTPException(400, "dual_account_enabled 必须是布尔值")
@@ -78,7 +106,50 @@ def write_profile(body: ProfileIn):
     return {"ok": True, "resume": updated, "rescore": rescore}
 
 
-_resume_score_state = {"running": False, "resume_id": None, "result": None}
+_resume_score_state = {"running": {}, "pending": {}, "results": {}}
+_resume_score_lock = threading.Lock()
+
+
+def _run_resume_l2(resume_id: int, revision: int, favorite_keys: list) -> None:
+    from .scoring import l2 as scoring_l2
+    try:
+        result = scoring_l2.run_l2(
+            limit=len(favorite_keys), only_missing=False,
+            resume_id=resume_id, job_keys=favorite_keys, force=True)
+    except Exception as e:
+        result = {"error": str(e)[:300]}
+    next_job = None
+    key = str(resume_id)
+    with _resume_score_lock:
+        _resume_score_state["results"][key] = result
+        next_job = _resume_score_state["pending"].pop(key, None)
+        if next_job:
+            _resume_score_state["running"][key] = next_job["revision"]
+        else:
+            _resume_score_state["running"].pop(key, None)
+    if next_job:
+        threading.Thread(
+            target=_run_resume_l2,
+            args=(resume_id, next_job["revision"], next_job["job_keys"]),
+            daemon=True).start()
+
+
+def _schedule_resume_l2(resume: dict, favorite_keys: list) -> str:
+    key = str(resume["id"])
+    payload = {"revision": resume["revision"], "job_keys": list(favorite_keys)}
+    start_now = False
+    with _resume_score_lock:
+        if key in _resume_score_state["running"]:
+            # 同一简历再次更新时只保留最新修订，当前任务结束后串行补跑。
+            _resume_score_state["pending"][key] = payload
+            return "queued"
+        _resume_score_state["running"][key] = resume["revision"]
+        start_now = True
+    if start_now:
+        threading.Thread(
+            target=_run_resume_l2,
+            args=(resume["id"], resume["revision"], favorite_keys), daemon=True).start()
+    return "started"
 
 
 def _rescore_resume(resume: dict) -> dict:
@@ -88,25 +159,9 @@ def _rescore_resume(resume: dict) -> dict:
     favorite_keys = [row["job_key"] for row in get_db().execute(
         "SELECT job_key FROM jobs WHERE favorite_at IS NOT NULL AND status='active'")]
     background = bool(favorite_keys and llm_mod.configured())
-    if background and not _resume_score_state["running"]:
-        import threading
-
-        def _run():
-            from .scoring import l2 as scoring_l2
-            try:
-                _resume_score_state["result"] = scoring_l2.run_l2(
-                    limit=len(favorite_keys), only_missing=False,
-                    resume_id=resume["id"], job_keys=favorite_keys, force=True)
-            except Exception as e:
-                _resume_score_state["result"] = {"error": str(e)[:300]}
-            finally:
-                _resume_score_state["running"] = False
-
-        _resume_score_state.update({"running": True, "resume_id": resume["id"],
-                                    "result": None})
-        threading.Thread(target=_run, daemon=True).start()
+    schedule = _schedule_resume_l2(resume, favorite_keys) if background else "not_needed"
     return {"l1": l1_result, "favorite_l2_background": background,
-            "favorite_jobs": len(favorite_keys)}
+            "favorite_jobs": len(favorite_keys), "l2_schedule": schedule}
 
 
 # ── 多简历档案 ──────────────────────────────────────────────────
@@ -193,7 +248,8 @@ def resumes_rescore(resume_id: int):
 
 @app.get("/api/resume-score/status")
 def resumes_rescore_status():
-    return dict(_resume_score_state)
+    with _resume_score_lock:
+        return {key: dict(value) for key, value in _resume_score_state.items()}
 
 
 # ── 总览与岗位用户状态 ──────────────────────────────────────────
@@ -320,8 +376,12 @@ def import_xlsx(body: dict):
     # Excel 正被打开时也能读：复制到临时文件再解析，避免锁冲突
     import shutil, tempfile
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-        shutil.copy(p, tmp.name)
-        return importer.import_xlsx(tmp.name)
+        temp_path = Path(tmp.name)
+    shutil.copy2(p, temp_path)
+    try:
+        return importer.import_xlsx(str(temp_path))
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 @app.post("/api/import/json")
@@ -361,7 +421,7 @@ def list_jobs(status: Optional[str] = "active", q: str = "", source: str = "",
         args += [f"%{q}%", f"%{q}%"]
     if keyword:
         where.append("EXISTS (SELECT 1 FROM job_collection_hits h WHERE h.job_key=j.job_key "
-                     "AND h.keyword LIKE ?)")
+                     "AND h.keyword LIKE ? AND h.is_active=1)")
         args.append(f"%{keyword}%")
     if favorite == "only":
         where.append("j.favorite_at IS NOT NULL")
@@ -387,19 +447,15 @@ def list_jobs(status: Optional[str] = "active", q: str = "", source: str = "",
     conn = get_db()
     total = conn.execute(
         f"SELECT COUNT(*) c FROM jobs j WHERE {cond}", args).fetchone()["c"]
-    score_exists = "s.job_key IS NOT NULL"
     rows = conn.execute(
         f"SELECT j.job_key, j.title, j.company, j.salary, j.salary_max, j.experience, "
         f"j.degree, j.location, j.industry, j.scale, j.stage, j.hr_active, j.source, "
         f"j.status, j.last_seen_at, j.job_link, j.favorite_at, j.is_headhunter, "
         f"j.headhunter_reason, j.headhunter_override, {hunter_expr} effective_headhunter, "
-        f"CASE WHEN {score_exists} THEN s.l1_score ELSE j.l1_score END current_l1_score, "
-        f"CASE WHEN {score_exists} THEN s.match_rough ELSE j.match_rough END current_match_rough, "
-        f"CASE WHEN {score_exists} THEN s.composite_rough ELSE j.composite_rough END current_composite_rough, "
-        f"CASE WHEN {score_exists} THEN s.job_score ELSE j.job_score END current_job_score, "
-        f"CASE WHEN {score_exists} THEN s.match_score ELSE j.match_score END current_match_score, "
-        f"CASE WHEN {score_exists} THEN s.composite ELSE j.composite END current_composite, "
-        f"CASE WHEN {score_exists} THEN s.priority ELSE j.priority END current_priority "
+        f"s.l1_score current_l1_score, s.match_rough current_match_rough, "
+        f"s.composite_rough current_composite_rough, s.job_score current_job_score, "
+        f"s.match_score current_match_score, s.composite current_composite, "
+        f"s.priority current_priority "
         f"FROM jobs j LEFT JOIN job_resume_scores s ON s.job_key=j.job_key "
         f"AND s.resume_id=? AND s.resume_revision=? WHERE {cond} "
         f"ORDER BY {order} LIMIT ? OFFSET ?",
@@ -453,11 +509,12 @@ def job_detail(job_key: str, resume_id: Optional[int] = None):
     out["jd"] = detail["jd"] if detail else ""
     out["skill_tags"] = detail["skill_tags"] if detail else ""
     out["fetched_at"] = detail["fetched_at"] if detail else None
-    if current_score:
-        for field in ("l1_score", "l1_detail", "match_rough", "composite_rough",
-                      "job_score", "match_score", "composite", "priority",
-                      "l2_detail", "l2_source", "l2_stale"):
-            out[field] = current_score.get(field)
+    for field in ("l1_score", "match_rough", "composite_rough", "job_score",
+                  "match_score", "composite", "priority", "l2_source"):
+        out[field] = current_score.get(field) if current_score else None
+    out["l1_detail"] = current_score.get("l1_detail", {}) if current_score else {}
+    out["l2_detail"] = current_score.get("l2_detail", {}) if current_score else {}
+    out["l2_stale"] = bool(current_score.get("l2_stale")) if current_score else False
     out["current_score"] = current_score
     out["baseline"] = baseline
     out["imported_baseline"] = baseline
@@ -493,10 +550,13 @@ def runs():
 def run_l1(body: dict = None):
     body = body or {}
     resume_id = body.get("resume_id")
-    return scoring_l1.run_l1(
-        force=bool(body.get("force")),
-        resume_id=int(resume_id) if resume_id else None,
-        job_keys=body.get("job_keys"))
+    try:
+        return scoring_l1.run_l1(
+            force=bool(body.get("force")),
+            resume_id=int(resume_id) if resume_id else None,
+            job_keys=body.get("job_keys"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.post("/api/score/l2")
@@ -513,7 +573,7 @@ def run_l2(body: dict = None):
             only_missing=not bool(body.get("force")),
             resume_id=int(resume_id) if resume_id else None,
             job_keys=body.get("job_keys"), force=bool(body.get("force")))
-    except llm_mod.LLMError as e:
+    except (llm_mod.LLMError, ValueError) as e:
         raise HTTPException(400, str(e))
 
 
@@ -533,6 +593,8 @@ def gen_strategy(body: dict = None):
     resume_id = (body or {}).get("resume_id")
     try:
         prof = resumes.get_default_resume() if not resume_id else resumes.get_resume(resume_id)
+        if prof.get("archived"):
+            raise ValueError("已归档简历不能生成采集策略")
     except ValueError as e:
         raise HTTPException(400, str(e))
     try:
@@ -552,27 +614,76 @@ def save_strategy(body: dict):
 
 # ── 在线采集与同步 ──────────────────────────────────────────────
 
+def _default_resume_id(resume_id=None) -> int:
+    if resume_id:
+        return int(resume_id)
+    from . import resumes
+    return int(resumes.get_default_resume()["id"])
+
+
+@app.get("/api/collect/config")
+def collect_config_get(resume_id: Optional[int] = None):
+    from . import cities, collector
+    rid = _default_resume_id(resume_id)
+    return {"config": collector.get_collect_config(rid),
+            "city_options": cities.city_groups(), "resume_id": rid,
+            "max_combinations": collector.MAX_SEARCH_COMBINATIONS}
+
+
+@app.put("/api/collect/config")
+def collect_config_save(body: dict, resume_id: Optional[int] = None):
+    from . import cities, collector
+    rid = _default_resume_id(resume_id or body.get("resume_id"))
+    try:
+        config_data = collector.save_collect_config(body, rid)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(400, str(e))
+    return {"config": config_data, "city_options": cities.city_groups(),
+            "resume_id": rid, "max_combinations": collector.MAX_SEARCH_COMBINATIONS}
+
+
+@app.get("/api/collect/options")
+def collect_options():
+    from . import cities, collector
+    return {"city_options": cities.city_groups(),
+            "filter_values": collector.FILTER_VALUE_MAPS,
+            "max_combinations": collector.MAX_SEARCH_COMBINATIONS}
+
 @app.post("/api/collect/run")
 def collect_run(body: dict):
     from . import collector
     kind = body.get("kind", "search")
+    resume_id = _default_resume_id(body.get("resume_id"))
+    if kind == "config":
+        result = collector.start_config(
+            body.get("config") or body, resume_id, sync_mode=bool(body.get("sync")))
+        if not result.get("ok"):
+            raise HTTPException(400, result.get("error", "采集配置无效"))
+        return result
     if kind == "search":
         if not body.get("keyword"):
             raise HTTPException(400, "keyword required")
         tasks = [{"type": "search", "keyword": body["keyword"],
-                  "city": body.get("city", "深圳"), "pages": int(body.get("pages", 3))}]
+                  "city": body.get("city", "深圳"), "pages": int(body.get("pages", 3)),
+                  "filters": body.get("filters", {}), "resume_id": resume_id}]
     elif kind == "company":
         if not (body.get("url") or body.get("brand_id")):
             raise HTTPException(400, "url or brand_id required")
-        tasks = [{"type": "company", **{k: v for k, v in body.items()
-                                        if k in ("url", "brand_id", "name", "pages")}}]
+        tasks = [{"type": "company", "resume_id": resume_id,
+                  **{k: v for k, v in body.items()
+                     if k in ("url", "brand_id", "name", "pages")}}]
     elif kind == "plan":
-        tasks = collector.plan_tasks()
+        tasks = collector.plan_tasks(resume_id)
         if not tasks:
             raise HTTPException(400, "采集计划为空：先在上方生成/保存策略")
     else:
-        raise HTTPException(400, "kind must be search/company/plan")
-    return collector.start(kind, tasks, sync_mode=bool(body.get("sync")))
+        raise HTTPException(400, "kind must be config/search/company/plan")
+    result = collector.start(kind, tasks, sync_mode=bool(body.get("sync")),
+                             fetch_details=bool(body.get("fetch_details", True)),
+                             resume_id=resume_id)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "采集启动失败"))
+    return result
 
 
 @app.get("/api/collect/status")
@@ -589,14 +700,36 @@ def collect_cancel():
     return collector.cancel()
 
 
+@app.post("/api/collect/retry-details")
+def collect_retry_details(body: dict = None):
+    from . import collector
+    result = collector.retry_missing((body or {}).get("source_run_id"))
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "没有可重试的详情"))
+    return result
+
+
 @app.post("/api/sync/refresh")
-def sync_refresh():
+def sync_refresh(body: dict = None):
     """按已保存计划重跑采集：diff 下架 + HR 活跃度剔除。"""
     from . import collector
-    tasks = collector.plan_tasks()
+    resume_id = _default_resume_id((body or {}).get("resume_id"))
+    tasks = collector.plan_tasks(resume_id)
     if not tasks:
         raise HTTPException(400, "采集计划为空：先生成/保存策略（或先跑一次按计划采集）")
-    return collector.start("sync", tasks, sync_mode=True)
+    return collector.start("sync", tasks, sync_mode=True, fetch_details=True,
+                           resume_id=resume_id)
+
+
+@app.get("/api/analytics")
+def analytics_read(keyword: str = "", city_code: str = "", date_from: str = "",
+                   date_to: str = "", resume_id: Optional[int] = None):
+    from . import analytics
+    filters = {key: value for key, value in {
+        "keyword": keyword, "city_code": city_code,
+        "date_from": date_from, "date_to": date_to,
+    }.items() if value}
+    return analytics.aggregate(filters, _default_resume_id(resume_id))
 
 
 @app.post("/api/sync/rescore")
@@ -614,9 +747,11 @@ def sync_rescore():
 @app.post("/api/greeting/generate")
 def greeting_generate(body: dict):
     from . import greeting, llm as llm_mod
+    from . import resumes
     try:
+        resume_id = body.get("resume_id") or resumes.get_default_resume()["id"]
         return greeting.generate(body.get("job_key", ""),
-                                 resume_id=body.get("resume_id"))
+                                 resume_id=resume_id)
     except llm_mod.LLMError as e:
         raise HTTPException(400, str(e))
 

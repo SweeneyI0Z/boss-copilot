@@ -79,6 +79,17 @@ class JobListAndDetailTests(unittest.TestCase):
         self.assertEqual(detail["imported_baseline"]["job_score"], 88)
         self.assertEqual(detail["application"]["status"], "manual_confirmed")
 
+    def test_unscored_resume_never_falls_back_to_default_or_imported_score(self):
+        second = resumes.create_resume("未评分简历", "另一份简历正文")
+        listed = main.list_jobs(resume_id=second["id"])
+        active = next(item for item in listed["items"] if item["job_key"] == "active")
+        self.assertIsNone(active["l1_score"])
+        self.assertIsNone(active["job_score"])
+        detail = main.job_detail("active", second["id"])
+        self.assertIsNone(detail["l1_score"])
+        self.assertIsNone(detail["job_score"])
+        self.assertEqual(detail["imported_baseline"]["job_score"], 88)
+
     def test_message_center_routes_are_not_registered(self):
         paths = {route.path for route in main.app.routes}
         self.assertFalse(any(path.startswith("/api/chat/") for path in paths))

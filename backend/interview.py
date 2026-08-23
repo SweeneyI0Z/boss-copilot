@@ -49,6 +49,8 @@ def _job_context(job_key: str, resume_id: int = None) -> tuple:
     else:
         from . import resumes
         prof = resumes.get_resume(int(resume_id))
+        if prof.get("archived"):
+            raise llm.LLMError("已归档简历不能用于新面试")
         resume = (prof.get("resume_text") or "").strip()
         revision = int(prof["revision"])
     if len(resume) < 50:

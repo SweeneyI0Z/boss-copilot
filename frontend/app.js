@@ -41,10 +41,12 @@ const score = (job, kind) => {
 }
 const splitLines = value => String(value || '').split(/[\n,，]+/).map(x => x.trim()).filter(Boolean)
 const joinText = value => typeof value === 'string' ? value : JSON.stringify(value || {}, null, 2)
-const parseExpectations = value => {
+const parseProfileField = (value, fallbackKey) => {
   const text = String(value || '').trim()
-  if (!text) return ''
-  try { return JSON.parse(text) } catch (_) { return text }
+  if (!text) return {}
+  try { return JSON.parse(text) } catch (_) {
+    return fallbackKey === 'skills' ? { skills: splitLines(text) } : { [fallbackKey]: text }
+  }
 }
 
 // ── Hash 路由 ────────────────────────────────────────────────────
@@ -145,8 +147,8 @@ const DashboardView = {
         </div>
         <div class="status-item">
           <span class="status-dot" :class="collectTone"></span>
-          <div><b>{{collect.running ? '采集执行中' : (collect.stale ? '采集数据需要更新' : '采集数据正常')}}</b>
-            <p>最近有效数据：{{fmtTime(effectiveCollectTime)}}<template v-if="collect.stale"> · 已超过 3 天</template></p></div>
+          <div><b>{{collect.running ? '采集执行中' : (!collect.collected ? '尚未采集数据' : (collect.stale ? '采集数据需要更新' : '采集数据正常'))}}</b>
+            <p>最近有效数据：{{fmtTime(effectiveCollectTime)}}<template v-if="collect.collected && collect.stale"> · 已超过 3 天</template></p></div>
           <a href="#/collect">查看</a>
         </div>
         <div class="status-item">
@@ -494,7 +496,8 @@ const ProfileView = {
       if (!form.name.trim() || !form.resume_text.trim()) { alert('请填写简历名称和正文'); return }
       saving.value = true
       const body = { name: form.name.trim(), boss_resume_label: form.boss_resume_label.trim(),
-        expectations: parseExpectations(form.expectations), skill_profile: parseExpectations(form.skill_profile), resume_text: form.resume_text }
+        expectations: parseProfileField(form.expectations, 'notes'),
+        skill_profile: parseProfileField(form.skill_profile, 'skills'), resume_text: form.resume_text }
       try {
         const data = form.id ? await api.put(`/api/resumes/${form.id}`, body) : await api.post('/api/resumes', body)
         const wasUpdate = Boolean(form.id)
@@ -520,8 +523,8 @@ const ProfileView = {
       </aside>
       <section class="editor" v-if="form">
         <div class="form-grid two"><label>档案名称<input v-model="form.name" placeholder="如：嵌入式与 AI Agent"></label><label>BOSS 简历标签<input v-model="form.boss_resume_label" placeholder="便于在原平台核对"></label></div>
-        <label>求职期望<textarea class="short" v-model="form.expectations" placeholder="目标岗位、城市、薪资或其他偏好"></textarea></label>
-        <label>个人技能画像<textarea class="short" v-model="form.skill_profile" placeholder="用于评分和招呼语的能力摘要"></textarea></label>
+        <label>求职期望<textarea class="short" v-model="form.expectations" placeholder="可填写说明，或 JSON：城市、薪资、方向"></textarea></label>
+        <label>个人技能画像<textarea class="short" v-model="form.skill_profile" placeholder="技能用逗号或换行分隔，也可填写分类 JSON"></textarea></label>
         <label>简历正文<textarea class="resume-text" v-model="form.resume_text" placeholder="粘贴 Markdown 或纯文本简历"></textarea></label>
         <div class="editor-foot"><span v-if="form.id" class="hint">修订 {{form.revision || 1}} · 更新于 {{fmtTime(form.updated_at)}}</span><span class="grow"></span><button v-if="form.id && !form.is_default && !form.archived_at" @click="setDefault">设为默认</button><button v-if="form.id && !form.archived_at" @click="archive">归档</button><button v-if="form.id && form.archived_at" @click="restore">恢复</button><button class="primary" :disabled="saving || form.archived_at" @click="save">{{saving ? '保存中…' : '保存简历'}}</button></div>
       </section>
@@ -565,6 +568,8 @@ const CollectView = {
     }
     const optionLabels = { experience: '经验', degree: '学历', scale: '公司规模', stage: '融资阶段', industry: '行业' }
     const keywords = computed(() => splitLines(config.keywords))
+    const companyTargets = computed(() => splitLines(config.companies))
+    const hasTasks = computed(() => keywords.value.length > 0 || companyTargets.value.length > 0)
     const combinations = computed(() => keywords.value.length * config.city_codes.length)
     const selectedCities = computed(() => cityGroups.value.flatMap(group => group.cities.map(city => ({
       province: group.province, city: city.name, city_code: city.code,
@@ -584,7 +589,7 @@ const CollectView = {
       if (index >= 0) list.splice(index, 1); else list.push(value)
     }
     function payload() {
-      const companies = splitLines(config.companies).map(value => /^https?:\/\//.test(value) ? { url: value } : { brand_id: value })
+      const companies = companyTargets.value.map(value => /^https?:\/\//.test(value) ? { url: value } : { brand_id: value })
       return { keywords: keywords.value, cities: selectedCities.value, city_codes: [...config.city_codes], pages: Number(config.pages),
         filters: { salary: config.salary, experience: [...config.experience], degree: [...config.degree], scale: [...config.scale], stage: [...config.stage], industry: [...config.industry] },
         companies, company_urls: splitLines(config.companies) }
@@ -620,7 +625,8 @@ const CollectView = {
     onMounted(async () => { await loadConfig(); try { runs.value = await api.get('/api/runs') } catch (_) {} await poll() })
     const timer = setInterval(poll, 3000); onBeforeUnmount(() => clearInterval(timer))
     async function save() {
-      if (!keywords.value.length || !config.city_codes.length) { alert('至少填写一个关键词并选择一个城市'); return false }
+      if (!hasTasks.value) { alert('至少填写一个关键词或一个公司 URL / brandId'); return false }
+      if (keywords.value.length && !config.city_codes.length) { alert('关键词采集至少选择一个城市'); return false }
       if (combinations.value > 20) { alert(`当前共有 ${combinations.value} 个关键词×城市组合，最多允许 20 个`); return false }
       try { await api.put('/api/collect/config', payload()); return true }
       catch (e) { alert('采集配置保存失败：' + e.message); return false }
@@ -639,11 +645,13 @@ const CollectView = {
       finally { busy.value = '' }
     }
     return { config, citySearch, filteredCityGroups, status, runs, busy, xlsxPath, jsonDir, importResult,
-      optionGroups, optionLabels, keywords, combinations, listProgress, detailProgress, percent, toggleOption, save, start, cancel, retryDetails, doImport, fmtTime }
+      optionGroups, optionLabels, keywords, companyTargets, hasTasks, combinations,
+      listProgress, detailProgress, percent, toggleOption, save, start, cancel,
+      retryDetails, doImport, fmtTime }
   },
   template: `
   <div>
-    <div class="page-head"><div><h1>采集中心</h1><p>全局配置一次城市与筛选条件，任务按关键词×城市串行执行。</p></div><div class="row"><button @click="save">保存配置</button><button class="primary" :disabled="status.running || combinations<1 || combinations>20" @click="start">开始采集</button></div></div>
+    <div class="page-head"><div><h1>采集中心</h1><p>全局配置一次城市与筛选条件，任务按关键词×城市串行执行。</p></div><div class="row"><button @click="save">保存配置</button><button class="primary" :disabled="status.running || !hasTasks || combinations>20" @click="start">开始采集</button></div></div>
     <div v-if="status.risk || status.halted || status.risk_signal" class="notice bad">采集已因风控信号停止：{{status.risk_reason || status.risk_signal || status.error || '请检查采集账号'}}</div>
     <div class="collect-grid">
       <section class="config-module"><h2>搜索关键词</h2><p>每行一个关键词。</p><textarea class="short" v-model="config.keywords"></textarea><div class="module-foot"><span>{{keywords.length}} 个关键词</span></div></section>
@@ -656,7 +664,7 @@ const CollectView = {
       <div class="choice-row" v-for="(options,field) in optionGroups" :key="field"><b>{{optionLabels[field]}}</b><button v-for="value in options" :key="value" :class="{selected:config[field].includes(value)}" @click="toggleOption(field,value)">{{value}}</button></div>
       <label>公司定向（每行 URL 或 brandId）<textarea class="short" v-model="config.companies"></textarea></label>
     </section>
-    <section v-if="status.running || status.current || status.last_result" class="run-panel"><div class="section-title"><div><h2>执行状态</h2><p>{{status.current || '等待任务'}}</p></div><div class="row"><button v-if="!status.running && detailProgress.total>detailProgress.done" @click="retryDetails">仅重试缺失 JD</button><button v-if="status.running" @click="cancel">取消采集</button></div></div>
+    <section v-if="status.running || status.current || status.run_id || status.last_result" class="run-panel"><div class="section-title"><div><h2>执行状态</h2><p>{{status.current || (status.phase==='finished' ? '最近任务已结束' : '等待任务')}}</p></div><div class="row"><button v-if="!status.running && (status.retry_details_available || detailProgress.total>detailProgress.done)" @click="retryDetails">仅重试缺失 JD</button><button v-if="status.running" @click="cancel">取消采集</button></div></div>
       <div class="progress-row"><span>列表采集 {{listProgress.done}} / {{listProgress.total}}</span><div class="progress"><i :style="{width:percent(listProgress)+'%'}"></i></div></div>
       <div class="progress-row"><span>JD 详情 {{detailProgress.done}} / {{detailProgress.total}}</span><div class="progress"><i :style="{width:percent(detailProgress)+'%'}"></i></div></div>
       <pre v-if="status.log?.length" class="log">{{status.log.join('\\n')}}</pre>
@@ -674,7 +682,7 @@ const SvgBars = {
     const max = computed(() => Math.max(1, ...rows.value.map(item => Number(item.count || item.value || 0))))
     return { rows, max }
   },
-  template: `<div class="bar-chart"><div v-for="item in rows" :key="item.label" class="bar-row"><span :title="item.label">{{item.label}}</span><svg viewBox="0 0 100 12" preserveAspectRatio="none" role="img" :aria-label="item.label + ' ' + (item.count ?? item.value)"><rect width="100" height="12" rx="2" fill="#edf0ec"></rect><rect :width="Math.max(1,(item.count ?? item.value)/max*100)" height="12" rx="2" :fill="color || '#177a58'"></rect></svg><b>{{item.count ?? item.value}}</b></div><div v-if="!rows.length" class="empty">暂无数据</div></div>`,
+  template: `<div class="bar-chart"><div v-for="item in rows" :key="item.label" class="bar-row"><span :title="item.label">{{item.label}}</span><svg viewBox="0 0 100 12" preserveAspectRatio="none" role="img" :aria-label="item.label + ' ' + (item.count ?? item.value)"><rect width="100" height="12" rx="2" fill="#edf0ec"></rect><rect :width="(item.count ?? item.value) > 0 ? Math.max(1,(item.count ?? item.value)/max*100) : 0" height="12" rx="2" :fill="color || '#177a58'"></rect></svg><b>{{item.count ?? item.value}}</b></div><div v-if="!rows.length" class="empty">暂无数据</div></div>`,
 }
 const AnalyticsView = {
   components: { SvgBars },
