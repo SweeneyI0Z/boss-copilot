@@ -5,16 +5,36 @@
 - 登录引导用「静止页面」模式：打开 zhipin.com 后不再自动导航，避免打扰登录
 """
 import json
+import os
 import subprocess
 import time
 import urllib.request
 
 from .. import config
 
-CHROME = config.CHROME_PATH
-
 # 本机 CDP 请求绝不走系统代理（用户常挂 Clash 类代理，会把 127.0.0.1 劫持成 502）
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+LOGIN_URL = "https://www.zhipin.com/web/user/"
+LOGIN_STATE_JS = r"""
+(() => {
+  const visible = el => !!el && (el.offsetParent !== null || el.getClientRects().length > 0);
+  const text = el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+  const controls = [...document.querySelectorAll('a,button')].filter(visible);
+  const loginControl = controls.some(el => {
+    const label = text(el);
+    const href = el.getAttribute('href') || '';
+    return ['登录', '登录/注册', '注册/登录'].includes(label) ||
+      (/\/web\/user\/?(?:\?|$)/.test(href) && /登录|注册/.test(label));
+  });
+  const loginPanel = !!document.querySelector(
+    '.sign-wrap,.login-register-content,[class*=login-register],input[placeholder*=手机号]');
+  const header = document.querySelector('#header,.boss-header,.site-header,header');
+  const userControl = !!(header && header.querySelector(
+    '.nav-figure,.user-nav,.geek-name,a[href*="/web/geek/resume"],a[href*="/web/geek/chat"]'));
+  return JSON.stringify({login: loginControl || loginPanel, user: userControl});
+})()
+"""
 
 
 def _http_get_json(url: str, timeout=3):
@@ -55,7 +75,7 @@ def launch(account: str, wait_sec: float = 15) -> dict:
     if is_running(conf["cdp_port"]):
         return {"ok": True, "already_running": True, "port": conf["cdp_port"]}
     conf["profile_dir"].mkdir(parents=True, exist_ok=True)
-    cmd = [CHROME,
+    cmd = [config.CHROME_PATH,
            f"--remote-debugging-port={conf['cdp_port']}",
            f"--user-data-dir={conf['profile_dir']}",
            "--no-first-run", "--no-default-browser-check",
@@ -70,18 +90,28 @@ def launch(account: str, wait_sec: float = 15) -> dict:
 
 
 def stop(account: str) -> dict:
-    """按 user-data-dir 精准关闭该账号的 Chrome（ps 匹配命令行，不碰其他进程）。"""
+    """按 user-data-dir 精准关闭该账号的 Chrome，不碰其他 Chrome。"""
     conf = config.ACCOUNTS[account]
     marker = str(conf["profile_dir"])
-    r = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True)
+    if os.name == "nt":
+        command = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                   "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }")
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", command],
+                           capture_output=True, text=True)
+    else:
+        r = subprocess.run(["ps", "-axo", "pid=,command="],
+                           capture_output=True, text=True)
     killed = 0
     for line in r.stdout.splitlines():
         line = line.strip()
-        if marker not in line or "Google Chrome" not in line:
+        if marker not in line or "chrome" not in line.lower():
             continue
         pid_text = line.split(None, 1)[0]
         try:
-            subprocess.run(["kill", pid_text], check=False)
+            kill_cmd = ["taskkill", "/PID", pid_text, "/T"] if os.name == "nt" \
+                else ["kill", pid_text]
+            subprocess.run(kill_cmd, check=False, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
             killed += 1
         except (OSError, ValueError):
             continue
@@ -102,10 +132,10 @@ def status() -> dict:
         out[name] = {
             "label": conf["label"], "port": conf["cdp_port"],
             "description": conf.get("description", ""),
-            "profile": str(conf["profile_dir"]),
             "roles": roles, "enabled": bool(roles),
             "running": running,
             "browser": browser_version(conf["cdp_port"]) if running else "",
+            "login_state": saved_login_state(name),
         }
     return out
 
@@ -130,9 +160,11 @@ def _ws_eval(port: int, target_id: str, js: str):
 
 
 def open_login_page(account: str) -> dict:
-    """在前台标签页打开 zhipin.com（不自动刷新，用户手动登录）。"""
+    """在前台标签页打开 BOSS 登录页。"""
     conf = config.ACCOUNTS[account]
-    launch(account)
+    launched = launch(account)
+    if not launched.get("ok"):
+        return launched
     import websocket
     targets = _http_get_json(f"http://127.0.0.1:{conf['cdp_port']}/json") or []
     page = next((t for t in targets if t.get("type") == "page"), None)
@@ -141,17 +173,29 @@ def open_login_page(account: str) -> dict:
     ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=10)
     try:
         ws.send(json.dumps({"id": 1, "method": "Page.navigate",
-                            "params": {"url": "https://www.zhipin.com/"}}))
+                            "params": {"url": LOGIN_URL}}))
         ws.recv()
     finally:
         ws.close()
     return {"ok": True, "port": conf["cdp_port"]}
 
 
-def login_state(account: str) -> dict:
-    """轻量登录态探测：只看页面 DOM 特征（不调任何 BOSS API，沟通号零足迹）。
+def _classify_login_dom(account: str, data: dict) -> dict:
+    """登录入口优先，只有明确用户菜单才判为已登录。"""
+    if data.get("login"):
+        return {"account": account, "running": True, "logged_in": False,
+                "hint": "未登录"}
+    if data.get("user"):
+        return {"account": account, "running": True, "logged_in": True,
+                "hint": ""}
+    return {"account": account, "running": True, "logged_in": None,
+            "hint": "页面尚未加载完成或无法确认登录态"}
 
-    判据：已登录首页会出现用户头像/昵称区；未登录则顶部有「登录」按钮。
+
+def login_state(account: str) -> dict:
+    """轻量登录态探测：只看页面 DOM 特征，不读取 Cookie 或调用 BOSS API。
+
+    判据：出现登录入口一律未登录；无登录入口且出现明确用户菜单才算已登录。
     """
     conf = config.ACCOUNTS[account]
     if not is_running(conf["cdp_port"]):
@@ -162,23 +206,87 @@ def login_state(account: str) -> dict:
     page = next((t for t in targets
                  if t.get("type") == "page" and "zhipin.com" in (t.get("url") or "")), None)
     if page:
-        js = ("(function(){var u=document.querySelector('[class*=user] img,"
-              "[class*=avatar],.geek-name');var l=document.querySelector("
-              "'[class*=login],a[href*=login]');"
-              "return JSON.stringify({user: !!u, loginBtn: !!l && (l.innerText||'').includes('登录')});})()")
         try:
-            val = _ws_eval(conf["cdp_port"], page["id"], js)
+            val = _ws_eval(conf["cdp_port"], page["id"], LOGIN_STATE_JS)
             d = json.loads(val) if val else {}
-            if d.get("user"):
-                logged = True
-            elif d.get("loginBtn"):
-                logged = False
-            else:
-                return {"account": account, "running": True, "logged_in": None,
-                        "hint": "页面尚未加载完成或无法识别，请稍后重试"}
-            return {"account": account, "running": True, "logged_in": logged,
-                    "hint": "" if logged else "请在打开的窗口中登录"}
-        except (OSError, ValueError, KeyError):
+            return _classify_login_dom(account, d)
+        except (OSError, ValueError, KeyError, websocket.WebSocketException):
             pass
     return {"account": account, "running": True, "logged_in": None,
             "hint": "未检测到 zhipin.com 标签页，请先打开登录页"}
+
+
+def saved_login_state(account: str):
+    """读取最近一次人工检测结果。"""
+    from ..db import get_db
+    row = get_db().execute(
+        "SELECT logged_in, hint, checked_at FROM account_states WHERE account=?",
+        (account,)).fetchone()
+    if row is None:
+        return None
+    logged_in = None if row["logged_in"] is None else bool(row["logged_in"])
+    return {"logged_in": logged_in, "hint": row["hint"],
+            "checked_at": row["checked_at"]}
+
+
+def _save_login_state(account: str, result: dict) -> dict:
+    """持久化检测结果，供页面刷新后继续展示。"""
+    from ..db import get_db, now_iso
+    checked_at = now_iso()
+    logged_in = result.get("logged_in")
+    stored = None if logged_in is None else int(bool(logged_in))
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO account_states(account, logged_in, hint, checked_at) VALUES(?,?,?,?) "
+        "ON CONFLICT(account) DO UPDATE SET logged_in=excluded.logged_in, "
+        "hint=excluded.hint, checked_at=excluded.checked_at",
+        (account, stored, result.get("hint", "")[:200], checked_at))
+    conn.commit()
+    result["checked_at"] = checked_at
+    return result
+
+
+def check_login_state(account: str, wait_sec: float = 10,
+                      interval: float = 0.5) -> dict:
+    """检测登录态；Chrome 未运行时临时启动、打开登录页，完成后再停止。"""
+    conf = config.ACCOUNTS[account]
+    was_running = is_running(conf["cdp_port"])
+    started_here = False
+    result = None
+    try:
+        if not was_running:
+            launched = launch(account)
+            if not launched.get("ok"):
+                result = {"account": account, "running": False, "logged_in": None,
+                          "hint": launched.get("error", "Chrome 启动失败")}
+            else:
+                started_here = not launched.get("already_running", False)
+                opened = open_login_page(account)
+                if not opened.get("ok"):
+                    result = {"account": account, "running": True,
+                              "logged_in": None,
+                              "hint": opened.get("error", "登录页打开失败")}
+
+        if result is None:
+            deadline = time.time() + max(0, wait_sec)
+            while True:
+                result = login_state(account)
+                if result.get("logged_in") is not None or time.time() >= deadline:
+                    break
+                time.sleep(interval)
+    except Exception as e:  # 检测边界兜底：失败结果仍需落库，且临时 Chrome 仍需停止
+        result = {"account": account, "running": was_running or started_here,
+                  "logged_in": None, "hint": f"登录态检测失败：{e}"[:200]}
+    finally:
+        if started_here:
+            try:
+                stop(account)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+
+    result = result or {"account": account, "running": was_running,
+                        "logged_in": None, "hint": "登录态检测失败"}
+    result["auto_started"] = started_here
+    if started_here:
+        result["running"] = False
+    return _save_login_state(account, result)

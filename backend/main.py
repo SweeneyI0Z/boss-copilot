@@ -21,6 +21,7 @@ FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
 
 @app.on_event("startup")
 def _startup():
+    config.migrate_legacy_data()
     init_db()
 
 
@@ -97,7 +98,7 @@ def import_xlsx(body: dict):
 
 @app.post("/api/import/json")
 def import_json(body: dict):
-    directory = body.get("dir") or str(Path.home() / ".boss-zhipin-scraper" / "job-result")
+    directory = body.get("dir") or str(config.COLLECT_RESULT_DIR)
     return importer.import_scraper_json(directory)
 
 
@@ -447,7 +448,7 @@ def account_login_page(name: str):
 def account_login_state(name: str):
     if name not in config.ACCOUNTS:
         raise HTTPException(404, "unknown account")
-    return cdp.login_state(name)
+    return cdp.check_login_state(name)
 
 
 @app.post("/api/accounts/{name}/stop")

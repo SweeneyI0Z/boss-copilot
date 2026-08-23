@@ -4,20 +4,21 @@
 打 origin_query 标签 →（同步模式）同词缺失判下架 + HR 活跃度剔除。
 """
 import json
+import os
 import subprocess
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
-from . import importer, sync
+from . import config, importer, sync
 from .boss import cdp
 from .db import get_db, now_iso
 
-SCRAPER_DIR = Path("~/project/boss-zhipin-scraper")
-SCRAPER_PY = SCRAPER_DIR / ".venv" / "bin" / "python"
-SCRAPER_SCRIPT = SCRAPER_DIR / "scripts" / "boss_cdp_raw.py"
-RESULT_DIR = Path.home() / ".boss-zhipin-scraper" / "job-result"
+SCRAPER_DIR = config.SCRAPER_DIR
+SCRAPER_PY = config.SCRAPER_PY
+SCRAPER_SCRIPT = config.SCRAPER_SCRIPT
+RESULT_DIR = config.COLLECT_RESULT_DIR
 ITEM_GAP_SEC = 120          # 计划内相邻任务间隔（COLLECT.md 多关键词惯例）
 
 _state_lock = threading.Lock()
@@ -60,12 +61,15 @@ def _finish_run(run_id: int, stats: dict) -> None:
 
 def _run_scraper(args: list, timeout: int, cdp_port: int) -> str:
     """跑 scraper 子进程，返回 stdout 摘要（用于日志）。"""
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    output = RESULT_DIR / f"boss_jobs_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.run(
         [str(SCRAPER_PY), str(SCRAPER_SCRIPT)] + args
-        + ["--cdp-port", str(cdp_port)],
+        + ["--cdp-port", str(cdp_port), "--output", str(output)],
         cwd=str(SCRAPER_DIR), capture_output=True, text=True,
-        timeout=timeout, env={"PYTHONUNBUFFERED": "1",
-                              "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
+        timeout=timeout, env=env)
     tail = (proc.stdout or "").strip().splitlines()[-6:]
     if proc.returncode != 0:
         err = (proc.stderr or "").strip().splitlines()[-3:]

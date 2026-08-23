@@ -34,6 +34,13 @@ def get_db() -> sqlite3.Connection:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
+CREATE TABLE IF NOT EXISTS account_states (
+  account TEXT PRIMARY KEY,
+  logged_in INTEGER,                       -- 1/0/NULL（无法确认）
+  hint TEXT NOT NULL DEFAULT '',
+  checked_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS profile (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   resume_text TEXT NOT NULL DEFAULT '',

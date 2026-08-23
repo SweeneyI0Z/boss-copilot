@@ -222,7 +222,7 @@ def _sheet_rows(ws) -> list[dict]:
 # ── scraper JSON 导入 ──────────────────────────────────────────────
 
 def import_scraper_json(directory: str) -> dict:
-    """导入 ~/.boss-zhipin-scraper/job-result/ 下所有列表与详情 JSON。"""
+    """导入统一采集结果目录下所有列表与详情 JSON。"""
     base = Path(directory).expanduser()
     list_files = sorted(list(base.glob("boss_jobs_*.json"))
                         + list(base.glob("boss_company_jobs_*.json")))

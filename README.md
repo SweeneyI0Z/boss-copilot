@@ -8,7 +8,7 @@
 
 ```bash
 cd ~/project/boss-copilot
-.venv/bin/python -m unittest discover tests   # 回归（71 例，必须全绿）
+.venv/bin/python -m unittest discover tests   # 回归（80 例，必须全绿）
 .venv/bin/uvicorn backend.main:app --port 8787
 # 浏览器打开 http://127.0.0.1:8787
 ```
@@ -25,10 +25,18 @@ cd ~/project/boss-copilot
 
 | 账号 | Chrome profile | CDP | 用途 |
 |------|----------------|-----|------|
-| 采集号 | `~/.boss-zhipin-scraper/chrome-profile` | 9222 | 全部采集（风控风险集中于此） |
-| 沟通号 | `~/.boss-copilot/chrome-profile-a` | 9223 | 招呼语发送与消息收发；单账号模式下也负责采集 |
+| 采集号 | `~/.boss-copilot/chrome-profile-collect` | 9222 | 全部采集（风控风险集中于此） |
+| 沟通号 | `~/.boss-copilot/chrome-profile-communication` | 9223 | 招呼语发送与消息收发；单账号模式下也负责采集 |
 
 双账号模式默认开启，以保持原有的风控隔离行为。关闭后，采集脚本与沟通功能都连接沟通号的 9223 端口。挂系统代理（Clash 等）时后端已自动对 localhost CDP 绕过代理。
+
+点击「检测登录态」时，如果对应 Chrome 尚未运行，应用会临时启动它、打开登录页、完成检测并自动停止；原本已运行的 Chrome 不会被自动停止。结果及检测时间会保存并在页面刷新后继续显示。
+
+## 数据目录与迁移
+
+运行数据统一放在用户主目录的 `.boss-copilot` 下：macOS 当前为 `~/.boss-copilot`，Windows 自动使用 `%USERPROFILE%\.boss-copilot`。可用 `BOSS_COPILOT_HOME` 覆盖数据根目录，用 `BOSS_CHROME_PATH` 覆盖 Chrome，用 `BOSS_ZHIPIN_SCRAPER_HOME` 指定外部采集仓库。
+
+启动时会把旧版的 `~/.boss-zhipin-scraper/chrome-profile`、`~/.boss-zhipin-scraper/job-result` 和 `~/.boss-copilot/chrome-profile-a` 迁入统一目录。迁移是幂等的：旧 profile 正在使用或目标已经存在时会跳过，绝不覆盖目标数据。
 
 ## 功能与里程碑
 
@@ -74,7 +82,7 @@ backend/
   interview.py   模拟面试 agent
   boss/cdp.py    账号 CDP 管理（单/双账号切换 + 代理绕过）
 frontend/        无构建 Vue3（app.js 单文件 + vendored vue.esm）
-tests/           71 个单测 + spike 脚本（spike_m5/m6_*）
+tests/           80 个单测 + spike 脚本（spike_m5/m6_*）
 ```
 
 ## 已知边界

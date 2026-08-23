@@ -1,5 +1,6 @@
 """M8 测试：LLM 连通性、单/双账号路由、登录态提示与岗位详情入口。"""
 import os
+import ntpath
 import tempfile
 import unittest
 from pathlib import Path
@@ -72,6 +73,8 @@ class AccountModeTests(unittest.TestCase):
 
     def setUp(self):
         set_setting("dual_account_enabled", True)
+        get_db().execute("DELETE FROM account_states")
+        get_db().commit()
 
     def test_dual_account_routes_collection_to_collect_account(self):
         self.assertEqual(cdp.account_for("collect"), "collect")
@@ -91,19 +94,126 @@ class AccountModeTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "必须是布尔值"):
             main.write_settings({"dual_account_enabled": "false"})
 
-    def test_stopped_login_state_has_friendly_hint(self):
+    def test_low_level_stopped_login_state_has_friendly_hint(self):
         with patch.object(cdp, "is_running", return_value=False):
             state = cdp.login_state("account_a")
         self.assertFalse(state["running"])
         self.assertIsNone(state["logged_in"])
         self.assertIn("Chrome 未启动", state["hint"])
 
+    def test_login_marker_wins_over_user_marker(self):
+        state = cdp._classify_login_dom("account_a", {"login": True, "user": True})
+        self.assertFalse(state["logged_in"])
+
+    def test_unknown_dom_never_claims_logged_in(self):
+        state = cdp._classify_login_dom("account_a", {"login": False, "user": False})
+        self.assertIsNone(state["logged_in"])
+
+    def test_check_temporarily_starts_opens_stops_and_saves(self):
+        detected = {"account": "account_a", "running": True,
+                    "logged_in": False, "hint": "未登录"}
+        with patch.object(cdp, "is_running", return_value=False), \
+             patch.object(cdp, "launch", return_value={"ok": True,
+                                                        "already_running": False}), \
+             patch.object(cdp, "open_login_page", return_value={"ok": True}), \
+             patch.object(cdp, "login_state", return_value=detected), \
+             patch.object(cdp, "stop", return_value={"ok": True}) as stop:
+            result = cdp.check_login_state("account_a", wait_sec=0)
+        self.assertFalse(result["logged_in"])
+        self.assertFalse(result["running"])
+        self.assertTrue(result["auto_started"])
+        stop.assert_called_once_with("account_a")
+        self.assertFalse(cdp.saved_login_state("account_a")["logged_in"])
+
+    def test_check_does_not_stop_preexisting_chrome(self):
+        detected = {"account": "account_a", "running": True,
+                    "logged_in": True, "hint": ""}
+        with patch.object(cdp, "is_running", return_value=True), \
+             patch.object(cdp, "login_state", return_value=detected), \
+             patch.object(cdp, "launch") as launch, \
+             patch.object(cdp, "open_login_page") as open_page, \
+             patch.object(cdp, "stop") as stop:
+            result = cdp.check_login_state("account_a", wait_sec=0)
+        self.assertTrue(result["logged_in"])
+        self.assertFalse(result["auto_started"])
+        launch.assert_not_called()
+        open_page.assert_not_called()
+        stop.assert_not_called()
+
+    def test_check_failure_still_stops_and_saves_unknown(self):
+        with patch.object(cdp, "is_running", return_value=False), \
+             patch.object(cdp, "launch", return_value={"ok": True,
+                                                        "already_running": False}), \
+             patch.object(cdp, "open_login_page", side_effect=RuntimeError("navigate")), \
+             patch.object(cdp, "stop", return_value={"ok": True}) as stop:
+            result = cdp.check_login_state("account_a", wait_sec=0)
+        self.assertIsNone(result["logged_in"])
+        self.assertIn("检测失败", result["hint"])
+        stop.assert_called_once_with("account_a")
+        self.assertIsNone(cdp.saved_login_state("account_a")["logged_in"])
+
+    def test_status_returns_saved_state_without_profile_path(self):
+        cdp._save_login_state("account_a", {"logged_in": False, "hint": "未登录"})
+        with patch.object(cdp, "is_running", return_value=False):
+            status = cdp.status()["account_a"]
+        self.assertFalse(status["login_state"]["logged_in"])
+        self.assertNotIn("profile", status)
+
     def test_scraper_receives_selected_cdp_port(self):
         completed = SimpleNamespace(returncode=0, stdout="完成\n", stderr="")
         with patch.object(collector.subprocess, "run", return_value=completed) as run:
             collector._run_scraper(["--keyword", "AI"], timeout=10, cdp_port=9223)
         command = run.call_args.args[0]
-        self.assertEqual(command[-2:], ["--cdp-port", "9223"])
+        port_index = command.index("--cdp-port")
+        output_index = command.index("--output")
+        self.assertEqual(command[port_index + 1], "9223")
+        self.assertEqual(Path(command[output_index + 1]).parent, collector.RESULT_DIR)
+
+
+class PathMigrationTests(unittest.TestCase):
+    def test_legacy_directories_move_into_unified_data_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            home, data = root / "home", root / "data"
+            old_collect = home / ".boss-zhipin-scraper" / "chrome-profile"
+            old_result = home / ".boss-zhipin-scraper" / "job-result"
+            old_communication = data / "chrome-profile-a"
+            for directory, filename in ((old_collect, "cookie"),
+                                        (old_result, "jobs.json"),
+                                        (old_communication, "state")):
+                directory.mkdir(parents=True)
+                (directory / filename).write_text("x")
+
+            report = config.migrate_legacy_data(data_dir=data, home_dir=home,
+                                                check_ports=False)
+            self.assertEqual({item["status"] for item in report}, {"moved"})
+            self.assertTrue((data / "chrome-profile-collect" / "cookie").exists())
+            self.assertTrue((data / "job-result" / "jobs.json").exists())
+            self.assertTrue((data / "chrome-profile-communication" / "state").exists())
+            self.assertFalse(old_collect.exists())
+
+    def test_existing_target_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            home, data = root / "home", root / "data"
+            source = home / ".boss-zhipin-scraper" / "job-result"
+            target = data / "job-result"
+            source.mkdir(parents=True)
+            target.mkdir(parents=True)
+            (source / "old.json").write_text("old")
+            (target / "new.json").write_text("new")
+            report = config.migrate_legacy_data(data_dir=data, home_dir=home,
+                                                check_ports=False)
+            item = next(x for x in report if x["source"] == str(source))
+            self.assertEqual(item["status"], "skipped_target_exists")
+            self.assertTrue((source / "old.json").exists())
+            self.assertEqual((target / "new.json").read_text(), "new")
+
+    def test_windows_chrome_path_uses_local_app_data(self):
+        env = {"LOCALAPPDATA": r"C:\Users\tester\AppData\Local"}
+        path = config.default_chrome_path(system="Windows", environ=env)
+        self.assertEqual(path, ntpath.join(env["LOCALAPPDATA"], "Google", "Chrome",
+                                           "Application", "chrome.exe"))
 
 
 class JobDetailAndFrontendTests(unittest.TestCase):
@@ -135,6 +245,9 @@ class JobDetailAndFrontendTests(unittest.TestCase):
         self.assertIn("测试连通性", source)
         self.assertIn("账号管理", source)
         self.assertIn("const desired = event.target.checked", source)
+        self.assertIn("上次检测：", source)
+        self.assertNotIn("{{a.profile}}", source)
+        self.assertNotIn("~/.boss-zhipin-scraper/job-result/", source)
         self.assertNotIn("alert(JSON.stringify(r))", source)
 
 

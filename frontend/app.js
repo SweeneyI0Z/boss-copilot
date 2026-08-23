@@ -413,7 +413,7 @@ const CollectView = {
       catch (e) { alert('启动失败：' + e.message) }
     }
     async function doSync() {
-      if (!confirm('按保存的计划重跑采集（走采集号 Chrome）：新岗位入库、同词消失的下架、HR 不活跃剔除。继续？')) return
+      if (!confirm('按保存的计划重跑采集：新岗位入库、同词消失的下架、HR 不活跃剔除。继续？')) return
       runCollect('plan', { sync: true })
     }
     async function doRescore() {
@@ -448,7 +448,7 @@ const CollectView = {
         <span class="muted" v-if="plan && plan.searches">搜索词 {{plan.searches.length}} 组 · 定向公司 {{(plan.companies||[]).length}} 家</span>
       </div>
     </div>
-    <div class="card"><h3>单项采集（采集号 Chrome · 9222）</h3>
+    <div class="card"><h3>单项采集（使用当前采集账号）</h3>
       <div class="row">
         <input v-model="kw" placeholder="关键词" style="width:160px">
         <input v-model="city" placeholder="城市" style="width:90px">
@@ -473,7 +473,7 @@ const CollectView = {
     <div class="card">
       <h3>导入 scraper 采集结果（JSON）</h3>
       <div class="row">
-        <input class="grow" v-model="jsonDir" placeholder="默认 ~/.boss-zhipin-scraper/job-result/">
+        <input class="grow" v-model="jsonDir" placeholder="留空则使用默认采集结果目录">
         <button :disabled="busy" @click="doImport('json')">{{busy==='json'?'导入中…':'导入'}}</button>
       </div>
     </div>
@@ -533,19 +533,28 @@ const AccountsView = {
       ])
       accounts.value = accountData
       dualEnabled.value = settings.dual_account_enabled !== false
+      for (const [name, account] of Object.entries(accountData)) {
+        if (account.login_state) loginStates[name] = formatLoginState(account.login_state, true)
+        else delete loginStates[name]
+      }
     }
     onMounted(load)
     const refresh = () => load()
     async function launch(name) { await api.post('/api/accounts/' + name + '/launch'); load() }
     async function loginPage(name) { const r = await api.post('/api/accounts/' + name + '/login-page'); alert(r.ok ? '已打开登录页，请在弹出的 Chrome 中登录' : r.error); load() }
+    function formatLoginState(state, cached = false) {
+      const prefix = cached ? '上次检测：' : ''
+      const time = state.checked_at ? ' · ' + new Date(state.checked_at).toLocaleString('zh-CN', { hour12: false }) : ''
+      if (state.logged_in === true) return { kind: 'ok', text: prefix + '已登录' + time }
+      if (state.logged_in === false) return { kind: 'bad', text: prefix + '未登录' + time }
+      return { kind: 'warn', text: prefix + (state.hint || '无法确认登录态') + time }
+    }
     async function loginState(name) {
       checking.value = name
       try {
         const r = await api.get('/api/accounts/' + name + '/login-state')
-        if (!r.running) loginStates[name] = { kind: 'bad', text: r.hint || 'Chrome 未启动' }
-        else if (r.logged_in === true) loginStates[name] = { kind: 'ok', text: '已登录' }
-        else if (r.logged_in === false) loginStates[name] = { kind: 'warn', text: r.hint || '未登录' }
-        else loginStates[name] = { kind: 'warn', text: r.hint || '暂时无法判断登录态' }
+        loginStates[name] = formatLoginState(r)
+        if (accounts.value[name]) accounts.value[name].running = r.running
       } catch (e) {
         loginStates[name] = { kind: 'bad', text: '检测失败：' + e.message }
       } finally { checking.value = '' }
@@ -584,7 +593,7 @@ const AccountsView = {
       <div class="row">
         <div class="grow"><b>{{a.label}}</b>
           <span class="tag" v-for="role in a.roles" :key="role">{{role}}</span>
-          <div class="muted">{{a.description}} · {{a.profile}} · CDP :{{a.port}}</div></div>
+          <div class="muted">{{a.description}} · CDP :{{a.port}}</div></div>
         <span :class="a.running?'ok':'bad'">{{a.running?'运行中':'未启动'}}</span>
       </div>
       <div class="row" style="margin-top:10px">
@@ -594,6 +603,7 @@ const AccountsView = {
         <button @click="stop(name)">停止</button>
         <span v-if="loginStates[name]" :class="loginStates[name].kind">{{loginStates[name].text}}</span>
       </div>
+      <div class="muted" style="margin-top:6px">未启动时，检测会临时打开 Chrome 与登录页，完成后自动停止。</div>
     </div>
   </div>`
 }
