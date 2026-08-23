@@ -27,12 +27,16 @@ LOGIN_STATE_JS = r"""
     return ['登录', '登录/注册', '注册/登录'].includes(label) ||
       (/\/web\/user\/?(?:\?|$)/.test(href) && /登录|注册/.test(label));
   });
-  const loginPanel = !!document.querySelector(
-    '.sign-wrap,.login-register-content,[class*=login-register],input[placeholder*=手机号]');
+  const loginPanel = [...document.querySelectorAll(
+    '.sign-wrap,.login-register-content,[class*=login-register],input[placeholder*=手机号]')]
+    .some(visible);
   const header = document.querySelector('#header,.boss-header,.site-header,header');
   const userControl = !!(header && header.querySelector(
     '.nav-figure,.user-nav,.geek-name,a[href*="/web/geek/resume"],a[href*="/web/geek/chat"]'));
-  return JSON.stringify({login: loginControl || loginPanel, user: userControl});
+  const authenticatedRoute = /^\/web\/geek\/(chat|recommend|resume|manage)(?:\/|$)/
+    .test(location.pathname);
+  return JSON.stringify({login: loginControl || loginPanel, user: userControl,
+    authenticated: authenticatedRoute});
 })()
 """
 
@@ -124,6 +128,10 @@ def status() -> dict:
     out = {}
     for name, conf in config.ACCOUNTS.items():
         running = is_running(conf["cdp_port"])
+        if running:
+            live = login_state(name)
+            if live.get("logged_in") is not None:
+                _save_login_state(name, live)
         roles = []
         if name == collect_account:
             roles.append("采集")
@@ -185,7 +193,7 @@ def _classify_login_dom(account: str, data: dict) -> dict:
     if data.get("login"):
         return {"account": account, "running": True, "logged_in": False,
                 "hint": "未登录"}
-    if data.get("user"):
+    if data.get("user") or data.get("authenticated"):
         return {"account": account, "running": True, "logged_in": True,
                 "hint": ""}
     return {"account": account, "running": True, "logged_in": None,
@@ -203,15 +211,23 @@ def login_state(account: str) -> dict:
                 "hint": "Chrome 未启动，请先点击「启动」或「打开登录页」"}
     import websocket
     targets = _http_get_json(f"http://127.0.0.1:{conf['cdp_port']}/json") or []
-    page = next((t for t in targets
-                 if t.get("type") == "page" and "zhipin.com" in (t.get("url") or "")), None)
-    if page:
+    pages = [t for t in targets
+             if t.get("type") == "page" and "zhipin.com" in (t.get("url") or "")]
+    states = []
+    for page in pages:
         try:
             val = _ws_eval(conf["cdp_port"], page["id"], LOGIN_STATE_JS)
             d = json.loads(val) if val else {}
-            return _classify_login_dom(account, d)
+            state = _classify_login_dom(account, d)
+            if state.get("logged_in") is True:
+                return state
+            states.append(state)
         except (OSError, ValueError, KeyError, websocket.WebSocketException):
-            pass
+            continue
+    logged_out = next((state for state in states
+                       if state.get("logged_in") is False), None)
+    if logged_out:
+        return logged_out
     return {"account": account, "running": True, "logged_in": None,
             "hint": "未检测到 zhipin.com 标签页，请先打开登录页"}
 
@@ -271,7 +287,11 @@ def check_login_state(account: str, wait_sec: float = 10,
             deadline = time.time() + max(0, wait_sec)
             while True:
                 result = login_state(account)
-                if result.get("logged_in") is not None or time.time() >= deadline:
+                logged_in = result.get("logged_in")
+                # 临时打开登录页时，已登录 profile 可能先渲染登录页再重定向。
+                if logged_in is True or time.time() >= deadline:
+                    break
+                if logged_in is False and not started_here:
                     break
                 time.sleep(interval)
     except Exception as e:  # 检测边界兜底：失败结果仍需落库，且临时 Chrome 仍需停止

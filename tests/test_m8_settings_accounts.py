@@ -109,6 +109,14 @@ class AccountModeTests(unittest.TestCase):
         state = cdp._classify_login_dom("account_a", {"login": False, "user": False})
         self.assertIsNone(state["logged_in"])
 
+    def test_authenticated_geek_route_is_logged_in(self):
+        state = cdp._classify_login_dom(
+            "collect", {"login": False, "user": False, "authenticated": True})
+        self.assertTrue(state["logged_in"])
+
+    def test_dom_probe_ignores_hidden_login_panel(self):
+        self.assertIn(".some(visible)", cdp.LOGIN_STATE_JS)
+
     def test_check_temporarily_starts_opens_stops_and_saves(self):
         detected = {"account": "account_a", "running": True,
                     "logged_in": False, "hint": "未登录"}
@@ -158,6 +166,17 @@ class AccountModeTests(unittest.TestCase):
             status = cdp.status()["account_a"]
         self.assertFalse(status["login_state"]["logged_in"])
         self.assertNotIn("profile", status)
+
+    def test_status_refreshes_saved_state_for_running_chrome(self):
+        cdp._save_login_state("collect", {"logged_in": False, "hint": "未登录"})
+        live = {"account": "collect", "running": True,
+                "logged_in": True, "hint": ""}
+        with patch.object(cdp, "is_running", side_effect=lambda port: port == 9222), \
+             patch.object(cdp, "browser_version", return_value="Chrome/test"), \
+             patch.object(cdp, "login_state", return_value=live):
+            status = cdp.status()["collect"]
+        self.assertTrue(status["login_state"]["logged_in"])
+        self.assertTrue(cdp.saved_login_state("collect")["logged_in"])
 
     def test_scraper_receives_selected_cdp_port(self):
         completed = SimpleNamespace(returncode=0, stdout="完成\n", stderr="")

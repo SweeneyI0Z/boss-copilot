@@ -8,7 +8,7 @@
 
 ```bash
 cd ~/project/boss-copilot
-.venv/bin/python -m unittest discover tests   # 回归（80 例，必须全绿）
+.venv/bin/python -m unittest discover tests   # 回归（83 例，必须全绿）
 .venv/bin/uvicorn backend.main:app --port 8787
 # 浏览器打开 http://127.0.0.1:8787
 ```
@@ -82,7 +82,7 @@ backend/
   interview.py   模拟面试 agent
   boss/cdp.py    账号 CDP 管理（单/双账号切换 + 代理绕过）
 frontend/        无构建 Vue3（app.js 单文件 + vendored vue.esm）
-tests/           80 个单测 + spike 脚本（spike_m5/m6_*）
+tests/           83 个单测 + spike 脚本（spike_m5/m6_*）
 ```
 
 ## 已知边界
