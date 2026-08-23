@@ -59,24 +59,179 @@ def test_llm_connection(body: LLMTestIn):
 
 class ProfileIn(BaseModel):
     resume_text: str
-    expectations: dict = {}
+    expectations: Optional[dict] = None
 
 
 @app.get("/api/profile")
 def read_profile():
-    row = get_db().execute("SELECT * FROM profile WHERE id=1").fetchone()
-    return {"resume_text": row["resume_text"],
-            "expectations": json.loads(row["expectations"] or "{}"),
-            "updated_at": row["updated_at"]}
+    from . import resumes
+    return resumes.get_default_resume()
 
 
 @app.put("/api/profile")
 def write_profile(body: ProfileIn):
-    get_db().execute(
-        "UPDATE profile SET resume_text=?, expectations=?, updated_at=? WHERE id=1",
-        (body.resume_text, json.dumps(body.expectations, ensure_ascii=False), now_iso()))
-    get_db().commit()
-    return {"ok": True}
+    from . import resumes
+    current = resumes.get_default_resume()
+    updated = resumes.save_revision(
+        current["id"], body.resume_text, expectations=body.expectations)
+    return {"ok": True, "resume": updated}
+
+
+# ── 多简历档案 ──────────────────────────────────────────────────
+
+@app.get("/api/resumes")
+def resumes_list(include_archived: bool = False):
+    from . import resumes
+    return resumes.list_resumes(include_archived=include_archived)
+
+
+@app.post("/api/resumes")
+def resumes_create(body: dict):
+    from . import resumes
+    try:
+        return resumes.create_resume(
+            body.get("name", ""), body.get("resume_text", ""),
+            body.get("expectations"), body.get("skill_profile"),
+            body.get("boss_resume_label", ""), bool(body.get("make_default")))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/resumes/{resume_id}")
+def resumes_get(resume_id: int):
+    from . import resumes
+    try:
+        return resumes.get_resume(resume_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.put("/api/resumes/{resume_id}")
+def resumes_update(resume_id: int, body: dict):
+    from . import resumes
+    allowed = {k: v for k, v in body.items() if k in {
+        "name", "resume_text", "expectations", "skill_profile", "boss_resume_label"}}
+    try:
+        return resumes.update_resume(resume_id, **allowed)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/api/resumes/{resume_id}")
+@app.post("/api/resumes/{resume_id}/archive")
+def resumes_archive(resume_id: int):
+    from . import resumes
+    try:
+        return resumes.archive_resume(resume_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/resumes/{resume_id}/restore")
+def resumes_restore(resume_id: int, body: dict = None):
+    from . import resumes
+    try:
+        return resumes.restore_resume(resume_id, bool((body or {}).get("make_default")))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/resumes/{resume_id}/default")
+def resumes_default(resume_id: int):
+    from . import resumes
+    try:
+        return resumes.set_default(resume_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ── 总览与岗位用户状态 ──────────────────────────────────────────
+
+@app.get("/api/dashboard")
+def dashboard_read():
+    from . import collector, dashboard
+    return dashboard.get_dashboard(collector.status())
+
+
+@app.put("/api/jobs/{job_key}/favorite")
+@app.post("/api/jobs/{job_key}/favorite")
+def job_favorite(job_key: str, body: dict):
+    from . import job_state
+    try:
+        return job_state.favorite_job(job_key, bool(body.get("favorite", True)))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/jobs/{job_key}/exclude")
+def job_exclude(job_key: str):
+    from . import job_state
+    try:
+        return job_state.exclude_job(job_key)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/jobs/{job_key}/restore")
+def job_restore(job_key: str):
+    from . import job_state
+    try:
+        return job_state.restore_job(job_key)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/jobs-excluded")
+def jobs_excluded(limit: int = 100, offset: int = 0):
+    from . import job_state
+    return job_state.list_excluded(limit, offset)
+
+
+@app.put("/api/jobs/{job_key}/headhunter")
+def job_headhunter(job_key: str, body: dict):
+    from . import job_state
+    try:
+        return job_state.set_headhunter_override(job_key, body.get("value"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/applications")
+def applications_list(status: str = "", resume_id: Optional[int] = None,
+                      limit: int = 100, offset: int = 0):
+    from . import applications
+    try:
+        return applications.list_applications(status, resume_id, limit, offset)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/applications/{job_key}")
+def application_get(job_key: str, resume_id: Optional[int] = None):
+    from . import applications
+    try:
+        return applications.get_application(job_key, resume_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/applications/{job_key}/confirm")
+def application_confirm(job_key: str, body: dict = None):
+    from . import applications
+    try:
+        return applications.confirm_application(job_key, (body or {}).get("resume_id"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.put("/api/applications/{job_key}")
+def application_update(job_key: str, body: dict):
+    from . import applications
+    try:
+        return applications.set_application_status(
+            job_key, body.get("resume_id"), body.get("status", "unknown"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 # ── 导入 ────────────────────────────────────────────────────────
@@ -345,39 +500,6 @@ def greeting_send_status():
 
 
 _send_state = type("S", (), {"running": False, "result": None})()
-
-
-# ── 消息中心 ────────────────────────────────────────────────────
-
-@app.post("/api/chat/poll")
-def chat_poll(body: dict = None):
-    from . import chatpoll, llm as llm_mod
-    try:
-        return chatpoll.poll(int((body or {}).get("max", 8)))
-    except (llm_mod.LLMError, RuntimeError, OSError) as e:
-        return {"ok": False, "error": str(e)[:200]}
-
-
-@app.get("/api/chat/conversations")
-def chat_conversations():
-    from . import chatpoll
-    return chatpoll.conversations_with_drafts()
-
-
-@app.post("/api/chat/draft")
-def chat_draft(body: dict):
-    from . import chatpoll, llm as llm_mod
-    try:
-        return chatpoll.generate_draft(int(body.get("conversation_id", 0)))
-    except llm_mod.LLMError as e:
-        raise HTTPException(400, str(e))
-
-
-@app.post("/api/chat/send")
-def chat_send(body: dict):
-    from . import chatpoll
-    return chatpoll.approve_and_send(int(body.get("conversation_id", 0)),
-                                     body.get("reply", ""))
 
 
 # ── 模拟面试 ────────────────────────────────────────────────────

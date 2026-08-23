@@ -48,6 +48,20 @@ CREATE TABLE IF NOT EXISTS profile (
   expectations TEXT NOT NULL DEFAULT '{}'   -- 期望城市/薪资/方向 等 JSON
 );
 
+CREATE TABLE IF NOT EXISTS resumes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  resume_text TEXT NOT NULL DEFAULT '',
+  expectations TEXT NOT NULL DEFAULT '{}',
+  skill_profile TEXT NOT NULL DEFAULT '{}',
+  boss_resume_label TEXT NOT NULL DEFAULT '',
+  revision INTEGER NOT NULL DEFAULT 1,
+  is_default INTEGER NOT NULL DEFAULT 0,
+  archived_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS jobs (
   job_key TEXT PRIMARY KEY,               -- encrypt_job_id 可得则用之，否则 md5(公司|岗位|薪资)
   encrypt_job_id TEXT,
@@ -92,7 +106,32 @@ CREATE TABLE IF NOT EXISTS collect_runs (
   params TEXT NOT NULL DEFAULT '{}',
   stats TEXT NOT NULL DEFAULT '{}',
   started_at TEXT NOT NULL,
-  finished_at TEXT
+  finished_at TEXT,
+  status TEXT NOT NULL DEFAULT '',          -- queued/running/succeeded/partial/failed/cancelled
+  data_source_at TEXT,                     -- 文件内数据时间；与运行完成时间分开
+  risk_signal TEXT NOT NULL DEFAULT '',
+  phase TEXT NOT NULL DEFAULT '',
+  cancel_requested INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS collect_run_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL REFERENCES collect_runs(id) ON DELETE CASCADE,
+  task_key TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'search',
+  keyword TEXT NOT NULL DEFAULT '',
+  province TEXT NOT NULL DEFAULT '',
+  city TEXT NOT NULL DEFAULT '',
+  city_code TEXT NOT NULL DEFAULT '',
+  filters TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'queued',
+  stats TEXT NOT NULL DEFAULT '{}',
+  error TEXT NOT NULL DEFAULT '',
+  list_file TEXT NOT NULL DEFAULT '',
+  detail_file TEXT NOT NULL DEFAULT '',
+  started_at TEXT,
+  finished_at TEXT,
+  UNIQUE(run_id, task_key)
 );
 
 CREATE TABLE IF NOT EXISTS greetings (
@@ -102,7 +141,13 @@ CREATE TABLE IF NOT EXISTS greetings (
   chosen TEXT DEFAULT '',
   status TEXT NOT NULL DEFAULT 'draft',   -- draft/approved/sending/sent/failed/skipped
   sent_at TEXT, error TEXT,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  resume_id INTEGER REFERENCES resumes(id),
+  resume_revision INTEGER,
+  delivery_channel TEXT NOT NULL DEFAULT '', -- manual/auto
+  delivery_status TEXT NOT NULL DEFAULT '', -- confirmed/needs_review/failed
+  confirmed_at TEXT,
+  updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sent_log (
@@ -141,24 +186,250 @@ CREATE TABLE IF NOT EXISTS interviews (
   status TEXT NOT NULL DEFAULT 'active',  -- active/finished
   transcript TEXT NOT NULL DEFAULT '[]',  -- [{role, content, feedback?}]
   report TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  resume_id INTEGER REFERENCES resumes(id),
+  resume_revision INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS job_resume_scores (
+  job_key TEXT NOT NULL REFERENCES jobs(job_key) ON DELETE CASCADE,
+  resume_id INTEGER NOT NULL REFERENCES resumes(id) ON DELETE CASCADE,
+  resume_revision INTEGER NOT NULL,
+  l1_score REAL,
+  l1_detail TEXT NOT NULL DEFAULT '{}',
+  match_rough REAL,
+  composite_rough REAL,
+  l1_source TEXT NOT NULL DEFAULT '',
+  job_score REAL,
+  match_score REAL,
+  composite REAL,
+  priority TEXT NOT NULL DEFAULT '',
+  l2_detail TEXT NOT NULL DEFAULT '{}',
+  l2_source TEXT NOT NULL DEFAULT '',
+  l2_stale INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(job_key, resume_id, resume_revision)
+);
+
+CREATE TABLE IF NOT EXISTS job_score_baselines (
+  job_key TEXT PRIMARY KEY,
+  l1_score REAL,
+  l1_detail TEXT NOT NULL DEFAULT '{}',
+  match_rough REAL,
+  composite_rough REAL,
+  job_score REAL,
+  match_score REAL,
+  composite REAL,
+  priority TEXT NOT NULL DEFAULT '',
+  l2_detail TEXT NOT NULL DEFAULT '{}',
+  source TEXT NOT NULL DEFAULT 'imported',
+  imported_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS applications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_key TEXT NOT NULL REFERENCES jobs(job_key) ON DELETE CASCADE,
+  resume_id INTEGER NOT NULL REFERENCES resumes(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'unknown',   -- unknown/platform_confirmed/manual_confirmed
+  probe_evidence TEXT NOT NULL DEFAULT '',
+  probe_error TEXT NOT NULL DEFAULT '',
+  last_probed_at TEXT,
+  confirmed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(job_key, resume_id)
+);
+
+CREATE TABLE IF NOT EXISTS job_collection_hits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER REFERENCES collect_run_tasks(id) ON DELETE CASCADE,
+  run_id INTEGER NOT NULL REFERENCES collect_runs(id) ON DELETE CASCADE,
+  job_key TEXT NOT NULL REFERENCES jobs(job_key) ON DELETE CASCADE,
+  search_key TEXT NOT NULL,
+  keyword TEXT NOT NULL DEFAULT '',
+  province TEXT NOT NULL DEFAULT '',
+  city TEXT NOT NULL DEFAULT '',
+  city_code TEXT NOT NULL DEFAULT '',
+  filters TEXT NOT NULL DEFAULT '{}',
+  is_active INTEGER NOT NULL DEFAULT 1,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE(search_key, job_key, run_id)
 );
 """
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _add_columns(conn: sqlite3.Connection, table: str,
+                 columns: dict[str, str]) -> None:
+    """给旧库补列；SQLite 不支持一次添加多列，因此逐列幂等执行。"""
+    existing = _table_columns(conn, table)
+    for name, definition in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def _json_source(raw: str, fallback: str = "") -> str:
+    try:
+        value = json.loads(raw or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return fallback
+    return value.get("source", fallback) if isinstance(value, dict) else fallback
+
+
+def _migrate_legacy_data(conn: sqlite3.Connection) -> None:
+    """把单档案和 jobs 内嵌评分迁到新模型；只补缺失记录，绝不回写历史值。"""
+    default = conn.execute(
+        "SELECT * FROM resumes WHERE is_default=1 AND archived_at IS NULL "
+        "ORDER BY id LIMIT 1").fetchone()
+    if default is None:
+        first = conn.execute(
+            "SELECT * FROM resumes WHERE archived_at IS NULL ORDER BY id LIMIT 1").fetchone()
+        if first is None:
+            legacy = conn.execute("SELECT * FROM profile WHERE id=1").fetchone()
+            ts = (legacy["updated_at"] if legacy else None) or now_iso()
+            cur = conn.execute(
+                "INSERT INTO resumes(name, resume_text, expectations, skill_profile, "
+                "boss_resume_label, revision, is_default, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,1,1,?,?)",
+                ("默认简历", legacy["resume_text"] if legacy else "",
+                 legacy["expectations"] if legacy else "{}", "{}", "", ts, ts))
+            default_id = cur.lastrowid
+        else:
+            default_id = first["id"]
+            conn.execute("UPDATE resumes SET is_default=1 WHERE id=?", (default_id,))
+    else:
+        default_id = default["id"]
+
+    # 异常中断或旧试验库可能留下多个默认项，建唯一索引前先确定唯一默认档案。
+    conn.execute(
+        "UPDATE resumes SET is_default=CASE WHEN id=? THEN 1 ELSE 0 END "
+        "WHERE archived_at IS NULL", (default_id,))
+
+    default = conn.execute("SELECT * FROM resumes WHERE id=?", (default_id,)).fetchone()
+    revision = default["revision"]
+    rows = conn.execute(
+        "SELECT * FROM jobs WHERE l1_score IS NOT NULL OR job_score IS NOT NULL "
+        "OR match_score IS NOT NULL OR composite IS NOT NULL").fetchall()
+    for row in rows:
+        l1_source = _json_source(row["l1_detail"], "legacy")
+        l2_source = row["l2_source"] or "legacy"
+        ts = row["last_seen_at"] or now_iso()
+        conn.execute(
+            "INSERT OR IGNORE INTO job_resume_scores("
+            "job_key, resume_id, resume_revision, l1_score, l1_detail, match_rough, "
+            "composite_rough, l1_source, job_score, match_score, composite, priority, "
+            "l2_detail, l2_source, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (row["job_key"], default_id, revision, row["l1_score"],
+             row["l1_detail"] or "{}", row["match_rough"], row["composite_rough"],
+             l1_source, row["job_score"], row["match_score"], row["composite"],
+             row["priority"] or "", row["l2_detail"] or "{}", l2_source, ts, ts))
+        if l1_source == "imported" or l2_source == "imported":
+            conn.execute(
+                "INSERT OR IGNORE INTO job_score_baselines("
+                "job_key, l1_score, l1_detail, match_rough, composite_rough, job_score, "
+                "match_score, composite, priority, l2_detail, imported_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (row["job_key"], row["l1_score"], row["l1_detail"] or "{}",
+                 row["match_rough"], row["composite_rough"], row["job_score"],
+                 row["match_score"], row["composite"], row["priority"] or "",
+                 row["l2_detail"] or "{}", ts))
+
+    conn.execute(
+        "UPDATE greetings SET resume_id=?, resume_revision=? "
+        "WHERE resume_id IS NULL", (default_id, revision))
+    conn.execute(
+        "UPDATE greetings SET delivery_channel='auto' "
+        "WHERE delivery_channel='' AND status IN "
+        "('sending','sent','failed')")
+    conn.execute(
+        "UPDATE greetings SET delivery_status=CASE "
+        "WHEN status='sent' THEN 'confirmed' WHEN status='failed' THEN 'failed' "
+        "WHEN status='sending' THEN 'needs_review' ELSE delivery_status END "
+        "WHERE delivery_status='' AND status IN ('sending','sent','failed')")
+    conn.execute(
+        "UPDATE greetings SET confirmed_at=COALESCE(sent_at, created_at) "
+        "WHERE confirmed_at IS NULL AND delivery_status='confirmed'")
+    conn.execute(
+        "UPDATE greetings SET updated_at=COALESCE(sent_at, created_at) "
+        "WHERE updated_at IS NULL")
+    conn.execute(
+        "UPDATE interviews SET resume_id=?, resume_revision=? WHERE resume_id IS NULL",
+        (default_id, revision))
 
 
 def init_db() -> None:
     conn = get_db()
     conn.executescript(SCHEMA)
-    # 轻量迁移：origin_query 追踪岗位来源搜索词（同步刷新时按同词缺失判下架）
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
-    if "origin_query" not in cols:
-        conn.execute("ALTER TABLE jobs ADD COLUMN origin_query TEXT DEFAULT ''")
+    # 轻量迁移列全部保留默认值，旧代码可继续直接 INSERT/UPDATE。
+    _add_columns(conn, "jobs", {
+        "origin_query": "TEXT DEFAULT ''",
+        "favorite_at": "TEXT",
+        "excluded_at": "TEXT",
+        "status_before_excluded": "TEXT NOT NULL DEFAULT ''",
+        "hr_title": "TEXT NOT NULL DEFAULT ''",
+        "is_headhunter": "INTEGER NOT NULL DEFAULT 0",
+        "headhunter_reason": "TEXT NOT NULL DEFAULT ''",
+        "headhunter_override": "INTEGER",
+    })
+    _add_columns(conn, "greetings", {
+        "resume_id": "INTEGER",
+        "resume_revision": "INTEGER",
+        "delivery_channel": "TEXT NOT NULL DEFAULT ''",
+        "delivery_status": "TEXT NOT NULL DEFAULT ''",
+        "confirmed_at": "TEXT",
+        "updated_at": "TEXT",
+    })
+    _add_columns(conn, "collect_runs", {
+        "status": "TEXT NOT NULL DEFAULT ''",
+        "data_source_at": "TEXT",
+        "risk_signal": "TEXT NOT NULL DEFAULT ''",
+        "phase": "TEXT NOT NULL DEFAULT ''",
+        "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+    })
+    _add_columns(conn, "interviews", {
+        "resume_id": "INTEGER",
+        "resume_revision": "INTEGER",
+    })
     # 默认设置与档案占位
     for k, v in config.DEFAULT_SETTINGS.items():
         conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
                      (k, json.dumps(v, ensure_ascii=False)))
     conn.execute("INSERT OR IGNORE INTO profile(id, resume_text, updated_at, expectations) "
                  "VALUES(1, '', ?, '{}')", (now_iso(),))
+    _migrate_legacy_data(conn)
+    conn.executescript("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_resumes_one_default
+          ON resumes(is_default) WHERE is_default=1 AND archived_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_jobs_favorite ON jobs(favorite_at);
+        CREATE INDEX IF NOT EXISTS idx_jobs_headhunter
+          ON jobs(headhunter_override, is_headhunter);
+        CREATE INDEX IF NOT EXISTS idx_job_resume_scores_current
+          ON job_resume_scores(resume_id, resume_revision, composite DESC);
+        CREATE INDEX IF NOT EXISTS idx_applications_status
+          ON applications(status, confirmed_at);
+        CREATE INDEX IF NOT EXISTS idx_collect_tasks_run_status
+          ON collect_run_tasks(run_id, status);
+        CREATE INDEX IF NOT EXISTS idx_collection_hits_source_active
+          ON job_collection_hits(search_key, is_active);
+        CREATE INDEX IF NOT EXISTS idx_collection_hits_job_active
+          ON job_collection_hits(job_key, is_active);
+        CREATE TRIGGER IF NOT EXISTS job_score_baselines_no_update
+        BEFORE UPDATE ON job_score_baselines
+        BEGIN
+          SELECT RAISE(ABORT, '导入评分基线不可修改');
+        END;
+    """)
+    conn.execute(
+        "UPDATE collect_runs SET status=CASE "
+        "WHEN finished_at IS NULL THEN 'running' "
+        "WHEN stats LIKE '%\"error\"%' THEN 'failed' ELSE 'succeeded' END "
+        "WHERE status='' OR status IS NULL")
     conn.commit()
 
 
