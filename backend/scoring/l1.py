@@ -223,7 +223,8 @@ def score_job(job: dict, jd_text: str, dictionary: dict, expect: dict) -> dict:
 
 
 # ── 全量执行（只填空值；force=True 时重算并覆盖 L1 自身）──────────
-def run_l1(force: bool = False) -> dict:
+def run_l1(force: bool = False, keep_imported: bool = False) -> dict:
+    """keep_imported=True 时跳过 xlsx 导入的人工基线（l1_detail 含 source=imported）。"""
     conn = get_db()
     dictionary = json.loads(
         conn.execute("SELECT value FROM settings WHERE key='skill_dictionary'")
@@ -238,6 +239,10 @@ def run_l1(force: bool = False) -> dict:
         "LEFT JOIN job_details d ON d.job_key=j.job_key").fetchall()
     scored = skipped = 0
     for r in rows:
+        is_imported = "imported" in (r["l1_detail"] or "")
+        if keep_imported and is_imported:
+            skipped += 1
+            continue
         if not force and r["l1_score"] is not None:
             skipped += 1
             continue

@@ -167,6 +167,15 @@ const CollectView = {
   setup() {
     const xlsxPath = ref(''), jsonDir = ref(''), busy = ref(''), result = ref(null), runs = ref([])
     const plan = ref(null), planText = ref(''), genBusy = ref(false), planSaved = ref(false)
+    const st = ref({ running: false, log: [], current: '' })
+    const kw = ref(''), city = ref('深圳'), pages = ref(3), coUrl = ref('')
+    let timer = null
+    async function pollStatus() {
+      try { st.value = await api.get('/api/collect/status'); runs.value = st.value.recent || runs.value } catch (e) {}
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(pollStatus, st.value.running ? 3000 : 8000)
+    }
+    onMounted(pollStatus)
     async function doImport(kind) {
       busy.value = kind; result.value = null
       try {
@@ -190,16 +199,35 @@ const CollectView = {
       try { await api.put('/api/strategy', JSON.parse(planText.value)); planSaved.value = true; setTimeout(()=>planSaved.value=false, 1500) }
       catch (e) { alert('保存失败（JSON 格式错误？）：' + e.message) }
     }
+    async function runCollect(kind, extra) {
+      try { const r = await api.post('/api/collect/run', { kind, ...extra }); if (!r.ok) alert(r.error); pollStatus() }
+      catch (e) { alert('启动失败：' + e.message) }
+    }
+    async function doSync() {
+      if (!confirm('按保存的计划重跑采集（走采集号 Chrome）：新岗位入库、同词消失的下架、HR 不活跃剔除。继续？')) return
+      runCollect('plan', { sync: true })
+    }
+    async function doRescore() {
+      try { const r = await api.post('/api/sync/rescore', {}); alert('L1 已全量重算：' + r.scored + ' 条；P 级变化 ' + r.report.changed.length + ' 条（详见作战卡）') }
+      catch (e) { alert('重算失败：' + e.message) }
+    }
+    async function cancelCollect() { await api.post('/api/collect/cancel'); pollStatus() }
     onMounted(async () => { runs.value = await api.get('/api/runs'); loadPlan() })
-    return { xlsxPath, jsonDir, busy, result, runs, doImport, plan, planText, genBusy, planSaved, genPlan, savePlan }
+    return { xlsxPath, jsonDir, busy, result, runs, doImport, plan, planText, genBusy, planSaved, genPlan, savePlan,
+      st, kw, city, pages, coUrl, runCollect, doSync, doRescore, cancelCollect }
   },
   template: `
   <div>
-    <h2>采集中心</h2>
+    <h2>采集中心
+      <span v-if="st.running" class="warn">● 采集中：{{st.current}}</span>
+      <button v-if="st.running" style="margin-left:10px" @click="cancelCollect()">取消</button>
+    </h2>
     <div class="card">
       <h3>AI 采集策略（根据简历智能生成搜索计划）</h3>
       <div class="row" style="margin-bottom:8px">
-        <button class="primary" :disabled="genBusy" @click="genPlan">{{genBusy?'生成中（LLM）…':'根据简历生成策略'}}</button>
+        <button class="primary" :disabled="genBusy||st.running" @click="genPlan">{{genBusy?'生成中（LLM）…':'根据简历生成策略'}}</button>
+        <button :disabled="st.running" @click="doSync">同步刷新（按计划重跑+下架+HR剔除）</button>
+        <button :disabled="st.running" @click="doRescore">简历变更重算 L1</button>
         <span class="muted">需先在「简历档案」粘贴简历、在「设置」配置 LLM</span>
       </div>
       <textarea v-model="planText" style="min-height:180px" spellcheck="false"></textarea>
@@ -207,8 +235,23 @@ const CollectView = {
         <button :disabled="!planText" @click="savePlan">保存计划</button>
         <span v-if="planSaved" class="ok">已保存 ✓</span>
         <span class="grow"></span>
+        <button :disabled="st.running" @click="runCollect('plan', {})">▶ 按计划采集</button>
         <span class="muted" v-if="plan && plan.searches">搜索词 {{plan.searches.length}} 组 · 定向公司 {{(plan.companies||[]).length}} 家</span>
       </div>
+    </div>
+    <div class="card"><h3>单项采集（采集号 Chrome · 9222）</h3>
+      <div class="row">
+        <input v-model="kw" placeholder="关键词" style="width:160px">
+        <input v-model="city" placeholder="城市" style="width:90px">
+        <input v-model.number="pages" type="number" min="1" max="10" style="width:70px">
+        <button :disabled="!kw||st.running" @click="runCollect('search', {keyword:kw, city, pages})">搜索采集</button>
+        <span class="grow"></span>
+        <input v-model="coUrl" placeholder="公司页 URL / brandId" style="width:260px">
+        <button :disabled="!coUrl||st.running" @click="runCollect('company', {url:coUrl})">公司定向</button>
+      </div>
+    </div>
+    <div class="card" v-if="st.log && st.log.length"><h3>执行日志</h3>
+      <pre class="jd" style="max-height:220px;overflow:auto">{{st.log.join('\\n')}}</pre>
     </div>
     <div class="card">
       <h3>导入岗位表格（xlsx）</h3>
@@ -230,12 +273,12 @@ const CollectView = {
     </div>
     <div class="card"><h3>最近任务</h3>
       <table><thead><tr><th>时间</th><th>类型</th><th>统计</th></tr></thead><tbody>
-        <tr v-for="r in runs"><td class="muted">{{r.finished_at}}</td><td>{{r.kind}}</td>
+        <tr v-for="r in runs"><td class="muted">{{r.finished_at || '进行中'}}</td><td>{{r.kind}}</td>
         <td class="muted">{{JSON.stringify(r.stats)}}</td></tr>
       </tbody></table>
     </div>
-    <div class="card muted">按计划在线采集与同步刷新在 M4 接入。</div>
-  </div>`
+  </div>`,
+  methods: {}
 }
 
 // ── 页面：简历档案 ───────────────────────────────────────────────

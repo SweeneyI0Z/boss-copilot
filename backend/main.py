@@ -202,6 +202,63 @@ def save_strategy(body: dict):
     return {"ok": True}
 
 
+# ── 在线采集与同步 ──────────────────────────────────────────────
+
+@app.post("/api/collect/run")
+def collect_run(body: dict):
+    from . import collector
+    kind = body.get("kind", "search")
+    if kind == "search":
+        if not body.get("keyword"):
+            raise HTTPException(400, "keyword required")
+        tasks = [{"type": "search", "keyword": body["keyword"],
+                  "city": body.get("city", "深圳"), "pages": int(body.get("pages", 3))}]
+    elif kind == "company":
+        if not (body.get("url") or body.get("brand_id")):
+            raise HTTPException(400, "url or brand_id required")
+        tasks = [{"type": "company", **{k: v for k, v in body.items()
+                                        if k in ("url", "brand_id", "name", "pages")}}]
+    elif kind == "plan":
+        tasks = collector.plan_tasks()
+        if not tasks:
+            raise HTTPException(400, "采集计划为空：先在上方生成/保存策略")
+    else:
+        raise HTTPException(400, "kind must be search/company/plan")
+    return collector.start(kind, tasks, sync_mode=bool(body.get("sync")))
+
+
+@app.get("/api/collect/status")
+def collect_status():
+    from . import collector
+    st = collector.status()
+    st["recent"] = runs()
+    return st
+
+
+@app.post("/api/collect/cancel")
+def collect_cancel():
+    from . import collector
+    return collector.cancel()
+
+
+@app.post("/api/sync/refresh")
+def sync_refresh():
+    """按已保存计划重跑采集：diff 下架 + HR 活跃度剔除。"""
+    from . import collector
+    tasks = collector.plan_tasks()
+    if not tasks:
+        raise HTTPException(400, "采集计划为空：先生成/保存策略（或先跑一次按计划采集）")
+    return collector.start("sync", tasks, sync_mode=True)
+
+
+@app.post("/api/sync/rescore")
+def sync_rescore():
+    """简历/词典变更后：L1 重算（保留 xlsx 导入基线）+ P 级变化报告。"""
+    from . import sync as sync_mod
+    result = scoring_l1.run_l1(force=True, keep_imported=True)
+    return {**result, "report": sync_mod.rescore_report()}
+
+
 # ── 双账号 ──────────────────────────────────────────────────────
 
 @app.get("/api/accounts")

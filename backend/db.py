@@ -141,6 +141,10 @@ CREATE TABLE IF NOT EXISTS interviews (
 def init_db() -> None:
     conn = get_db()
     conn.executescript(SCHEMA)
+    # 轻量迁移：origin_query 追踪岗位来源搜索词（同步刷新时按同词缺失判下架）
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+    if "origin_query" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN origin_query TEXT DEFAULT ''")
     # 默认设置与档案占位
     for k, v in config.DEFAULT_SETTINGS.items():
         conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
