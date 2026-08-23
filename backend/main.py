@@ -329,6 +329,39 @@ def greeting_send_status():
 _send_state = type("S", (), {"running": False, "result": None})()
 
 
+# ── 消息中心 ────────────────────────────────────────────────────
+
+@app.post("/api/chat/poll")
+def chat_poll(body: dict = None):
+    from . import chatpoll, llm as llm_mod
+    try:
+        return chatpoll.poll(int((body or {}).get("max", 8)))
+    except (llm_mod.LLMError, RuntimeError, OSError) as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+
+@app.get("/api/chat/conversations")
+def chat_conversations():
+    from . import chatpoll
+    return chatpoll.conversations_with_drafts()
+
+
+@app.post("/api/chat/draft")
+def chat_draft(body: dict):
+    from . import chatpoll, llm as llm_mod
+    try:
+        return chatpoll.generate_draft(int(body.get("conversation_id", 0)))
+    except llm_mod.LLMError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/chat/send")
+def chat_send(body: dict):
+    from . import chatpoll
+    return chatpoll.approve_and_send(int(body.get("conversation_id", 0)),
+                                     body.get("reply", ""))
+
+
 # ── 双账号 ──────────────────────────────────────────────────────
 
 @app.get("/api/accounts")

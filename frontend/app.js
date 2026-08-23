@@ -11,7 +11,7 @@ const api = {
 const route = ref(location.hash.slice(1) || '/jobs')
 const nav = [
   ['/jobs', '岗位列表'], ['/jobcard', '作战卡'], ['/collect', '采集中心'],
-  ['/greetings', '招呼语'], ['/profile', '简历档案'], ['/accounts', '双账号'], ['/settings', '设置'],
+  ['/greetings', '招呼语'], ['/messages', '消息'], ['/profile', '简历档案'], ['/accounts', '双账号'], ['/settings', '设置'],
 ]
 window.addEventListener('hashchange', () => { route.value = location.hash.slice(1) || '/jobs' })
 
@@ -92,6 +92,57 @@ const JobsView = {
       <span class="muted">第 {{page+1}}/{{Math.max(pages,1)}} 页</span>
       <button :disabled="page>=pages-1||loading" @click="next">下一页</button>
     </div>
+    </div>
+  </div>`
+}
+
+// ── 页面：消息中心 ───────────────────────────────────────────────
+const MessagesView = {
+  setup() {
+    const convs = ref([]), busy = ref(''), sel = ref(null)
+    async function load() { convs.value = await api.get('/api/chat/conversations') }
+    onMounted(load)
+    async function doPoll() {
+      busy.value = 'poll'
+      const r = await api.post('/api/chat/poll', {})
+      busy.value = ''
+      if (!r.ok) alert('轮询失败：' + r.error)
+      else alert('会话 ' + r.conversations + ' 个，新快照 ' + r.new_snapshots + ' 份')
+      load()
+    }
+    async function doDraft(c) {
+      busy.value = 'draft'
+      try { const r = await api.post('/api/chat/draft', { conversation_id: c.id })
+        alert('草稿：' + r.reply) } catch (e) { alert('草稿失败：' + e.message) }
+      busy.value = ''; load()
+    }
+    async function doSend(c, reply) {
+      if (!confirm('确认发送这条回复（账号A）？\n\n' + reply)) return
+      busy.value = 'send'
+      const r = await api.post('/api/chat/send', { conversation_id: c.id, reply })
+      busy.value = ''
+      alert(r.ok ? '已发送' : '发送失败：' + (r.error || ''))
+      load()
+    }
+    return { convs, busy, sel, doPoll, doDraft, doSend, load }
+  },
+  template: `
+  <div>
+    <h2>消息中心 <span class="muted">账号A 会话 · AI 起草 + 人工点发</span>
+      <button class="primary" style="margin-left:10px" :disabled="busy" @click="doPoll">{{busy==='poll'?'轮询中…':'轮询会话'}}</button>
+    </h2>
+    <div v-if="!convs.length" class="card muted">暂无会话——先「轮询会话」（需账号A 已登录）。</div>
+    <div v-for="c in convs" :key="c.id" class="card">
+      <div class="row">
+        <b class="grow">{{c.boss_name}}</b>
+        <span class="muted">{{(c.last_message_at||'').slice(0,16)}}</span>
+        <button :disabled="busy" @click="doDraft(c)">AI 起草回复</button>
+      </div>
+      <pre class="jd" style="max-height:160px;overflow:auto;margin-top:8px">{{(c.latest_snapshot||'').slice(0,600)}}</pre>
+      <div v-for="d in c.drafts" :key="d.id" class="row" style="margin-top:6px">
+        <span class="grow" :class="d.draft_status==='sent'?'muted':''">✎ {{d.draft_reply}} <span class="muted">({{d.draft_status}})</span></span>
+        <button v-if="d.draft_status!=='sent'" :disabled="busy" @click="doSend(c, d.draft_reply)">发送</button>
+      </div>
     </div>
   </div>`
 }
@@ -456,6 +507,7 @@ const App = {
     const view = computed(() => {
       const r = route.value
       if (r.startsWith('/jobcard')) return JobCardView
+      if (r.startsWith('/messages')) return MessagesView
       if (r.startsWith('/greetings')) return GreetingsView
       if (r.startsWith('/collect')) return CollectView
       if (r.startsWith('/profile')) return ProfileView

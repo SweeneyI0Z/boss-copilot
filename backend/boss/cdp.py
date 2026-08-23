@@ -13,10 +13,13 @@ from .. import config
 
 CHROME = config.CHROME_PATH
 
+# 本机 CDP 请求绝不走系统代理（用户常挂 Clash 类代理，会把 127.0.0.1 劫持成 502）
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 def _http_get_json(url: str, timeout=3):
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with _opener.open(url, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except (OSError, ValueError):
         return None
