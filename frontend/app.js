@@ -96,6 +96,92 @@ const JobsView = {
   </div>`
 }
 
+// ── 页面：模拟面试 ───────────────────────────────────────────────
+const InterviewView = {
+  setup() {
+    const sessions = ref([]), cur = ref(null), input = ref(''), busy = ref(false), report = ref(null)
+    async function load() { sessions.value = await api.get('/api/interviews') }
+    onMounted(load)
+    async function startNew() {
+      const q = prompt('输入要模拟面试的岗位关键字（从岗位列表搜索）：', '')
+      if (!q) return
+      const jobs = await api.get('/api/jobs?q=' + encodeURIComponent(q) + '&limit=5')
+      if (!jobs.items.length) { alert('没有匹配岗位'); return }
+      const pick = jobs.items[0]
+      if (!confirm(`对「${pick.title} · ${pick.company}」开始模拟面试？`)) return
+      busy.value = true
+      try {
+        const s = await api.post('/api/interview/start', { job_key: pick.job_key })
+        cur.value = { id: s.id, title: s.title, total: s.total_questions,
+          transcript: [{ role: 'interviewer', content: s.first_question }] }
+        report.value = null
+      } catch (e) { alert('开始失败：' + e.message) }
+      busy.value = false
+    }
+    async function send() {
+      if (!input.value.trim() || !cur.value) return
+      const text = input.value; input.value = ''
+      cur.value.transcript.push({ role: 'candidate', content: text })
+      busy.value = true
+      try {
+        const r = await api.post(`/api/interview/${cur.value.id}/answer`, { text })
+        cur.value.transcript.push({ role: 'interviewer', content: r.content,
+          feedback: r.feedback })
+        if (String(r.content).includes('面试结束')) await finish()
+      } catch (e) { alert('失败：' + e.message) }
+      busy.value = false
+    }
+    async function finish() {
+      busy.value = true
+      try { report.value = await api.post(`/api/interview/${cur.value.id}/finish`) }
+      catch (e) { alert('报告失败：' + e.message) }
+      busy.value = false; load()
+    }
+    async function openSession(s) {
+      const d = await api.get('/api/interview/' + s.id)
+      cur.value = { id: d.id, title: s.title, total: 0, transcript: d.transcript.filter(t => t.role !== 'bank') }
+      report.value = d.report || null
+    }
+    return { sessions, cur, input, busy, report, load, startNew, send, finish, openSession }
+  },
+  template: `
+  <div class="grid2">
+    <div>
+      <h2>模拟面试 <button class="primary" :disabled="busy" @click="startNew">＋ 新面试</button></h2>
+      <div class="card"><h3>历史会话</h3>
+        <table><tbody><tr v-for="s in sessions" :key="s.id" style="cursor:pointer" @click="openSession(s)">
+          <td>{{s.title}}<div class="muted">{{s.company}} · {{s.status}} · {{(s.created_at||'').slice(0,16)}}</div></td>
+        </tr></tbody></table>
+        <div v-if="!sessions.length" class="muted">暂无</div>
+      </div>
+      <div v-if="report" class="card"><h3>面试报告 <span class="score">{{report.score ?? '—'}}</span>/100</h3>
+        <p>{{report.overall}}</p>
+        <h3>优势</h3><ul style="padding-left:18px"><li v-for="x in report.strengths">{{x}}</li></ul>
+        <h3>风险</h3><ul style="padding-left:18px"><li v-for="x in report.risks">{{x}}</li></ul>
+        <h3>面试前必补</h3><ul style="padding-left:18px"><li v-for="x in report.prep">{{x}}</li></ul>
+      </div>
+    </div>
+    <div v-if="cur">
+      <h2>{{cur.title}}</h2>
+      <div class="card" style="max-height:520px;overflow:auto">
+        <div v-for="(t,i) in cur.transcript" :key="i" style="margin-bottom:12px">
+          <div :style="{textAlign: t.role==='candidate'?'right':'left'}">
+            <div class="tag" :style="{display:'inline-block'}">{{t.role==='candidate'?'我':'面试官'}}</div>
+            <div style="white-space:pre-wrap">{{t.content}}</div>
+            <div v-if="t.feedback" class="muted" style="margin-top:4px">💬 点评：{{t.feedback}}</div>
+          </div>
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px" v-if="!report">
+        <input class="grow" v-model="input" placeholder="输入你的回答，回车发送" @keyup.enter="send">
+        <button class="primary" :disabled="busy" @click="send">回答</button>
+        <button :disabled="busy" @click="finish">提前结束并出报告</button>
+      </div>
+    </div>
+    <div v-else class="muted">左侧选择历史会话，或开始新面试</div>
+  </div>`
+}
+
 // ── 页面：消息中心 ───────────────────────────────────────────────
 const MessagesView = {
   setup() {
@@ -507,6 +593,7 @@ const App = {
     const view = computed(() => {
       const r = route.value
       if (r.startsWith('/jobcard')) return JobCardView
+      if (r.startsWith('/interview')) return InterviewView
       if (r.startsWith('/messages')) return MessagesView
       if (r.startsWith('/greetings')) return GreetingsView
       if (r.startsWith('/collect')) return CollectView

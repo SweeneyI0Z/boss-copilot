@@ -20,13 +20,14 @@ def now_iso() -> str:
 
 def get_db() -> sqlite3.Connection:
     conn = getattr(_local, "conn", None)
-    if conn is None:
+    if conn is None or getattr(_local, "path", "") != str(config.DB_PATH):
         config.DATA_DIR.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(config.DB_PATH, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         _local.conn = conn
+        _local.path = str(config.DB_PATH)
     return conn
 
 

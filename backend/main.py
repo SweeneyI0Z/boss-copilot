@@ -362,6 +362,49 @@ def chat_send(body: dict):
                                      body.get("reply", ""))
 
 
+# ── 模拟面试 ────────────────────────────────────────────────────
+
+@app.post("/api/interview/start")
+def interview_start(body: dict):
+    from . import interview, llm as llm_mod
+    if not llm_mod.configured():
+        raise HTTPException(400, "LLM 未配置：请在「设置」页填写 BYOK 信息")
+    try:
+        return interview.start(body.get("job_key", ""))
+    except llm_mod.LLMError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/interview/{sid}/answer")
+def interview_answer(sid: int, body: dict):
+    from . import interview, llm as llm_mod
+    try:
+        return interview.answer(sid, body.get("text", ""))
+    except llm_mod.LLMError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/interview/{sid}/finish")
+def interview_finish(sid: int):
+    from . import interview, llm as llm_mod
+    try:
+        return interview.finish(sid)
+    except llm_mod.LLMError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/interview/{sid}")
+def interview_get(sid: int):
+    from . import interview
+    return interview.get(sid)
+
+
+@app.get("/api/interviews")
+def interview_list():
+    from . import interview
+    return interview.list_sessions()
+
+
 # ── 双账号 ──────────────────────────────────────────────────────
 
 @app.get("/api/accounts")
