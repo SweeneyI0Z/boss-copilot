@@ -19,7 +19,8 @@ window.addEventListener('hashchange', () => { route.value = location.hash.slice(
 const JobsView = {
   setup() {
     const items = ref([]), total = ref(0), counts = ref({}), q = ref(''),
-      status = ref(''), sort = ref('composite'), page = ref(0), loading = ref(false)
+      status = ref(''), sort = ref('composite'), page = ref(0), loading = ref(false),
+      scoring = ref(false)
     const PAGE = 50
     async function load() {
       loading.value = true
@@ -30,8 +31,14 @@ const JobsView = {
       } finally { loading.value = false }
     }
     onMounted(load)
+    async function runL1() {
+      scoring.value = true
+      try { alert('L1 评分完成：' + JSON.stringify(await api.post('/api/score/l1', {}))); load() }
+      catch (e) { alert('L1 失败：' + e.message) }
+      scoring.value = false
+    }
     const pages = computed(() => Math.ceil(total.value / PAGE))
-    return { items, total, counts, q, status, sort, page, loading, load, pages,
+    return { items, total, counts, q, status, sort, page, loading, scoring, load, pages, runL1,
       search: () => { page.value = 0; load() },
       prev: () => { page.value--; load() }, next: () => { page.value++; load() } }
   },
@@ -50,6 +57,8 @@ const JobsView = {
         <option value="recent">最近采集</option>
       </select>
       <button class="primary" @click="search">筛选</button>
+      <span class="grow"></span>
+      <button :disabled="scoring" @click="runL1">{{scoring?'评分中…':'运行 L1 评分'}}</button>
     </div></div>
     <div class="card" style="padding:0 10px">
     <table>

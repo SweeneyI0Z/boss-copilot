@@ -12,6 +12,7 @@ from . import config
 from . import importer
 from .boss import cdp
 from .db import get_all_settings, get_db, init_db, now_iso, set_setting
+from .scoring import l1 as scoring_l1
 
 app = FastAPI(title="boss-copilot")
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
@@ -149,6 +150,14 @@ def runs():
         d["stats"] = json.loads(d["stats"] or "{}")
         out.append(d)
     return out
+
+
+# ── 评分 ────────────────────────────────────────────────────────
+
+@app.post("/api/score/l1")
+def run_l1(body: dict = None):
+    force = bool((body or {}).get("force"))
+    return scoring_l1.run_l1(force=force)
 
 
 # ── 双账号 ──────────────────────────────────────────────────────
