@@ -11,6 +11,9 @@
 - 后台标签页必须开 Emulation.setFocusEmulationEnabled（BOSS SPA 无焦点不渲染）。
 - 页面卡片解析借鉴外部 scraper 公司页的成熟做法：JS 只取文本行+结构化提示，
   字段映射放在 Python 纯函数里（可单测，DOM 结构变化时只改一处启发式）。
+  实测「感兴趣」列表用专用组件 li.item-boss（职位名 .job-name-text、公司
+  .company-info、岗位链接 a[href*=job_detail] 带 encryptJobId），搜索系
+  job-card-box 卡片作为兼容家族一并支持。
 """
 import json
 import random
@@ -40,6 +43,8 @@ _SALARY_RE = re.compile(r"^\d[\d\.]*\s*-\s*\d[\d\.]*\s*[Kk元]")
 _EXP_RE = re.compile(r"^(经验不限|在校/应届|应届生|在校生|\d+年以内|\d+-\d+年|\d+年以上)$")
 _DEGREE_SET = {"学历不限", "初中", "中专/中技", "高中", "大专", "本科", "硕士", "博士",
                "MBA/EMBA"}
+_STAGE_SET = {"未融资", "天使轮", "A轮", "B轮", "C轮", "D轮及以上", "已上市", "不需要融资"}
+_SCALE_RE = re.compile(r"^\d+(?:-\d+)?人以上?$")
 _COMPANY_META_RE = re.compile(
     r"^(不需要融资|未融资|天使轮|[A-D]轮及以上|已上市|\d+-?\d*人以上?|\d+-\d+人)$")
 _ACTIVITY_RE = re.compile(r"活跃|在线|刚发布|今日更新|刚刚|刚更新")
@@ -54,32 +59,57 @@ EXTRACT_JS = r"""
   var panel = document.querySelector(
     '.sign-wrap,.login-register-content,[class*=login-register],input[placeholder*=手机号]');
   out.login = /\/web\/user\//.test(location.href) || visible(panel);
-  var pick = function (root, selectors) {
-    for (var i = 0; i < selectors.length; i++) {
-      var el = root.querySelector(selectors[i]);
-      var text = el ? (el.textContent || '').trim() : '';
-      if (text) return text;
-    }
-    return '';
+  var abs = function (href) {
+    if (!href) return '';
+    return href.indexOf('http') === 0 ? href :
+      'https://www.zhipin.com' + (href.charAt(0) === '/' ? '' : '/') + href;
   };
-  var nodes = document.querySelectorAll('li.job-card-box, .job-card-box, li.job-card');
+  var text = function (el) { return el ? (el.textContent || '').trim() : ''; };
+  var nodes = document.querySelectorAll(
+    'li.job-card-box, .job-card-box, li.job-card, li.item-boss');
   for (var i = 0; i < nodes.length; i++) {
     var card = nodes[i];
-    var a = card.querySelector('a[href*="job_detail"]');
+    var jobA = card.querySelector('a[href*="job_detail"]');
+    var companyA = card.querySelector(
+      '.company-info a[href*="/gongsi/"], a[href*="/gongsi/"]');
+    var meta = [];
+    var metaSpans = card.querySelectorAll('.company-info p.gray span');
+    for (var m = 0; m < metaSpans.length; m++) {
+      var mt = text(metaSpans[m]);
+      if (mt) meta.push(mt);
+    }
+    var sal = text(card.querySelector('.job-salary, .salary'));
+    if (!sal) {
+      var pText = text(card.querySelector('.job-info p.gray'));
+      var mm = pText.match(/\d[\d\.]*\s*-\s*\d[\d\.]*\s*[Kk][^\s]*/);
+      sal = mm ? mm[0] : '';
+    }
+    var tags = [];
+    var tagSpans = card.querySelectorAll('.job-info p.gray span');
+    for (var g = 0; g < tagSpans.length; g++) {
+      var tg = text(tagSpans[g]);
+      if (tg && tg !== sal) tags.push(tg);
+    }
     var raw = (card.innerText || '').split('\n');
     var lines = [];
     for (var j = 0; j < raw.length; j++) {
-      var t = raw[j].trim();
-      if (t) lines.push(t);
+      var lt = raw[j].trim();
+      if (lt && lt !== '[' && lt !== ']') lines.push(lt);
     }
     out.cards.push({
-      href: a ? (a.getAttribute('href') || '') : '',
+      href: jobA ? abs(jobA.getAttribute('href')) : '',
       lines: lines,
-      name: pick(card, ['.job-name', '.job-title', '.job-name-text']),
-      salary: pick(card, ['.salary', '.job-salary', '.job-salary-bottom']),
-      company: pick(card, ['.company-name', '.company-card', '.boss-name']),
-      tags: pick(card, ['.job-info .tag-list', '.tag-list', '.job-tags']),
-      area: pick(card, ['.job-area', '.job-area-wrapper'])
+      name: text(card.querySelector('.job-name-text')) ||
+            text(card.querySelector('.job-name, .job-title')),
+      salary: sal,
+      company: text(card.querySelector(
+        '.company-info .text b, .company-name, .company-card, .boss-name')),
+      company_link: companyA ? abs(companyA.getAttribute('href')) : '',
+      company_meta: meta.join('·'),
+      tags: tags.join(' '),
+      area: text(card.querySelector(
+        '.job-name .location em, .job-area, .job-area-wrapper')),
+      boss_title: text(card.querySelector('.info-header .name .gray'))
     });
   }
   var body = document.body ? document.body.innerText : '';
@@ -131,10 +161,26 @@ def _line_is_tags_or_meta(line: str) -> bool:
     return bool(_COMPANY_META_RE.match(line)) or bool(_ACTIVITY_RE.search(line))
 
 
+def _parse_company_meta(meta: str) -> tuple[str, str, str]:
+    """把「行业·融资阶段·规模」串分解为三元组；无法识别的段当行业处理。"""
+    industry = stage = scale = ""
+    for segment in re.split(r"[·|]", _clean_text(meta)):
+        segment = segment.strip()
+        if not segment:
+            continue
+        if not scale and _SCALE_RE.match(segment):
+            scale = segment
+        elif not stage and segment in _STAGE_SET:
+            stage = segment
+        elif not industry:
+            industry = segment
+    return industry, stage, scale
+
+
 def parse_favorite_card(card: dict) -> dict | None:
     """把单张「感兴趣」卡片映射为 scraper 兼容的原始岗位字典；识别失败返回 None。
 
-    结构化字段（name/salary/company 来自 DOM 选择器）优先，行文本启发式兜底。
+    结构化字段（name/salary/company 等来自 DOM 选择器）优先，行文本启发式兜底。
     """
     lines = [str(line).strip() for line in (card.get("lines") or [])
              if str(line).strip()]
@@ -174,14 +220,24 @@ def parse_favorite_card(card: dict) -> dict | None:
         line_exp, line_degree = _tag_fields(lines)
         exp = exp or line_exp
         degree = degree or line_degree
-    return {
+    raw = {
         "title": title,
         "salary": salary,
         "boss_name": company,
         "tags": " | ".join(item for item in (exp, degree) if item),
         "location": _clean_text(card.get("area")),
         "job_link": link,
+        "company_link": str(card.get("company_link") or ""),
+        "boss_title": _clean_text(card.get("boss_title")),
     }
+    industry, stage, scale = _parse_company_meta(card.get("company_meta") or "")
+    if industry:
+        raw["company_industry"] = industry
+    if stage:
+        raw["company_stage"] = stage
+    if scale:
+        raw["company_scale"] = scale
+    return raw
 
 
 def parse_favorite_page(page_data: dict) -> list[dict]:
@@ -206,7 +262,12 @@ def parse_favorite_page(page_data: dict) -> list[dict]:
 # ── CDP 只读页面会话 ──────────────────────────────────────────────
 
 class FavoritePageSession:
-    """账号 Chrome 里一个后台标签页（焦点仿真），逐页只读「感兴趣」Tab。"""
+    """账号 Chrome 的只读「感兴趣」页会话；每页独立后台标签（焦点仿真）。
+
+    Chrome 会回收长时间闲置的后台标签（Session with given id not found），
+    且同标签改 page 参数不触发 SPA 首次路由；因此每页新建标签、用完即关，
+    读取中途会话失效时自愈重建一次。
+    """
 
     def __init__(self, account: str):
         import websocket
@@ -221,12 +282,8 @@ class FavoritePageSession:
         self.ws = websocket.create_connection(version["webSocketDebuggerUrl"],
                                               timeout=30)
         self._id = 0
-        self.tid = self.call("Target.createTarget",
-                             {"url": "about:blank", "background": True})["result"]["targetId"]
-        self.sid = self.call("Target.attachToTarget",
-                             {"targetId": self.tid, "flatten": True})["result"]["sessionId"]
-        # BOSS SPA 后台标签无焦点不渲染，必须开焦点仿真
-        self.call("Emulation.setFocusEmulationEnabled", {"enabled": True}, sid=self.sid)
+        self.tid = None
+        self.sid = None
 
     def call(self, method: str, params: dict, sid: str = None) -> dict:
         self._id += 1
@@ -250,34 +307,62 @@ class FavoritePageSession:
         except (json.JSONDecodeError, TypeError, KeyError):
             return {}
 
-    def read_page(self, page: int) -> dict:
-        """导航到第 page 页并等待卡片渲染稳定，返回 EXTRACT_JS 结果。"""
-        self.call("Page.navigate", {"url": FAVORITE_URL.format(page=page)},
-                  sid=self.sid)
-        deadline = time.time() + PAGE_LOAD_TIMEOUT_SEC
-        stable_rounds = 0
-        last_count = -1
-        data = {}
-        while time.time() < deadline:
-            data = self.eval_json(EXTRACT_JS)
-            count = len(data.get("cards") or [])
-            if data.get("login") or data.get("risk"):
-                break
-            if count and count == last_count:
-                stable_rounds += 1
-                if stable_rounds >= 2:
-                    break
-            else:
-                stable_rounds = 0
-            last_count = count
-            time.sleep(1.2)
-        return data
-
-    def close(self) -> None:
+    def _close_tab(self) -> None:
+        if not self.tid:
+            return
         try:
             self.call("Target.closeTarget", {"targetId": self.tid})
         except (FavoriteSyncError, OSError):
             pass
+        self.tid = None
+        self.sid = None
+
+    def _open_tab(self) -> None:
+        self._close_tab()
+        self.tid = self.call(
+            "Target.createTarget",
+            {"url": "about:blank", "background": True})["result"]["targetId"]
+        self.sid = self.call(
+            "Target.attachToTarget",
+            {"targetId": self.tid, "flatten": True})["result"]["sessionId"]
+        # BOSS SPA 后台标签无焦点不渲染，必须在任何内容加载前开启焦点仿真
+        self.call("Emulation.setFocusEmulationEnabled", {"enabled": True},
+                  sid=self.sid)
+
+    def read_page(self, page: int) -> dict:
+        """新标签导航到第 page 页，等待卡片渲染稳定后返回 EXTRACT_JS 结果。"""
+        for attempt in (1, 2):
+            data = {}
+            try:
+                self._open_tab()
+                self.call("Page.navigate",
+                          {"url": FAVORITE_URL.format(page=page)}, sid=self.sid)
+                deadline = time.time() + PAGE_LOAD_TIMEOUT_SEC
+                stable_rounds = 0
+                last_count = -1
+                while time.time() < deadline:
+                    data = self.eval_json(EXTRACT_JS)
+                    count = len(data.get("cards") or [])
+                    if data.get("login") or data.get("risk"):
+                        break
+                    if count and count == last_count:
+                        stable_rounds += 1
+                        if stable_rounds >= 2:
+                            break
+                    else:
+                        stable_rounds = 0
+                    last_count = count
+                    time.sleep(1.2)
+                return data
+            except FavoriteSyncError:
+                if attempt == 2:
+                    raise
+            finally:
+                self._close_tab()
+        return {}
+
+    def close(self) -> None:
+        self._close_tab()
         try:
             self.ws.close()
         except OSError:

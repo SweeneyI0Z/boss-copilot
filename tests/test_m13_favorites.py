@@ -40,6 +40,21 @@ class M13TestCase(unittest.TestCase):
                 "name": "", "salary": "", "company": "", "tags": "", "area": ""}
 
     @staticmethod
+    def interest_card(key="8915113db11fe04c0nJ53969GFpX"):
+        """实测「感兴趣」列表 li.item-boss 卡片的提取结果形态。"""
+        return {"href": f"https://www.zhipin.com/job_detail/{key}.html?securityId=x",
+                "lines": ["陈女士招聘经理", "大疆创新",
+                          "智能硬件/消费电子D轮及以上10000人以上",
+                          "中/高级嵌入式工程师（RTOS-深圳）", "深圳·南山区·科技园",
+                          "30-60K·15薪 经验不限 本科"],
+                "name": "中/高级嵌入式工程师（RTOS-深圳）", "salary": "30-60K·15薪",
+                "company": "大疆创新",
+                "company_link": "https://www.zhipin.com/gongsi/05457.html",
+                "company_meta": "智能硬件/消费电子·D轮及以上·10000人以上",
+                "tags": "经验不限 本科", "area": "深圳·南山区·科技园",
+                "boss_title": "招聘经理"}
+
+    @staticmethod
     def page(cards, **flags):
         return {"url": favorites.FAVORITE_URL.format(page=1), "login": False,
                 "risk": False, "cards": cards, **flags}
@@ -114,6 +129,21 @@ class CardParsingTests(M13TestCase):
         self.assertEqual([r["job_link"].rsplit("/", 1)[-1] for r in raws],
                          ["k1.html", "k2.html"])
 
+    def test_interest_item_boss_card_maps_structured_fields(self):
+        raw = favorites.parse_favorite_card(self.interest_card())
+        self.assertEqual(raw["title"], "中/高级嵌入式工程师（RTOS-深圳）")
+        self.assertEqual(raw["boss_name"], "大疆创新")
+        self.assertEqual(raw["salary"], "30-60K·15薪")
+        self.assertEqual(raw["tags"], "经验不限 | 本科")
+        self.assertEqual(raw["location"], "深圳·南山区·科技园")
+        self.assertEqual(raw["company_industry"], "智能硬件/消费电子")
+        self.assertEqual(raw["company_stage"], "D轮及以上")
+        self.assertEqual(raw["company_scale"], "10000人以上")
+        self.assertEqual(raw["boss_title"], "招聘经理")
+        self.assertEqual(raw["company_link"],
+                         "https://www.zhipin.com/gongsi/05457.html")
+        self.assertIn("8915113db11fe04c0nJ53969GFpX", raw["job_link"])
+
 
 class MergeTests(M13TestCase):
     def raws(self, *keys):
@@ -170,6 +200,20 @@ class MergeTests(M13TestCase):
         self.assertEqual(get_db().execute(
             "SELECT COUNT(*) c FROM job_favorite_hits WHERE job_key='a1'")
             .fetchone()["c"], 0)
+
+    def test_interest_card_company_fields_persist_to_jobs(self):
+        raw = favorites.parse_favorite_card(self.interest_card())
+        favorites.merge_account_hits("account_a", [raw])
+        row = get_db().execute(
+            "SELECT industry, stage, scale, hr_title, company_link, source "
+            "FROM jobs WHERE job_key='8915113db11fe04c0nJ53969GFpX'").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["industry"], "智能硬件/消费电子")
+        self.assertEqual(row["stage"], "D轮及以上")
+        self.assertEqual(row["scale"], "10000人以上")
+        self.assertEqual(row["hr_title"], "招聘经理")
+        self.assertEqual(row["company_link"], "https://www.zhipin.com/gongsi/05457.html")
+        self.assertEqual(row["source"], "favorite")
 
 
 class SyncRunTests(M13TestCase):
