@@ -780,7 +780,8 @@ const SvgBars = {
     const max = computed(() => Math.max(1, ...rows.value.map(item => Number(item.count || item.value || 0))))
     return { rows, max }
   },
-  template: `<div class="bar-chart"><div v-for="item in rows" :key="item.label" class="bar-row"><span :title="item.label">{{item.label}}</span><svg viewBox="0 0 100 12" preserveAspectRatio="none" role="img" :aria-label="item.label + ' ' + (item.count ?? item.value)"><rect width="100" height="12" rx="2" fill="#edf0ec"></rect><rect :width="(item.count ?? item.value) > 0 ? Math.max(1,(item.count ?? item.value)/max*100) : 0" height="12" rx="2" :fill="color || '#177a58'"></rect></svg><b>{{item.count ?? item.value}}</b></div><div v-if="!rows.length" class="empty">暂无数据</div></div>`,
+  // 柱状图颜色走 CSS 变量（随主题切换）；fill 属性不支持 var()，须用内联 style
+  template: `<div class="bar-chart"><div v-for="item in rows" :key="item.label" class="bar-row"><span :title="item.label">{{item.label}}</span><svg viewBox="0 0 100 12" preserveAspectRatio="none" role="img" :aria-label="item.label + ' ' + (item.count ?? item.value)"><rect class="bar-bg" width="100" height="12" rx="2"></rect><rect :width="(item.count ?? item.value) > 0 ? Math.max(1,(item.count ?? item.value)/max*100) : 0" height="12" rx="2" :style="{fill: color || 'var(--accent)'}"></rect></svg><b>{{item.count ?? item.value}}</b></div><div v-if="!rows.length" class="empty">暂无数据</div></div>`,
 }
 const AnalyticsView = {
   components: { SvgBars },
@@ -797,10 +798,10 @@ const AnalyticsView = {
     const dist = computed(() => data.value.distributions || {})
     const meta = computed(() => data.value.meta || {})
     const charts = computed(() => [
-      ['salary', '月薪分布', '#177a58'], ['annual_salary', '年包估算', '#2563a8'],
-      ['experience', '经验要求', '#a16618'], ['degree', '学历要求', '#7254a3'],
-      ['industry', '行业分布', '#a34b4b'], ['scale', '公司规模', '#28767a'],
-      ['priority', '岗位 P 级', '#4f6b3b'], ['trend', '采集趋势', '#49525e'],
+      ['salary', '月薪分布', 'var(--chart-1)'], ['annual_salary', '年包估算', 'var(--chart-2)'],
+      ['experience', '经验要求', 'var(--chart-3)'], ['degree', '学历要求', 'var(--chart-4)'],
+      ['industry', '行业分布', 'var(--chart-5)'], ['scale', '公司规模', 'var(--chart-6)'],
+      ['priority', '岗位 P 级', 'var(--chart-7)'], ['trend', '采集趋势', 'var(--chart-8)'],
     ])
     return { data, loading, filters, summary, dist, meta, charts, load }
   },
@@ -906,9 +907,16 @@ const App = {
       if (path.startsWith('/settings')) return SettingsView
       return JobsView
     })
-    return { route, nav, view }
+    // 主题：默认深色（初版风格），index.html 已在首帧前设置 data-theme，这里接管切换并持久化
+    const theme = ref(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark')
+    function toggleTheme() {
+      theme.value = theme.value === 'dark' ? 'light' : 'dark'
+      document.documentElement.dataset.theme = theme.value
+      localStorage.setItem('theme', theme.value)
+    }
+    return { route, nav, view, theme, toggleTheme }
   },
-  template: `<div class="layout"><aside class="side"><a class="logo" href="#/dashboard"><span class="logo-mark">BC</span><span>求职作战室<small>boss-copilot</small></span></a><nav><a v-for="[href,label] in nav" :key="href" :class="{on:route.startsWith(href)}" :href="'#'+href">{{label}}</a></nav><div class="side-foot">本地运行 · 数据不出设备</div></aside><main class="main"><component :is="view" /></main></div>`,
+  template: `<div class="layout"><aside class="side"><a class="logo" href="#/dashboard"><span class="logo-mark">BC</span><span>求职作战室<small>boss-copilot</small></span></a><nav><a v-for="[href,label] in nav" :key="href" :class="{on:route.startsWith(href)}" :href="'#'+href">{{label}}</a></nav><button class="theme-toggle" type="button" @click="toggleTheme">{{theme === 'dark' ? '☀️ 切换浅色' : '🌙 切换深色'}}</button><div class="side-foot">本地运行 · 数据不出设备</div></aside><main class="main"><component :is="view" /></main></div>`,
 }
 
 createApp(App).mount('#app')

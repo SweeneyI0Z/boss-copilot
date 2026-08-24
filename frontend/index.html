@@ -4,6 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>boss-copilot · 求职作战室</title>
+<script>
+  // 首帧前恢复上次选择的主题，默认深色（初版风格），避免刷新闪色
+  document.documentElement.dataset.theme = localStorage.getItem('theme') || 'dark'
+</script>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
