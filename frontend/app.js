@@ -916,7 +916,7 @@ const App = {
     }
     return { route, nav, view, theme, toggleTheme }
   },
-  template: `<div class="layout"><aside class="side"><a class="logo" href="#/dashboard"><span class="logo-mark">BC</span><span>求职作战室<small>boss-copilot</small></span></a><nav><a v-for="[href,label] in nav" :key="href" :class="{on:route.startsWith(href)}" :href="'#'+href">{{label}}</a></nav><button class="theme-toggle" type="button" @click="toggleTheme">{{theme === 'dark' ? '☀️ 切换浅色' : '🌙 切换深色'}}</button><div class="side-foot">本地运行 · 数据不出设备</div></aside><main class="main"><component :is="view" /></main></div>`,
+  template: `<div class="layout"><aside class="side"><div class="logo">boss<span>-copilot</span></div><nav><a v-for="[href,label] in nav" :key="href" :class="{on:route.startsWith(href)}" :href="'#'+href">{{label}}</a></nav><button class="theme-toggle" type="button" @click="toggleTheme">{{theme === 'dark' ? '☀️ 切换浅色' : '🌙 切换深色'}}</button><div class="side-foot">本地运行 · 数据不出设备</div></aside><main class="main"><component :is="view" /></main></div>`,
 }
 
 createApp(App).mount('#app')

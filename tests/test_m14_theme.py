@@ -43,6 +43,12 @@ class ThemeToggleTests(unittest.TestCase):
         self.assertIn("fill: var(--bar-bg)", self.css)
         self.assertIn("--chart-1: #4f8cff", self.css)
 
+    def test_logo_restored_to_initial_text_mark(self):
+        # 初版 logo：纯文本 boss-copilot，后缀走侧栏强调色；不再有 BC 方块与小字组合
+        self.assertIn('<div class="logo">boss<span>-copilot</span></div>', self.app)
+        self.assertNotIn("logo-mark", self.app)
+        self.assertIn(".logo span { color: var(--side-bar); }", self.css)
+
 
 if __name__ == "__main__":
     unittest.main()
