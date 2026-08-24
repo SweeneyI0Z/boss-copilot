@@ -5,7 +5,7 @@
 ## 常用命令
 
 ```bash
-# 回归测试（60 例，任何 backend/ 或 frontend/ 改动后必须全绿才可提交）
+# 回归测试（184 例，任何 backend/ 或 frontend/ 改动后必须全绿才可提交）
 .venv/bin/python -m unittest discover tests -v
 
 # 启动（浏览器打开 http://127.0.0.1:8787）
@@ -20,7 +20,7 @@
 - `backend/main.py`：**全部** REST 端点 + 前端静态托管，单文件新增端点。
 - `backend/db.py`：SQLite（WAL、thread-local 连接、DB_PATH 变化自动重连）。原则：**岗位永不物理删除**，用状态机 active/delisted/hr_inactive/excluded；评分字段同时存 JSON 明细与标量摘要（列表页不解析 JSON）。
 - `backend/scoring/l1.py` 规则电算 / `l2.py` LLM 精评（LLM 只出维度分，算术由代码合成，绝不 LLM 算总分）。
-- `backend/sender.py` 发送器 / `chatpoll.py` 消息中心 / `interview.py` 模拟面试 / `collector.py` 采集执行器（subprocess 调外部仓库）。
+- `backend/sender.py` 发送器 / `chatpoll.py` 消息中心 / `interview.py` 模拟面试 / `collector.py` 采集执行器（subprocess 调外部仓库）/ `favorites.py` 双账号BOSS收藏同步（推荐页感兴趣Tab只读 + 增量合并）。
 - `backend/boss/cdp.py`：双账号 Chrome CDP 管理。
 - `frontend/`：无构建 Vue3，`app.js` 单文件（hash 路由）+ vendored `vue.esm-browser.prod.js`，不引入 npm/构建链。
 - `tests/`：`test_m*_*.py` 单测（可跑回归）；`spike_*.py` 是只读探针脚本（需真实登录态，不进回归）。
@@ -31,7 +31,7 @@
 2. 里程碑 = 一次 git commit，Conventional Commits（如 `feat(M8): …`）。
 3. 导入的评分是基线，引擎评分不得覆盖（`keep_imported` 语义）。
 4. BOSS 写操作只走账号A（CDP 9223）、只走 UI 级点击、必须过护栏；护栏不可关闭（每日上限 40/硬顶 110、随机 30-90s 间隔、同公司 30 天去重、命中风控信号当日熔断）。
-5. 采集/公司页等读操作只走采集号（CDP 9222），风控风险集中在该号。
+5. 采集/公司页等读操作只走采集号（CDP 9222），风控风险集中在该号。唯一例外：「同步BOSS收藏」（`favorites.py`）会按用户明确要求只读访问沟通号的推荐页感兴趣 Tab（仅 Page.navigate + DOM 读取，零点击）；除此以外沟通号仍只做受护栏保护的写操作。
 6. 聊天页/搜索页后台标签必须开 `Emulation.setFocusEmulationEnabled`（BOSS SPA 无焦点不渲染）。
 7. LLM 未配置时所有 LLM 功能必须优雅降级（L1/导入/队列仍可用），不得抛异常。
 

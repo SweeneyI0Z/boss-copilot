@@ -452,6 +452,8 @@ def list_jobs(status: Optional[str] = "active", q: str = "", source: str = "",
         f"j.degree, j.location, j.industry, j.scale, j.stage, j.hr_active, j.source, "
         f"j.status, j.last_seen_at, j.job_link, j.favorite_at, j.is_headhunter, "
         f"j.headhunter_reason, j.headhunter_override, {hunter_expr} effective_headhunter, "
+        f"(SELECT group_concat(DISTINCT f.account) FROM job_favorite_hits f "
+        f"WHERE f.job_key=j.job_key) favorite_accounts, "
         f"s.l1_score current_l1_score, s.match_rough current_match_rough, "
         f"s.composite_rough current_composite_rough, s.job_score current_job_score, "
         f"s.match_score current_match_score, s.composite current_composite, "
@@ -541,6 +543,38 @@ def job_open_boss(job_key: str):
     result = cdp.open_boss_job_page(row["job_link"])
     if not result.get("ok"):
         raise HTTPException(400, result.get("error", "沟通号 Chrome 打开岗位失败"))
+    return result
+
+
+# ── BOSS 收藏（感兴趣）同步 ──────────────────────────────────────
+
+@app.post("/api/favorites/sync")
+def favorites_sync_start(body: dict = None):
+    from . import favorites
+    result = favorites.start_sync((body or {}).get("max_pages"))
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "收藏同步启动失败"))
+    return result
+
+
+@app.get("/api/favorites/sync/status")
+def favorites_sync_status():
+    from . import favorites
+    return favorites.status()
+
+
+@app.post("/api/favorites/sync/cancel")
+def favorites_sync_cancel():
+    from . import favorites
+    return favorites.cancel()
+
+
+@app.post("/api/favorites/sync/retry-details")
+def favorites_sync_retry_details(body: dict = None):
+    from . import favorites
+    result = favorites.retry_details((body or {}).get("source_run_id"))
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "没有可补齐的收藏 JD"))
     return result
 
 

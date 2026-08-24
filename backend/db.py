@@ -257,6 +257,15 @@ CREATE TABLE IF NOT EXISTS job_collection_hits (
   last_seen_at TEXT NOT NULL,
   UNIQUE(search_key, job_key, run_id)
 );
+
+CREATE TABLE IF NOT EXISTS job_favorite_hits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_key TEXT NOT NULL REFERENCES jobs(job_key) ON DELETE CASCADE,
+  account TEXT NOT NULL,                      -- collect / account_a（哪个账号的BOSS收藏）
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE(job_key, account)
+);
 """
 
 
@@ -447,6 +456,8 @@ def init_db() -> None:
           ON job_collection_hits(search_key, is_active);
         CREATE INDEX IF NOT EXISTS idx_collection_hits_job_active
           ON job_collection_hits(job_key, is_active);
+        CREATE INDEX IF NOT EXISTS idx_favorite_hits_job
+          ON job_favorite_hits(job_key);
         CREATE TRIGGER IF NOT EXISTS job_score_baselines_no_update
         BEFORE UPDATE ON job_score_baselines
         BEGIN

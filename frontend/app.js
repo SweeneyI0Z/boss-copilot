@@ -63,6 +63,9 @@ const nav = [
   ['/accounts', '账号管理'],
   ['/settings', '设置'],
 ]
+const ACCOUNT_LABELS = { collect: '采集号', account_a: '沟通号' }
+const accountLabel = value => String(value || '').split(',')
+  .map(name => ACCOUNT_LABELS[name] || name).join('·')
 window.addEventListener('hashchange', () => {
   route.value = location.hash.slice(1) || '/dashboard'
 })
@@ -352,6 +355,7 @@ const JobCardView = {
   setup() {
     const jobs = ref([]), resumes = ref([]), resumeId = ref(''), archived = ref(false), loading = ref(false)
     const selectedKeys = ref([]), greetedKeys = ref([]), generating = ref(false), progressText = ref('')
+    const favSync = ref({}), favBusy = ref(''), favPrevRunning = ref(false)
     async function loadResumes() {
       const data = await api.get('/api/resumes')
       resumes.value = arrayOf(data).filter(item => !item.archived_at)
@@ -382,7 +386,32 @@ const JobCardView = {
         loading.value = false
       }
     }
-    onMounted(async () => { try { await loadResumes() } catch (_) {} await load() })
+    onMounted(async () => { try { await loadResumes() } catch (_) {} await load(); pollFavSync() })
+    const favTimer = setInterval(pollFavSync, 4000)
+    onBeforeUnmount(() => clearInterval(favTimer))
+    async function pollFavSync() {
+      try { favSync.value = await api.get('/api/favorites/sync/status') } catch (_) { return }
+      // 同步从运行转为结束时自动刷新收藏列表
+      if (favPrevRunning.value && !favSync.value.running) load()
+      favPrevRunning.value = favSync.value.running
+    }
+    async function startFavSync() {
+      try {
+        const result = await api.post('/api/favorites/sync', {})
+        if (result.ok === false) alert(result.error || '启动失败')
+        pollFavSync()
+      } catch (e) { alert('收藏同步启动失败：' + e.message) }
+    }
+    async function cancelFavSync() { try { await api.post('/api/favorites/sync/cancel') } catch (_) {} pollFavSync() }
+    async function retryFavJd() {
+      favBusy.value = 'jd'
+      try {
+        const result = await api.post('/api/favorites/sync/retry-details')
+        alert(`已开始补齐 ${result.missing} 个缺失 JD（采集号只读执行，进度见下方状态）`)
+      } catch (e) { alert('补齐启动失败：' + e.message) }
+      finally { favBusy.value = ''; pollFavSync() }
+    }
+    const lastAccounts = computed(() => favSync.value.last_result?.accounts || [])
     const hasGreeting = job => greetedKeys.value.includes(job.job_key)
     const pendingSelection = computed(() => selectedKeys.value.filter(key => !greetedKeys.value.includes(key)))
     function toggleAllPending() {
@@ -422,18 +451,28 @@ const JobCardView = {
         : `已为 ${targets.length} 个岗位生成招呼语，可到「招呼语」页编辑选用。`)
     }
     return { jobs, resumes, resumeId, archived, loading, selectedKeys, generating, progressText,
+      favSync, favBusy, startFavSync, cancelFavSync, retryFavJd, lastAccounts, accountLabel,
       hasGreeting, pendingSelection, score, fmtTime, load, toggleAllPending, openBoss, remove, generate, generateSelected }
   },
   template: `
   <div>
-    <div class="page-head"><div><h1>收藏工作台</h1><p>收藏一次即可在此切换简历比较评分并准备联系。</p></div>
+    <div class="page-head"><div><h1>收藏工作台</h1><p>收藏一次即可在此切换简历比较评分并准备联系；「同步BOSS收藏」会把两个账号的感兴趣岗位增量合并进来。</p></div>
       <div class="row"><select v-model="resumeId" @change="load"><option v-for="r in resumes" :key="r.id" :value="String(r.id)">{{r.name}}</option></select><label class="check"><input type="checkbox" v-model="archived" @change="load"> 查看下架归档</label>
+        <button :disabled="favSync.running || generating" @click="startFavSync">{{favSync.running ? 'BOSS收藏同步中…' : '同步BOSS收藏'}}</button>
         <button :disabled="generating || !jobs.length" @click="toggleAllPending">全选未生成</button>
         <button class="primary" :disabled="generating || !pendingSelection.length" @click="generateSelected">{{generating ? '生成中 ' + progressText : '一键生成选中招呼语' + (pendingSelection.length ? '（' + pendingSelection.length + '）' : '')}}</button></div>
     </div>
-    <div v-if="!jobs.length && !loading" class="empty large">暂无收藏岗位，先到<a href="#/jobs">岗位列表</a>展开 JD 并收藏。</div>
+    <div v-if="favSync.running || lastAccounts.length" class="status-strip">
+      <span v-if="favSync.running" class="warn">正在同步{{favSync.current ? '：' + favSync.current : ''}}<template v-if="favSync.page"> · 第 {{favSync.page}} 页</template></span>
+      <span v-for="a in lastAccounts" :key="a.account" :class="a.ok ? 'ok' : 'bad'">{{a.label}} {{a.ok ? a.total + ' 个 · 新收藏 ' + a.newly_favorited : '失败：' + a.error}}</span>
+      <span v-if="favSync.last_result && !favSync.running" class="hint">上次同步 {{fmtTime(favSync.last_result.finished_at)}}<template v-if="favSync.missing_jd"> · {{favSync.missing_jd}} 个缺 JD</template></span>
+      <button v-if="favSync.running" @click="cancelFavSync">取消同步</button>
+      <button v-else-if="favSync.missing_jd" :disabled="favBusy==='jd' || favSync.running" @click="retryFavJd">补齐缺失 JD</button>
+    </div>
+    <div v-if="favSync.last_result?.risk_signal" class="notice bad">收藏同步遇风控信号停止：{{favSync.last_result.risk_signal}}</div>
+    <div v-if="!jobs.length && !loading" class="empty large">暂无收藏岗位，先到<a href="#/jobs">岗位列表</a>展开 JD 并收藏，或点「同步BOSS收藏」导入账号的感兴趣岗位。</div>
     <article v-for="job in jobs" :key="job.job_key" class="work-item">
-      <div class="work-main"><div><h2>{{job.title}}</h2><p>{{job.company}} · {{job.salary}} · {{job.experience || '经验不限'}} · {{job.degree || '学历不限'}}</p></div>
+      <div class="work-main"><div><h2>{{job.title}}</h2><p>{{job.company}} · {{job.salary}} · {{job.experience || '经验不限'}} · {{job.degree || '学历不限'}}<span v-if="job.favorite_accounts" class="tag ok-tag">BOSS收藏·{{accountLabel(job.favorite_accounts)}}</span></p></div>
         <div class="score-pair"><span><b>{{score(job,'job')}}</b>岗位分</span><span><b>{{score(job,'match')}}</b>匹配度</span><span><b>{{job.priority || '—'}}</b>P级</span></div></div>
       <div class="work-actions"><label class="check"><input type="checkbox" :value="job.job_key" v-model="selectedKeys" :disabled="hasGreeting(job) || generating"> 多选</label><span class="hint">最近活跃 {{job.hr_active || fmtTime(job.last_seen_at)}}</span><span class="grow"></span>
         <button @click="openBoss(job)">打开 BOSS</button><button :disabled="hasGreeting(job) || generating" @click="generate(job)">{{hasGreeting(job) ? '招呼语已生成' : '生成招呼语'}}</button><button @click="remove(job)">取消收藏</button></div>
