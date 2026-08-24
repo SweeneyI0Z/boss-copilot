@@ -226,6 +226,10 @@ const JobsView = {
         if (details[j.job_key]) details[j.job_key].favorite_at = j.favorite_at
       } catch (e) { alert('收藏操作失败：' + e.message) }
     }
+    async function openBoss(j) {
+      try { await api.post(`/api/jobs/${encodeURIComponent(j.job_key)}/open-boss`) }
+      catch (e) { alert('沟通号 Chrome 打开岗位失败：' + e.message) }
+    }
     async function excludeJob(j) {
       if (!confirm(`确认不再显示「${j.title} · ${j.company}」？后续采集会跳过该岗位，可在排除管理中恢复。`)) return
       try {
@@ -281,7 +285,7 @@ const JobsView = {
     const toggleExcludedMode = () => { excludedMode.value = !excludedMode.value; page.value = 0; expanded.value = ''; load() }
     return { items, total, q, keyword, headhunter, favorite, sort, page, pages, loading, scoring,
       resumes, resumeId, expanded, details, detailLoading, excludedMode, fmtTime, score, first, search, load, openJob,
-      reloadDetail, toggleFavorite, excludeJob, setHeadhunter, probeApplication,
+      reloadDetail, toggleFavorite, openBoss, excludeJob, setHeadhunter, probeApplication,
       confirmApplication, restoreJob, toggleExcludedMode, runL1, runL2,
       prev: () => { page.value--; load() }, next: () => { page.value++; load() } }
   },
@@ -305,7 +309,7 @@ const JobsView = {
         <tbody>
           <template v-for="j in items" :key="j.job_key">
             <tr class="job-row" :class="{open: expanded===j.job_key}" tabindex="0" @click="openJob(j)" @keyup.enter="openJob(j)" @keyup.space.prevent="openJob(j)">
-              <td><div class="job-title"><span class="chevron">›</span><div><b>{{j.title}}</b><p>{{j.location || '地区未知'}}<span v-if="j.effective_headhunter ?? j.is_headhunter" class="tag warn-tag">猎头</span><span v-if="j.favorite_at || j.is_favorite || j.favorite" class="tag ok-tag">已收藏</span></p></div></div></td>
+              <td><div class="job-title"><span class="chevron" aria-hidden="true"></span><div><b>{{j.title}}</b><p>{{j.location || '地区未知'}}<span v-if="j.effective_headhunter ?? j.is_headhunter" class="tag warn-tag">猎头</span><span v-if="j.favorite_at || j.is_favorite || j.favorite" class="tag ok-tag">已收藏</span></p></div></div></td>
               <td><b>{{j.company}}</b><p>{{[j.industry,j.scale].filter(Boolean).join(' · ') || '公司信息待补充'}}</p></td>
               <td class="nowrap">{{j.salary || '面议'}}</td>
               <td><span>{{j.experience || '不限'}}</span><p>{{j.degree || '不限'}}</p></td>
@@ -321,7 +325,7 @@ const JobsView = {
                   <template v-if="excludedMode"><button class="primary" @click.stop="restoreJob(j)">恢复岗位</button></template>
                   <template v-else><button :class="{primary: details[j.job_key].favorite_at || j.is_favorite || j.favorite}" @click.stop="toggleFavorite(j)">{{details[j.job_key].favorite_at || j.is_favorite || j.favorite ? '取消收藏' : '收藏岗位'}}</button>
                   <button @click.stop="excludeJob(j)">不再显示</button></template>
-                  <a v-if="details[j.job_key].job_link || j.job_link" class="button" :href="details[j.job_key].job_link || j.job_link" target="_blank" rel="noopener">打开 BOSS</a>
+                  <button v-if="details[j.job_key].job_link || j.job_link" @click.stop="openBoss(j)">打开 BOSS</button>
                   <template v-if="!excludedMode"><span class="separator"></span>
                   <label>猎头标记 <select :value="details[j.job_key].headhunter_override === null || details[j.job_key].headhunter_override === undefined ? 'auto' : String(Boolean(details[j.job_key].headhunter_override))" @click.stop @change.stop="setHeadhunter(j, $event.target.value==='auto' ? null : $event.target.value==='true')"><option value="auto">自动识别</option><option value="true">是猎头</option><option value="false">非猎头</option></select></label>
                   <span class="grow"></span>
@@ -347,41 +351,92 @@ const JobsView = {
 const JobCardView = {
   setup() {
     const jobs = ref([]), resumes = ref([]), resumeId = ref(''), archived = ref(false), loading = ref(false)
+    const selectedKeys = ref([]), greetedKeys = ref([]), generating = ref(false), progressText = ref('')
     async function loadResumes() {
       const data = await api.get('/api/resumes')
       resumes.value = arrayOf(data).filter(item => !item.archived_at)
       resumeId.value = String(first(data.default_id, resumes.value.find(item => item.is_default)?.id, resumes.value[0]?.id, ''))
     }
+    async function loadGreetings() {
+      // 已生成 = 当前简历下存在未跳过的招呼语（skipped 视为可重新生成）
+      try {
+        const items = arrayOf(await api.get('/api/greetings'))
+        greetedKeys.value = items
+          .filter(g => g.status !== 'skipped' && g.resume_id === Number(resumeId.value))
+          .map(g => g.job_key)
+      } catch (_) { greetedKeys.value = [] }
+    }
     async function load() {
       loading.value = true
       try {
+        await loadGreetings()
         const p = new URLSearchParams({ favorite: 'only', status: archived.value ? 'archived' : 'active', resume_id: resumeId.value, limit: 200 })
         const data = await api.get('/api/jobs?' + p); jobs.value = data.items || []
       } catch (e) { alert('收藏工作台加载失败：' + e.message) }
-      finally { loading.value = false }
+      finally {
+        // 刷新后勾选只保留当前列表里尚未生成的岗位
+        const greeted = greetedKeys.value
+        selectedKeys.value = jobs.value
+          .filter(job => selectedKeys.value.includes(job.job_key) && !greeted.includes(job.job_key))
+          .map(job => job.job_key)
+        loading.value = false
+      }
     }
     onMounted(async () => { try { await loadResumes() } catch (_) {} await load() })
+    const hasGreeting = job => greetedKeys.value.includes(job.job_key)
+    const pendingSelection = computed(() => selectedKeys.value.filter(key => !greetedKeys.value.includes(key)))
+    function toggleAllPending() {
+      const pending = jobs.value.filter(job => !hasGreeting(job)).map(job => job.job_key)
+      const allSelected = pending.length > 0 && pending.every(key => selectedKeys.value.includes(key))
+      selectedKeys.value = allSelected ? [] : pending
+    }
+    async function openBoss(job) {
+      try { await api.post(`/api/jobs/${encodeURIComponent(job.job_key)}/open-boss`) }
+      catch (e) { alert('沟通号 Chrome 打开岗位失败：' + e.message) }
+    }
     async function remove(job) {
       if (!confirm('从收藏工作台移除此岗位？')) return
       await api.post(`/api/jobs/${encodeURIComponent(job.job_key)}/favorite`, { favorite: false }); load()
     }
     async function generate(job) {
+      if (hasGreeting(job) || generating.value) return
       try { await api.post('/api/greeting/generate', { job_key: job.job_key, resume_id: Number(resumeId.value) || null }); window.location.hash = '#/greetings' }
       catch (e) { alert('生成失败：' + e.message) }
     }
-    return { jobs, resumes, resumeId, archived, loading, score, fmtTime, load, remove, generate }
+    async function generateSelected() {
+      const targets = jobs.value.filter(job => pendingSelection.value.includes(job.job_key))
+      if (!targets.length) { alert('请先勾选尚未生成招呼语的岗位'); return }
+      generating.value = true
+      const failures = []
+      for (let index = 0; index < targets.length; index++) {
+        const job = targets[index]
+        progressText.value = `${index + 1}/${targets.length} · ${(job.title || '').slice(0, 12)}`
+        try { await api.post('/api/greeting/generate', { job_key: job.job_key, resume_id: Number(resumeId.value) || null }) }
+        catch (e) { failures.push(`${job.title || job.job_key}：${e.message}`) }
+      }
+      generating.value = false; progressText.value = ''
+      await loadGreetings()
+      selectedKeys.value = selectedKeys.value.filter(key => !greetedKeys.value.includes(key))
+      alert(failures.length
+        ? `批量生成完成：成功 ${targets.length - failures.length} 条，失败 ${failures.length} 条\n${failures.join('\n')}`
+        : `已为 ${targets.length} 个岗位生成招呼语，可到「招呼语」页编辑选用。`)
+    }
+    return { jobs, resumes, resumeId, archived, loading, selectedKeys, generating, progressText,
+      hasGreeting, pendingSelection, score, fmtTime, load, toggleAllPending, openBoss, remove, generate, generateSelected }
   },
   template: `
   <div>
     <div class="page-head"><div><h1>收藏工作台</h1><p>收藏一次即可在此切换简历比较评分并准备联系。</p></div>
-      <div class="row"><select v-model="resumeId" @change="load"><option v-for="r in resumes" :key="r.id" :value="String(r.id)">{{r.name}}</option></select><label class="check"><input type="checkbox" v-model="archived" @change="load"> 查看下架归档</label></div>
+      <div class="row"><select v-model="resumeId" @change="load"><option v-for="r in resumes" :key="r.id" :value="String(r.id)">{{r.name}}</option></select><label class="check"><input type="checkbox" v-model="archived" @change="load"> 查看下架归档</label>
+        <button :disabled="generating || !jobs.length" @click="toggleAllPending">全选未生成</button>
+        <button class="primary" :disabled="generating || !pendingSelection.length" @click="generateSelected">{{generating ? '生成中 ' + progressText : '一键生成选中招呼语' + (pendingSelection.length ? '（' + pendingSelection.length + '）' : '')}}</button></div>
     </div>
     <div v-if="!jobs.length && !loading" class="empty large">暂无收藏岗位，先到<a href="#/jobs">岗位列表</a>展开 JD 并收藏。</div>
     <article v-for="job in jobs" :key="job.job_key" class="work-item">
       <div class="work-main"><div><h2>{{job.title}}</h2><p>{{job.company}} · {{job.salary}} · {{job.experience || '经验不限'}} · {{job.degree || '学历不限'}}</p></div>
         <div class="score-pair"><span><b>{{score(job,'job')}}</b>岗位分</span><span><b>{{score(job,'match')}}</b>匹配度</span><span><b>{{job.priority || '—'}}</b>P级</span></div></div>
-      <div class="work-actions"><span class="hint">最近活跃 {{job.hr_active || fmtTime(job.last_seen_at)}}</span><span class="grow"></span>
-        <a class="button" :href="job.job_link" target="_blank" rel="noopener">打开 BOSS</a><button @click="generate(job)">生成招呼语</button><button @click="remove(job)">取消收藏</button></div>
+      <div class="work-actions"><label class="check"><input type="checkbox" :value="job.job_key" v-model="selectedKeys" :disabled="hasGreeting(job) || generating"> 多选</label><span class="hint">最近活跃 {{job.hr_active || fmtTime(job.last_seen_at)}}</span><span class="grow"></span>
+        <button @click="openBoss(job)">打开 BOSS</button><button :disabled="hasGreeting(job) || generating" @click="generate(job)">{{hasGreeting(job) ? '招呼语已生成' : '生成招呼语'}}</button><button @click="remove(job)">取消收藏</button></div>
     </article>
   </div>`,
 }
@@ -425,13 +480,17 @@ const GreetingsView = {
       finally { busy.value = '' }
     }
     const chosenText = g => g.variants[g.selectedIndex || 0]?.text || g.chosen || ''
+    async function openBoss(g) {
+      try { await api.post(`/api/jobs/${encodeURIComponent(g.job_key)}/open-boss`) }
+      catch (e) { alert('沟通号 Chrome 打开岗位失败：' + e.message); return false }
+      return true
+    }
     async function copyAndOpen(g) {
       const text = chosenText(g)
       if (!text) { alert('请先选定一版招呼语'); return }
       try { await navigator.clipboard.writeText(text) }
       catch (_) { alert('浏览器未授权复制，请手动复制文案。') }
-      if (g.job_link) window.open(g.job_link, '_blank', 'noopener')
-      manualOpened[g.id] = true
+      if (await openBoss(g)) manualOpened[g.id] = true
     }
     async function confirmManual(g) {
       if (!confirm('仅在 BOSS 原平台明确发送成功后确认。是否已发送？')) return

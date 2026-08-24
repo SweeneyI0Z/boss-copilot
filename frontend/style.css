@@ -162,10 +162,12 @@ td p { margin-top: 2px; color: var(--muted); font-size: 11px; }
 .job-row { cursor: pointer; }
 .job-row:hover td, .job-row.open td { background: #f1f6f2; }
 .job-row:focus { outline: 2px solid rgba(23, 122, 88, .34); outline-offset: -2px; }
-.job-title { display: flex; gap: 8px; min-width: 0; }
+.job-title { display: grid; grid-template-columns: 16px minmax(0, 1fr); column-gap: 8px; min-width: 0; }
+.job-title > div { min-width: 0; }
 .job-title b, .jobs-table td b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chevron { display: inline-block; color: var(--muted); font-size: 20px; line-height: 20px; transition: transform .15s ease; }
-.job-row.open .chevron { transform: rotate(90deg); }
+.chevron { display: grid; width: 16px; height: 20px; place-items: center; }
+.chevron::before { width: 7px; height: 7px; border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); content: ''; transform: rotate(-45deg); transition: transform .15s ease; }
+.job-row.open .chevron::before { transform: rotate(45deg); }
 .score { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .detail-row > td { padding: 0; background: #fbfcfa; }
 .detail-loading { padding: 30px; color: var(--muted); text-align: center; }

@@ -9,6 +9,7 @@ import os
 import subprocess
 import time
 import urllib.request
+from urllib.parse import urlparse
 
 from .. import config
 
@@ -186,6 +187,55 @@ def open_login_page(account: str) -> dict:
     finally:
         ws.close()
     return {"ok": True, "port": conf["cdp_port"]}
+
+
+def open_boss_job_page(job_link: str) -> dict:
+    """用沟通号 Chrome 在前台打开一个合法的 BOSS 岗位链接。"""
+    parsed = urlparse((job_link or "").strip())
+    host = (parsed.hostname or "").lower()
+    if (parsed.scheme not in ("http", "https") or
+            not (host == "zhipin.com" or host.endswith(".zhipin.com"))):
+        return {"ok": False, "error": "岗位缺少有效的 BOSS 原始链接"}
+
+    account = account_for("communication")
+    conf = config.ACCOUNTS[account]
+    launched = launch(account)
+    if not launched.get("ok"):
+        return {"ok": False, "error": "沟通号 Chrome 启动失败"}
+
+    browser = None
+    try:
+        import websocket
+        version = _http_get_json(
+            f"http://127.0.0.1:{conf['cdp_port']}/json/version") or {}
+        ws_url = version.get("webSocketDebuggerUrl")
+        if not ws_url:
+            raise RuntimeError("CDP 未提供浏览器连接")
+        browser = websocket.create_connection(ws_url, timeout=10)
+
+        def call(message_id: int, method: str, params: dict) -> dict:
+            browser.send(json.dumps({"id": message_id, "method": method,
+                                     "params": params}))
+            while True:
+                response = json.loads(browser.recv())
+                if response.get("id") != message_id:
+                    continue
+                if "error" in response:
+                    raise RuntimeError(response["error"].get("message", method))
+                return response.get("result", {})
+
+        # 新建标签而非复用登录页，避免打断用户正在进行的 BOSS 操作。
+        target_id = call(1, "Target.createTarget", {"url": job_link})["targetId"]
+        call(2, "Target.activateTarget", {"targetId": target_id})
+        return {"ok": True, "account": account, "port": conf["cdp_port"]}
+    except Exception as error:
+        return {"ok": False, "error": f"沟通号 Chrome 打开岗位失败：{error}"[:200]}
+    finally:
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 
 def _classify_login_dom(account: str, data: dict) -> dict:

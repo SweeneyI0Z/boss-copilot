@@ -531,6 +531,19 @@ def job_detail(job_key: str, resume_id: Optional[int] = None):
     return out
 
 
+@app.post("/api/jobs/{job_key}/open-boss")
+def job_open_boss(job_key: str):
+    """在沟通号 Chrome 中打开岗位原始页面，供人工继续操作。"""
+    row = get_db().execute(
+        "SELECT job_link FROM jobs WHERE job_key=?", (job_key,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "岗位不存在")
+    result = cdp.open_boss_job_page(row["job_link"])
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "沟通号 Chrome 打开岗位失败"))
+    return result
+
+
 @app.get("/api/runs")
 def runs():
     rows = get_db().execute(

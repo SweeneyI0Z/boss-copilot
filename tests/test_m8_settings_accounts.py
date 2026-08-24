@@ -1,6 +1,8 @@
 """M8 测试：LLM 连通性、单/双账号路由、登录态提示与岗位详情入口。"""
+import json
 import os
 import ntpath
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -188,6 +190,41 @@ class AccountModeTests(unittest.TestCase):
         self.assertEqual(command[port_index + 1], "9223")
         self.assertEqual(Path(command[output_index + 1]).parent, collector.RESULT_DIR)
 
+    def test_open_boss_job_page_uses_communication_chrome(self):
+        calls = []
+
+        class FakeSocket:
+            def send(self, raw):
+                calls.append(json.loads(raw))
+
+            def recv(self):
+                message = calls[-1]
+                result = {"targetId": "job-target"} \
+                    if message["method"] == "Target.createTarget" else {}
+                return json.dumps({"id": message["id"], "result": result})
+
+            def close(self):
+                pass
+
+        fake_websocket = SimpleNamespace(create_connection=lambda *_args, **_kwargs: FakeSocket())
+        with patch.object(cdp, "launch", return_value={"ok": True}), \
+             patch.object(cdp, "_http_get_json", return_value={
+                 "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/browser/test"}), \
+             patch.dict(sys.modules, {"websocket": fake_websocket}):
+            result = cdp.open_boss_job_page("https://www.zhipin.com/job_detail/test.html")
+        self.assertEqual(result, {"ok": True, "account": "account_a", "port": 9223})
+        self.assertEqual(calls[0]["method"], "Target.createTarget")
+        self.assertEqual(calls[0]["params"]["url"], "https://www.zhipin.com/job_detail/test.html")
+        self.assertEqual(calls[1], {"id": 2, "method": "Target.activateTarget",
+                                    "params": {"targetId": "job-target"}})
+
+    def test_open_boss_job_page_rejects_non_boss_link(self):
+        with patch.object(cdp, "launch") as launch:
+            result = cdp.open_boss_job_page("https://example.com/job")
+        self.assertFalse(result["ok"])
+        self.assertIn("有效的 BOSS", result["error"])
+        launch.assert_not_called()
+
 
 class PathMigrationTests(unittest.TestCase):
     def test_legacy_directories_move_into_unified_data_root(self):
@@ -256,6 +293,16 @@ class JobDetailAndFrontendTests(unittest.TestCase):
         detail = main.job_detail("jd-key")
         self.assertEqual(detail["jd"], "负责大模型应用开发")
 
+    def test_open_boss_endpoint_uses_saved_job_link(self):
+        get_db().execute(
+            "UPDATE jobs SET job_link=? WHERE job_key=?",
+            ("https://www.zhipin.com/job_detail/test.html", "jd-key"))
+        get_db().commit()
+        expected = {"ok": True, "account": "account_a", "port": 9223}
+        with patch.object(cdp, "open_boss_job_page", return_value=expected) as open_page:
+            self.assertEqual(main.job_open_boss("jd-key"), expected)
+        open_page.assert_called_once_with("https://www.zhipin.com/job_detail/test.html")
+
     def test_frontend_uses_component_click_handler_and_friendly_states(self):
         source = (config.BASE_DIR / "frontend" / "app.js").read_text()
         self.assertIn('@click="openJob(j)"', source)
@@ -263,6 +310,8 @@ class JobDetailAndFrontendTests(unittest.TestCase):
         self.assertIn("职位描述（JD）", source)
         self.assertIn("测试连通性", source)
         self.assertIn("账号管理", source)
+        self.assertIn("/open-boss", source)
+        self.assertIn('@click.stop="openBoss(j)"', source)
         self.assertIn("const desired = event.target.checked", source)
         self.assertIn("上次检测：", source)
         self.assertNotIn("{{a.profile}}", source)
