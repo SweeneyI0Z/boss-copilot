@@ -47,6 +47,7 @@ class CollectorControlTests(unittest.TestCase):
                 "run_id": None, "cancel": False, "risk_signal": "",
                 "paused": False, "process": None, "pause_started_at": None,
                 "paused_seconds": 0.0, "worker_ident": None,
+                "eta_model": None,
                 "progress": {"list_total": 0, "list_completed": 0,
                              "detail_total": 0, "detail_completed": 0},
             })
@@ -60,7 +61,7 @@ class CollectorControlTests(unittest.TestCase):
                 "running": False, "current": "", "phase": "", "run_id": None,
                 "cancel": False, "paused": False, "process": None,
                 "pause_started_at": None, "paused_seconds": 0.0,
-                "worker_ident": None,
+                "worker_ident": None, "eta_model": None,
             })
             collector._state_condition.notify_all()
         if process is not None and process.poll() is None and hasattr(process, "terminate"):

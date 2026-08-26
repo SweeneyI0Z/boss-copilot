@@ -5,7 +5,7 @@
 ## 常用命令
 
 ```bash
-# 回归测试（289 例，任何 backend/ 或 frontend/ 改动后必须全绿才可提交）
+# 回归测试（316 例，任何 backend/ 或 frontend/ 改动后必须全绿才可提交）
 .venv/bin/python -m unittest discover tests -v
 
 # 启动（浏览器打开 http://127.0.0.1:8787）

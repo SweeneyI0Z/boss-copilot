@@ -484,7 +484,10 @@ td p { margin-top: 2px; color: var(--muted); font-size: 10px; }
 .variant-tabs button.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }
 .generation-stream { min-height: 82px; display: flex; align-items: center; justify-content: center; gap: 12px; padding: 14px; border: 1px dashed color-mix(in srgb, var(--accent) 48%, var(--line)); border-radius: 6px; background: var(--accent-soft); }
 .generation-stream .spinner { flex: 0 0 18px; width: 18px; height: 18px; border-color: color-mix(in srgb, var(--accent) 30%, transparent); border-top-color: var(--accent); }
+.generation-stream > div { flex: 1 1 auto; min-width: 0; }
 .generation-stream p { margin-top: 3px; color: var(--muted); font-size: 10px; }
+.generation-progress { display: grid; grid-template-columns: minmax(100px, 1fr) auto; align-items: center; gap: 9px; margin-top: 9px; }
+.generation-progress small { color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .section-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; color: var(--muted); font-size: 10px; }
 .section-actions > .row { justify-content: flex-end; }
 .inline-empty { min-height: 76px; display: grid; place-items: center; border: 1px dashed var(--line-strong); border-radius: 6px; color: var(--muted); font-size: 11px; }

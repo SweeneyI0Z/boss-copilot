@@ -237,7 +237,8 @@ def _run_ai_task(task: dict, cancelled):
         return greeting.generate(
             task["job_key"], resume_id=resume["id"],
             fallback_on_error=not llm_mod.configured(),
-            on_delta=_stream_progress(task), cancelled=cancelled)
+            on_delta=_stream_progress(task), cancelled=cancelled,
+            force=bool(task["payload"].get("force", False)))
     raise ValueError("不支持的 AI 任务类型")
 
 
@@ -847,7 +848,7 @@ def _validate_ai_page_kind(page: str, kind: str = None) -> None:
 
 @app.post("/api/ai/tasks/{page}", status_code=202)
 def ai_tasks_enqueue(page: str, body: dict):
-    from . import llm as llm_mod, resumes
+    from . import greeting, llm as llm_mod, resumes
     kind = str(body.get("kind") or "")
     # 岗位评分与匹配度来自同一次精评，统一成一个 artifact，避免重复调用。
     if page == "jobs" and kind in ("job_score", "match_score"):
@@ -879,9 +880,11 @@ def ai_tasks_enqueue(page: str, body: dict):
     force = bool(body.get("force", False))
     skipped_existing = []
     queued_keys = accepted
-    if kind in ("score", "analysis") and not force:
-        completed = _completed_l2_keys(
+    if kind in ("score", "analysis", "greeting") and not force:
+        completed = (_completed_l2_keys(
             accepted, resume["id"], resume["revision"])
+            if kind in ("score", "analysis") else greeting.completed_job_keys(
+                accepted, resume["id"], resume["revision"]))
         skipped_existing = [key for key in accepted if key in completed]
         queued_keys = [key for key in accepted if key not in completed]
     if queued_keys and kind in ("score", "analysis") and not llm_mod.configured():
@@ -1180,8 +1183,12 @@ def greeting_generate(body: dict):
     from . import resumes
     try:
         resume_id = body.get("resume_id") or resumes.get_default_resume()["id"]
-        return greeting.generate(body.get("job_key", ""),
-                                 resume_id=resume_id)
+        job_key = body.get("job_key", "")
+        result = greeting.generate(
+            job_key, resume_id=resume_id, force=bool(body.get("force", False)))
+        skipped_existing = [job_key] if result.get("reused_existing") else []
+        return {**result, "skipped_existing": skipped_existing,
+                "skipped_existing_count": len(skipped_existing)}
     except llm_mod.LLMError as e:
         raise HTTPException(400, str(e))
 

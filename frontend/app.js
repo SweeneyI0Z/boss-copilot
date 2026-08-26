@@ -202,7 +202,8 @@ const EMPTY_ANALYTICS = {
 }
 const EMPTY_AI_PAGE = page => ({
   page, tasks: [], active: 0, effective_concurrency: 5, max_concurrency: 5,
-  progress: { total: 0, completed: 0, percent: 0, queued: 0, running: 0, retrying: 0, succeeded: 0, failed: 0, cancelled: 0 },
+  progress: { total: 0, completed: 0, remaining: 0, percent: 0, eta_seconds: null,
+    queued: 0, running: 0, retrying: 0, succeeded: 0, failed: 0, cancelled: 0 },
 })
 const store = reactive({
   resumes: [], selectedResumeId: null, jobs: [], jobTotal: 0, runs: [], accounts: [],
@@ -280,11 +281,17 @@ function normalizeRun(row = {}) {
   }
 }
 function formatEta(seconds) {
+  if (seconds === null || seconds === undefined || seconds === '') return '预计时间计算中'
   const value = Number(seconds)
   if (!Number.isFinite(value) || value < 0) return '预计时间计算中'
   if (value < 60) return `预计剩余 ${Math.max(1, Math.ceil(value))} 秒`
   if (value < 3600) return `预计剩余 ${Math.ceil(value / 60)} 分钟`
   return `预计剩余 ${Math.floor(value / 3600)} 小时 ${Math.ceil(value % 3600 / 60)} 分钟`
+}
+function etaValue(value) {
+  if (value === null || value === undefined || value === '') return null
+  const seconds = Number(value)
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : null
 }
 function runProgressSummary(run) {
   if (run.phase === 'details') {
@@ -409,6 +416,7 @@ function applyGreetingsToJobs() {
   const byJob = new Map()
   for (const greeting of store.greetings) {
     if (greeting.resume_id && store.selectedResumeId && Number(greeting.resume_id) !== Number(store.selectedResumeId)) continue
+    if (greeting.stale) continue
     if (!byJob.has(greeting.job_key)) byJob.set(greeting.job_key, greeting)
   }
   for (const job of store.jobs) {
@@ -506,14 +514,37 @@ function aiSummary(page) {
   const cancelling = active.length > 0 && active.every(task => task.cancel_requested)
   const kinds = [...new Set(active.map(task => task.kind))]
   const labels = kinds.map(kind => kind === 'greeting' ? '正在生成招呼语' : kind === 'analysis' ? '正在生成分析' : '正在生成岗位与匹配度评分')
+  const progressUnits = tasks.reduce((total, task) => {
+    if (AI_TERMINAL.has(task.status)) return total + 1
+    const value = Number(task.progress)
+    return total + (Number.isFinite(value) ? Math.max(0, Math.min(0.99, value)) : 0)
+  }, 0)
+  const taskEtas = active.map(task => etaValue(task.eta_seconds))
+    .filter(value => value !== null)
+  const pageEta = etaValue(store.ai[page].progress && store.ai[page].progress.eta_seconds)
   return {
     visible: tasks.length > 0, running: active.length > 0, cancelling,
     total: tasks.length, completed,
-    failures, percent: tasks.length ? Math.round(completed / tasks.length * 100) : 0,
+    failures, percent: tasks.length ? Math.round(progressUnits / tasks.length * 100) : 0,
     label: labels.join(' / ') || (failures ? '生成完成，部分任务失败' : '最近生成任务已完成'),
     effective: Number(store.ai[page].effective_concurrency || 1),
     max: Number(store.ai[page].max_concurrency || 5),
+    etaSeconds: taskEtas.length ? Math.max(...taskEtas) : pageEta,
   }
+}
+
+function taskProgressPercent(task) {
+  if (!task) return 0
+  if (AI_TERMINAL.has(task.status)) return 100
+  const value = Number(task.progress)
+  if (!Number.isFinite(value)) return task.status === 'running' || task.status === 'retrying' ? 5 : 0
+  return Math.max(0, Math.min(99, Math.round(value * 100)))
+}
+
+function taskEtaSeconds(task, page) {
+  const direct = etaValue(task && task.eta_seconds)
+  if (direct !== null) return direct
+  return etaValue(store.ai[page] && store.ai[page].progress && store.ai[page].progress.eta_seconds)
 }
 
 async function enqueueAi(page, kind, jobKeys, force = false) {
@@ -1617,13 +1648,13 @@ const JobsView = {
       }
     }
     return { store, q, favoriteFilter, tagFilter, expanded, sortState, columns, sortedJobs, taskSummary,
-      deriveJobTags, workflowLabel, scoreLabel, jobCardHref, cancelAiTasks,
+      deriveJobTags, workflowLabel, scoreLabel, jobCardHref, formatEta, cancelAiTasks,
       setSort, ariaSort, toggleExpanded, toggleFavorite, excludeJob, runScore }
   },
   template: `
   <div>
     <header class="page-head"><div><div class="eyebrow">岗位池</div><h1>岗位列表</h1><p>共 {{sortedJobs.length}} 个符合条件的岗位</p></div><div class="row scoring-controls"><label class="inline-select"><span>当前简历</span><select v-model.number="store.selectedResumeId"><option v-for="resume in store.resumes" :key="resume.id" :value="resume.id">{{resume.name}}</option></select></label><button @click="runScore('匹配度评分')">匹配度评分</button><button class="primary" @click="runScore('岗位评分')">岗位评分</button></div></header>
-    <div v-if="taskSummary.visible" class="ai-task-progress" :class="{done:!taskSummary.running}"><div><b>{{taskSummary.label}}</b><span>动态并发 {{taskSummary.effective}} / {{taskSummary.max}}</span></div><div class="progress"><i :style="{width:taskSummary.percent+'%'}"></i></div><strong>{{taskSummary.completed}} / {{taskSummary.total}}</strong><small v-if="taskSummary.failures">{{taskSummary.failures}} 个失败，可重新评分</small><button v-if="taskSummary.running" class="danger-quiet" :disabled="taskSummary.cancelling" @click="cancelAiTasks('jobs')">{{taskSummary.cancelling?'取消中…':'取消评分'}}</button></div>
+    <div v-if="taskSummary.visible" class="ai-task-progress" :class="{done:!taskSummary.running}"><div><b>{{taskSummary.label}}</b><span>动态并发 {{taskSummary.effective}} / {{taskSummary.max}}<template v-if="taskSummary.running"> · {{formatEta(taskSummary.etaSeconds)}}</template></span></div><div class="progress"><i :style="{width:taskSummary.percent+'%'}"></i></div><strong>{{taskSummary.completed}} / {{taskSummary.total}}</strong><small v-if="taskSummary.failures">{{taskSummary.failures}} 个失败，可重新评分</small><button v-if="taskSummary.running" class="danger-quiet" :disabled="taskSummary.cancelling" @click="cancelAiTasks('jobs')">{{taskSummary.cancelling?'取消中…':'取消评分'}}</button></div>
     <div class="filterbar"><input v-model="q" aria-label="搜索岗位或公司" placeholder="搜索岗位、公司或地点"><select v-model="tagFilter" aria-label="岗位标签"><option value="all">全部标签</option><option value="headhunter">猎头</option><option value="benefits">福利</option><option value="weekend">双休</option><option value="eight_hour_weekend">八小时双休</option><option value="alternating_weekend">大小周</option><option value="outsourcing">外包</option></select><select v-model="favoriteFilter" aria-label="收藏状态"><option value="all">全部岗位</option><option value="only">仅收藏</option><option value="exclude">未收藏</option></select><span class="filter-result">{{sortedJobs.length}} 条结果</span></div>
     <div class="table-wrap">
       <table class="jobs-table">
@@ -1733,7 +1764,11 @@ const JobCardView = {
         const result = await enqueueAi('workbench', 'greeting', [job.job_key])
         job.actionError = ''
         job.actionErrorType = ''
-        if (!silent) showToast(result.added ? '招呼语已加入生成队列' : '该岗位正在生成招呼语', 'info')
+        const skipped = Number(result.skipped_existing_count || 0)
+        if (skipped) await refreshGreetings()
+        if (!silent) showToast(result.added ? '招呼语已加入生成队列'
+          : skipped ? '该岗位已有招呼语，已保留原结果'
+            : '该岗位正在生成招呼语', 'info')
         return result
       } catch (error) {
         job.actionError = error.message
@@ -1790,6 +1825,7 @@ const JobCardView = {
         try {
           const result = await enqueueAi('workbench', type, targets.map(job => job.job_key))
           const skipped = Number(result.skipped_existing_count || 0)
+          if (type === 'greeting' && skipped) await refreshGreetings()
           showToast(result.added
             ? `${result.added} 个岗位已加入${labels[type]}队列${skipped ? `，跳过 ${skipped} 个已有结果` : ''}`
             : skipped ? `所选 ${skipped} 个岗位已有结果，无需重复生成` : '所选岗位已在生成队列中', 'info')
@@ -1904,7 +1940,8 @@ const JobCardView = {
     const activeAnalysisTask = job => job ? aiTaskFor('workbench', job.job_key, ['analysis']) : null
     const activeGreetingTask = job => job ? aiTaskFor('workbench', job.job_key, ['greeting']) : null
     return { store, query, statusFilter, selectedKeys, activeKey, interview, jobs, favoriteJobs, activeJob, allSelected, taskSummary,
-      deriveJobTags, workflowLabel, scoreLabel, renderMarkdown, activeAnalysisTask, activeGreetingTask,
+      deriveJobTags, workflowLabel, scoreLabel, renderMarkdown, formatEta, taskProgressPercent, taskEtaSeconds,
+      activeAnalysisTask, activeGreetingTask,
       cancelAiTasks, cancelAiTask,
       selectJob, toggleAll, openBoss, setWorkflowStage, generateAnalysis, generateGreeting, executeBatch,
       saveGreeting, selectGreetingVariant, copyAndOpenBoss, retryFailed, removeFavorite, startInterview, submitAnswer, closeInterview }
@@ -1919,7 +1956,7 @@ const JobCardView = {
       <button :disabled="!selectedKeys.length" @click="executeBatch('greeting')">生成招呼语</button>
       <button class="primary" :disabled="!selectedKeys.length || store.batch.running" @click="executeBatch('auto')">自动打招呼</button>
     </div>
-    <div v-if="taskSummary.visible" class="ai-task-progress" :class="{done:!taskSummary.running}"><div><b>{{taskSummary.label}}</b><span>动态并发 {{taskSummary.effective}} / {{taskSummary.max}}</span></div><div class="progress"><i :style="{width:taskSummary.percent+'%'}"></i></div><strong>{{taskSummary.completed}} / {{taskSummary.total}}</strong><small v-if="taskSummary.failures">{{taskSummary.failures}} 个失败，可在岗位内重新生成</small><button v-if="taskSummary.running" class="danger-quiet" :disabled="taskSummary.cancelling" @click="cancelAiTasks('workbench')">{{taskSummary.cancelling?'取消中…':'取消生成'}}</button></div>
+    <div v-if="taskSummary.visible" class="ai-task-progress" :class="{done:!taskSummary.running}"><div><b>{{taskSummary.label}}</b><span>动态并发 {{taskSummary.effective}} / {{taskSummary.max}}<template v-if="taskSummary.running"> · {{formatEta(taskSummary.etaSeconds)}}</template></span></div><div class="progress"><i :style="{width:taskSummary.percent+'%'}"></i></div><strong>{{taskSummary.completed}} / {{taskSummary.total}}</strong><small v-if="taskSummary.failures">{{taskSummary.failures}} 个失败，可在岗位内重新生成</small><button v-if="taskSummary.running" class="danger-quiet" :disabled="taskSummary.cancelling" @click="cancelAiTasks('workbench')">{{taskSummary.cancelling?'取消中…':'取消生成'}}</button></div>
     <div v-if="store.batch.running" class="batch-progress"><span>{{store.batch.label}}处理中</span><div class="progress"><i :style="{width:(store.batch.total?store.batch.done/store.batch.total*100:0)+'%'}"></i></div><b>{{store.batch.done}} / {{store.batch.total}}</b><small v-if="store.batch.failures.length">{{store.batch.failures.length}} 个待重试</small></div>
     <div class="workbench-layout">
       <aside class="workbench-list">
@@ -1938,8 +1975,8 @@ const JobCardView = {
         <section class="workflow-status"><div><h3>求职状态</h3><p>选择当前阶段，推进时自动补齐前置状态</p></div><div class="workflow-actions five"><button :class="{active:!activeJob.contacted&&!activeJob.applied&&!activeJob.interviewed&&!activeJob.offered}" @click="setWorkflowStage(activeJob,'pending')"><span>0</span>待开始</button><button :class="{active:activeJob.contacted&&!activeJob.applied}" @click="setWorkflowStage(activeJob,'contacted')"><span>1</span>已打招呼</button><button :class="{active:activeJob.applied&&!activeJob.interviewed}" @click="setWorkflowStage(activeJob,'applied')"><span>2</span>已投递</button><button :class="{active:activeJob.interviewed&&!activeJob.offered}" @click="setWorkflowStage(activeJob,'interviewed')"><span>3</span>已面试</button><button :class="{active:activeJob.offered}" @click="setWorkflowStage(activeJob,'offered')"><span>4</span>OFFER</button></div></section>
         <div class="score-overview"><div><span>岗位评分</span><strong :class="{'score-pending':scoreLabel(activeJob,'job_score','workbench')==='评分中'}">{{scoreLabel(activeJob,'job_score','workbench')}}</strong><small>岗位本身质量</small></div><div><span>匹配度评分</span><strong :class="{'score-pending':scoreLabel(activeJob,'match_score','workbench')==='评分中'}">{{scoreLabel(activeJob,'match_score','workbench')}}</strong><small>当前简历匹配</small></div><div><span>优先级</span><strong>{{activeJob.priority || '未评分'}}</strong><small>{{activeJob.active}}</small></div></div>
         <section class="detail-section"><div class="section-title"><div><h3>职位描述（JD）</h3><p>{{activeJob.industry}} · {{activeJob.scale || '规模未知'}}</p></div></div><p class="jd-copy">{{activeJob.jd}}</p></section>
-        <section class="detail-section"><div class="section-title"><div><h3>招呼语</h3><p>按当前简历生成，可在三版之间切换并继续编辑</p></div><button v-if="!activeJob.greeting && !activeGreetingTask(activeJob)" @click="generateGreeting(activeJob)">生成招呼语</button></div><div v-if="activeGreetingTask(activeJob)" class="generation-stream"><span class="spinner"></span><div><b>正在生成招呼语</b><p>{{activeGreetingTask(activeJob).message || '任务已进入队列，生成内容将实时返回'}}</p></div></div><template v-else-if="activeJob.greeting"><div class="variant-tabs" role="tablist"><button v-for="(variant,index) in activeJob.greetingVariants" :key="index" :class="{active:Number(activeJob.greetingSelectedIndex)===index}" role="tab" @click="selectGreetingVariant(activeJob,index)">{{activeJob.greetingLabels[index] || ('版本 ' + (index+1))}}</button></div><textarea v-model="activeJob.greeting" class="greeting-editor"></textarea></template><div v-else class="inline-empty">尚未生成招呼语</div><div v-if="activeJob.greeting && !activeGreetingTask(activeJob)" class="section-actions"><span>{{activeJob.greeting.length}} 字 · {{activeJob.greetingStatus==='approved'?'已批准':'草稿'}}</span><div class="row"><button @click="saveGreeting(activeJob)">保存并批准</button><button @click="copyAndOpenBoss(activeJob)">复制并打开 BOSS</button><button class="primary" @click="executeBatch('auto',[activeJob.job_key])">自动打招呼</button></div></div></section>
-        <section class="detail-section"><div class="section-title"><div><h3>应聘建议</h3><p>结合岗位要求与当前简历，按重点分段呈现</p></div><button v-if="!activeJob.analysisReady && !activeAnalysisTask(activeJob)" @click="generateAnalysis(activeJob)">生成分析</button></div><div v-if="activeAnalysisTask(activeJob)" class="generation-stream"><span class="spinner"></span><div><b>正在生成分析</b><p>{{activeAnalysisTask(activeJob).message || '正在读取 JD 与当前简历'}}</p></div><button class="danger-quiet" :disabled="activeAnalysisTask(activeJob).cancel_requested" @click="cancelAiTask('workbench',activeAnalysisTask(activeJob))">{{activeAnalysisTask(activeJob).cancel_requested?'取消中…':'取消分析'}}</button></div><div v-else-if="activeJob.advice" class="advice-copy markdown-body" v-html="renderMarkdown(activeJob.advice)"></div><div v-else class="inline-empty">等待生成岗位分析与应聘建议</div></section>
+        <section class="detail-section"><div class="section-title"><div><h3>招呼语</h3><p>按当前简历生成，可在三版之间切换并继续编辑</p></div><button v-if="!activeJob.greeting && !activeGreetingTask(activeJob)" @click="generateGreeting(activeJob)">生成招呼语</button></div><div v-if="activeGreetingTask(activeJob)" class="generation-stream"><span class="spinner"></span><div><b>正在生成招呼语</b><p>{{activeGreetingTask(activeJob).message || '任务已进入队列，生成内容将实时返回'}}</p><div class="generation-progress"><div class="progress"><i :style="{width:taskProgressPercent(activeGreetingTask(activeJob))+'%'}"></i></div><small>{{taskProgressPercent(activeGreetingTask(activeJob))}}% · {{formatEta(taskEtaSeconds(activeGreetingTask(activeJob),'workbench'))}}</small></div></div></div><template v-else-if="activeJob.greeting"><div class="variant-tabs" role="tablist"><button v-for="(variant,index) in activeJob.greetingVariants" :key="index" :class="{active:Number(activeJob.greetingSelectedIndex)===index}" role="tab" @click="selectGreetingVariant(activeJob,index)">{{activeJob.greetingLabels[index] || ('版本 ' + (index+1))}}</button></div><textarea v-model="activeJob.greeting" class="greeting-editor"></textarea></template><div v-else class="inline-empty">尚未生成招呼语</div><div v-if="activeJob.greeting && !activeGreetingTask(activeJob)" class="section-actions"><span>{{activeJob.greeting.length}} 字 · {{activeJob.greetingStatus==='approved'?'已批准':'草稿'}}</span><div class="row"><button @click="saveGreeting(activeJob)">保存并批准</button><button @click="copyAndOpenBoss(activeJob)">复制并打开 BOSS</button><button class="primary" @click="executeBatch('auto',[activeJob.job_key])">自动打招呼</button></div></div></section>
+        <section class="detail-section"><div class="section-title"><div><h3>应聘建议</h3><p>结合岗位要求与当前简历，按重点分段呈现</p></div><button v-if="!activeJob.analysisReady && !activeAnalysisTask(activeJob)" @click="generateAnalysis(activeJob)">生成分析</button></div><div v-if="activeAnalysisTask(activeJob)" class="generation-stream"><span class="spinner"></span><div><b>正在生成分析</b><p>{{activeAnalysisTask(activeJob).message || '正在读取 JD 与当前简历'}}</p><div class="generation-progress"><div class="progress"><i :style="{width:taskProgressPercent(activeAnalysisTask(activeJob))+'%'}"></i></div><small>{{taskProgressPercent(activeAnalysisTask(activeJob))}}% · {{formatEta(taskEtaSeconds(activeAnalysisTask(activeJob),'workbench'))}}</small></div></div><button class="danger-quiet" :disabled="activeAnalysisTask(activeJob).cancel_requested" @click="cancelAiTask('workbench',activeAnalysisTask(activeJob))">{{activeAnalysisTask(activeJob).cancel_requested?'取消中…':'取消分析'}}</button></div><div v-else-if="activeJob.advice" class="advice-copy markdown-body" v-html="renderMarkdown(activeJob.advice)"></div><div v-else class="inline-empty">等待生成岗位分析与应聘建议</div></section>
         <div v-if="activeJob.actionError" class="notice bad"><b>上次处理失败</b><span>{{activeJob.actionError}}</span><button @click="retryFailed(activeJob)">重新生成</button></div>
       </section>
       <section v-else class="workbench-detail empty large"><b>选择一个收藏岗位查看详情</b></section>

@@ -7,8 +7,11 @@ LLM 或数据库实现。调用方通过 ``task_runner(task, cancelled)`` 注入
 from __future__ import annotations
 
 import copy
+import heapq
 import json
+import math
 import re
+import statistics
 import threading
 import time
 import uuid
@@ -22,6 +25,17 @@ VALID_PAGES = ("jobs", "workbench")
 ACTIVE_STATUSES = frozenset(("queued", "running", "retrying"))
 TERMINAL_STATUSES = frozenset(("succeeded", "failed", "cancelled"))
 MAX_PAGE_CONCURRENCY = 5
+DEFAULT_TASK_SECONDS = {
+    "score": 45.0,
+    "analysis": 55.0,
+    "greeting": 30.0,
+}
+DEFAULT_UNKNOWN_TASK_SECONDS = 45.0
+MIN_DURATION_SECONDS = 0.25
+MAX_DURATION_SECONDS = 3600.0
+DEFAULT_DURATION_HISTORY_SIZE = 20
+CANCEL_RELEASE_PRIOR_SECONDS = 2.0
+MAX_RETRY_WAIT_CHUNK_SECONDS = 3600.0
 
 TaskRunner = Callable[[dict, Callable[[], bool]], Any]
 SleepFunc = Callable[[float], None]
@@ -48,6 +62,12 @@ def _safe_copy(value):
         return copy.deepcopy(value)
     except Exception:
         return value
+
+
+def _ceil_seconds(value: float) -> int:
+    """向上取整 ETA，同时消除浮点加法产生的极小越界。"""
+    value = max(0.0, float(value))
+    return int(math.ceil(value - 1e-9)) if value > 0 else 0
 
 
 def _status_code(value) -> Optional[int]:
@@ -121,7 +141,9 @@ def _retry_after_seconds(error: BaseException) -> Optional[float]:
                 raw = headers.get("retry-after") or headers.get("Retry-After")
         try:
             if raw is not None:
-                return max(0.0, float(raw))
+                value = float(raw)
+                if math.isfinite(value):
+                    return max(0.0, value)
         except (TypeError, ValueError):
             pass
         for nested in (getattr(current, "__cause__", None),
@@ -145,13 +167,21 @@ class _Task:
     result: Any = None
     error: str = ""
     progress: Optional[float] = None
+    progress_attempt: int = field(default=0, repr=False)
     message: str = ""
     partial_output: str = ""
     cancel_requested: bool = False
+    cancel_requested_monotonic: Optional[float] = field(default=None, repr=False)
+    cancel_estimate_seconds: Optional[float] = field(default=None, repr=False)
     created_at: str = field(default_factory=_now_iso)
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     updated_at: str = field(default_factory=_now_iso)
+    created_monotonic: float = field(default_factory=time.monotonic, repr=False)
+    started_monotonic: Optional[float] = field(default=None, repr=False)
+    attempt_started_monotonic: Optional[float] = field(default=None, repr=False)
+    retry_ready_monotonic: Optional[float] = field(default=None, repr=False)
+    finished_monotonic: Optional[float] = field(default=None, repr=False)
     cancel_event: threading.Event = field(
         default_factory=threading.Event, repr=False, compare=False)
 
@@ -166,9 +196,11 @@ class _PageState:
     max_concurrency: int
     queue: deque = field(default_factory=deque)
     running: set = field(default_factory=set)
+    executing: set = field(default_factory=set)
     effective_concurrency: int = 1
     consecutive_successes: int = 0
     version: int = 0
+    duration_samples: dict[str, deque] = field(default_factory=dict)
 
     def __post_init__(self):
         self.effective_concurrency = self.max_concurrency
@@ -187,7 +219,10 @@ class AITaskScheduler:
             backoff_cap: float = 30.0,
             recovery_successes: int = 3,
             sleep_func: Optional[SleepFunc] = None,
-            delay_func: Optional[DelayFunc] = None):
+            delay_func: Optional[DelayFunc] = None,
+            default_task_seconds: Optional[dict[str, float]] = None,
+            duration_history_size: int = DEFAULT_DURATION_HISTORY_SIZE,
+            clock_func: Optional[Callable[[], float]] = None):
         if not callable(task_runner):
             raise TypeError("task_runner 必须可调用")
         self._task_runner = task_runner
@@ -199,6 +234,15 @@ class AITaskScheduler:
         self._recovery_successes = max(1, int(recovery_successes))
         self._sleep_func = sleep_func
         self._delay_func = delay_func
+        self._clock_func = clock_func or time.monotonic
+        self._duration_history_size = max(1, int(duration_history_size))
+        self._default_task_seconds = dict(DEFAULT_TASK_SECONDS)
+        for kind, seconds in (default_task_seconds or {}).items():
+            value = float(seconds)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("任务默认耗时必须大于 0")
+            self._default_task_seconds[str(kind)] = min(
+                MAX_DURATION_SECONDS, value)
 
         self._condition = threading.Condition(threading.RLock())
         self._tasks: dict[str, _Task] = {}
@@ -233,7 +277,246 @@ class AITaskScheduler:
         self._pages[page].version += 1
         self._condition.notify_all()
 
-    def _task_dict_locked(self, task: _Task) -> dict:
+    def _default_duration(self, kind: str) -> float:
+        return self._default_task_seconds.get(
+            kind, self._default_task_seconds.get(
+                "*", DEFAULT_UNKNOWN_TASK_SECONDS))
+
+    def _duration_estimate_locked(self, state: _PageState,
+                                  kind: str) -> tuple[float, int]:
+        """用近期成功耗时校准默认值，少量样本时保留先验以减少跳变。"""
+        samples = list(state.duration_samples.get(kind, ()))
+        if not samples:
+            return self._default_duration(kind), 0
+        observed = statistics.median(samples)
+        confidence = min(1.0, len(samples) / 3.0)
+        estimate = (self._default_duration(kind) * (1.0 - confidence) +
+                    observed * confidence)
+        estimate = max(
+            MIN_DURATION_SECONDS, min(MAX_DURATION_SECONDS, estimate))
+        return estimate, len(samples)
+
+    def _record_success_duration_locked(self, state: _PageState,
+                                        task: _Task, now: float) -> None:
+        if task.started_monotonic is None:
+            return
+        duration = max(
+            MIN_DURATION_SECONDS,
+            min(MAX_DURATION_SECONDS, now - task.started_monotonic),
+        )
+        samples = state.duration_samples.get(task.kind)
+        if samples is None:
+            samples = deque(maxlen=self._duration_history_size)
+            state.duration_samples[task.kind] = samples
+        samples.append(duration)
+
+    def _task_remaining_seconds_locked(self, state: _PageState,
+                                       task: _Task, now: float) -> float:
+        if task.cancel_requested:
+            started = task.cancel_requested_monotonic
+            elapsed = max(0.0, now - (started if started is not None else now))
+            prior = task.cancel_estimate_seconds or CANCEL_RELEASE_PRIOR_SECONDS
+            predicted_total = max(prior, elapsed * 1.2)
+            return max(MIN_DURATION_SECONDS, predicted_total - elapsed)
+        estimate, _ = self._duration_estimate_locked(state, task.kind)
+        if task.status == "queued":
+            return estimate
+        if task.status == "retrying":
+            retry_wait = max(
+                0.0, (task.retry_ready_monotonic or now) - now)
+            return retry_wait + estimate
+        if task.status != "running":
+            return 0.0
+
+        started = task.attempt_started_monotonic
+        if started is None:
+            started = task.started_monotonic
+        elapsed = max(0.0, now - (started if started is not None else now))
+        progress = (task.progress
+                    if task.progress_attempt == task.attempts else None)
+        if progress is not None and 0.0 < progress < 1.0:
+            inferred_total = elapsed / max(0.05, progress)
+            predicted_total = max(estimate, inferred_total)
+            return max(
+                MIN_DURATION_SECONDS, predicted_total * (1.0 - progress))
+        if progress is not None and progress >= 1.0:
+            return MIN_DURATION_SECONDS
+
+        # 无 token 级进度时先线性倒计时；超出历史均值后按已耗时的 20%
+        # 继续外推，避免任务尚未结束但 ETA 长时间卡在 0。
+        predicted_total = max(estimate, elapsed * 1.2)
+        return max(MIN_DURATION_SECONDS, predicted_total - elapsed)
+
+    @staticmethod
+    def _eta_confidence(sample_count: int) -> str:
+        if sample_count <= 0:
+            return "low"
+        if sample_count < 3:
+            return "medium"
+        return "high"
+
+    def _page_eta_locked(self, page: str, active_tasks: list[_Task],
+                         now: float) -> tuple[dict, dict[str, int], dict[str, str]]:
+        """模拟当前有效并发下的完成时刻；rate 的单位为任务/秒。"""
+        state = self._pages[page]
+        remaining = len(active_tasks)
+        if not active_tasks:
+            return {
+                "remaining": 0,
+                "eta_seconds": 0,
+                "eta_confidence": "none",
+                "rate": 0.0,
+                "rate_per_minute": 0.0,
+                "average_seconds_per_task": 0.0,
+                "estimate_samples": sum(
+                    len(samples) for samples in state.duration_samples.values()),
+            }, {}, {}
+
+        concurrency = max(1, state.effective_concurrency)
+        active_by_id = {task.id: task for task in active_tasks}
+        executing = [task for task in active_tasks
+                     if task.id in state.executing]
+        retry_waiting = [task for task in active_tasks
+                         if task.status == "retrying" and
+                         task.id not in state.executing]
+        queued_ids = {task.id for task in active_tasks if task.status == "queued"}
+        queued = []
+        for task_id in state.queue:
+            if task_id in queued_ids:
+                queued.append(self._tasks[task_id])
+                queued_ids.remove(task_id)
+        # 极短的派发窗口里任务可能还未进入 deque，按创建顺序兜底补齐。
+        queued.extend(task for task in active_tasks if task.id in queued_ids)
+
+        # ETA 同时模拟两个约束：effective_concurrency 是实际 LLM 请求槽，
+        # max_concurrency 是线程上限。retrying 在退避时仍占线程，但不占请求槽，
+        # 因而线程有空位时，普通排队任务可以先运行。
+        completion_times = {}
+        completion_events = []
+        retry_events = []
+        ready_retries = deque()
+        queued = deque(queued)
+        sequence = 0
+        executing_count = len(executing)
+        worker_count = len(state.running.intersection(active_by_id))
+
+        def add_completion(task: _Task, completed_at: float,
+                           holds_request: bool) -> None:
+            nonlocal sequence
+            completion_times[task.id] = completed_at
+            heapq.heappush(
+                completion_events,
+                (completed_at, sequence, task.id, holds_request),
+            )
+            sequence += 1
+
+        for task in executing:
+            add_completion(
+                task,
+                self._task_remaining_seconds_locked(state, task, now),
+                True,
+            )
+        for task in retry_waiting:
+            if task.cancel_requested:
+                add_completion(
+                    task,
+                    self._task_remaining_seconds_locked(state, task, now),
+                    False,
+                )
+                continue
+            ready_at = max(
+                0.0, (task.retry_ready_monotonic or now) - now)
+            retry_events.append((ready_at, sequence, task.id))
+            sequence += 1
+        retry_events = deque(sorted(retry_events))
+
+        def start_available(current_time: float) -> None:
+            nonlocal executing_count, worker_count
+            while executing_count < concurrency:
+                if ready_retries:
+                    task = active_by_id[ready_retries.popleft()]
+                    duration = self._duration_estimate_locked(
+                        state, task.kind)[0]
+                    executing_count += 1
+                    add_completion(task, current_time + duration, True)
+                    continue
+                if queued and worker_count < state.max_concurrency:
+                    task = queued.popleft()
+                    duration = self._task_remaining_seconds_locked(
+                        state, task, now)
+                    worker_count += 1
+                    executing_count += 1
+                    add_completion(task, current_time + duration, True)
+                    continue
+                break
+
+        current_time = 0.0
+        while retry_events and retry_events[0][0] <= current_time:
+            ready_retries.append(retry_events.popleft()[2])
+        start_available(current_time)
+        while len(completion_times) < len(active_tasks):
+            next_completion = (completion_events[0][0]
+                               if completion_events else math.inf)
+            next_retry = retry_events[0][0] if retry_events else math.inf
+            next_time = min(next_completion, next_retry)
+            if not math.isfinite(next_time):
+                # 状态瞬时不一致时采用串行兜底，保证快照仍可用且不返回 0。
+                cursor = max(completion_times.values(), default=current_time)
+                pending = ([active_by_id[task_id]
+                            for task_id in ready_retries] + list(queued))
+                for task in pending:
+                    cursor += self._duration_estimate_locked(
+                        state, task.kind)[0]
+                    completion_times[task.id] = cursor
+                break
+            current_time = next_time
+            while (completion_events and
+                   completion_events[0][0] <= current_time + 1e-9):
+                _, _, _, holds_request = heapq.heappop(completion_events)
+                worker_count = max(0, worker_count - 1)
+                if holds_request:
+                    executing_count = max(0, executing_count - 1)
+            while retry_events and retry_events[0][0] <= current_time + 1e-9:
+                ready_retries.append(retry_events.popleft()[2])
+            start_available(current_time)
+
+        eta = max(completion_times.values(), default=0.0)
+        estimated_durations = [
+            self._duration_estimate_locked(state, task.kind)[0]
+            for task in active_tasks if not task.cancel_requested
+        ]
+        average = (sum(estimated_durations) / len(estimated_durations)
+                   if estimated_durations else 0.0)
+        active_capacity = min(concurrency, len(estimated_durations))
+        rate = (active_capacity * 60.0 / average
+                if average > 0 and active_capacity else 0.0)
+        active_kinds = {task.kind for task in active_tasks}
+        sample_count = sum(
+            len(state.duration_samples.get(kind, ())) for kind in active_kinds)
+        task_confidence = {
+            task.id: self._eta_confidence(
+                len(state.duration_samples.get(task.kind, ())))
+            for task in active_tasks
+        }
+        task_eta = {
+            task_id: _ceil_seconds(seconds)
+            for task_id, seconds in completion_times.items()
+        }
+        return {
+            "remaining": remaining,
+            "eta_seconds": _ceil_seconds(eta),
+            "eta_confidence": min(
+                task_confidence.values(),
+                key=("low", "medium", "high").index,
+            ) if task_confidence else "none",
+            "rate": round(rate / 60.0, 4),
+            "rate_per_minute": round(rate, 2),
+            "average_seconds_per_task": round(average, 1),
+            "estimate_samples": sample_count,
+        }, task_eta, task_confidence
+
+    def _task_dict_locked(self, task: _Task, *, eta_seconds=None,
+                          eta_confidence=None) -> dict:
         return {
             "id": task.id,
             "page": task.page,
@@ -254,6 +537,10 @@ class AITaskScheduler:
             "started_at": task.started_at,
             "finished_at": task.finished_at,
             "updated_at": task.updated_at,
+            "eta_seconds": (0 if task.status in TERMINAL_STATUSES
+                            else eta_seconds),
+            "eta_confidence": ("none" if task.status in TERMINAL_STATUSES
+                               else eta_confidence),
         }
 
     def enqueue(self, page: str, kind: str, job_key: str,
@@ -289,6 +576,7 @@ class AITaskScheduler:
                 job_key=job_key,
                 resume_id=normalized_resume_id,
                 payload=_safe_copy(payload or {}),
+                created_monotonic=self._clock_func(),
             )
             self._tasks[task.id] = task
             self._task_order.append(task.id)
@@ -338,7 +626,8 @@ class AITaskScheduler:
             with self._condition:
                 task = None
                 while not self._closed:
-                    if len(state.running) < state.effective_concurrency:
+                    if (len(state.running) < state.max_concurrency and
+                            len(state.executing) < state.effective_concurrency):
                         task = self._next_queued_locked(state)
                         if task is not None:
                             break
@@ -348,8 +637,13 @@ class AITaskScheduler:
 
                 task.status = "running"
                 task.started_at = task.started_at or _now_iso()
+                task.started_monotonic = (
+                    task.started_monotonic
+                    if task.started_monotonic is not None
+                    else self._clock_func())
                 task.updated_at = _now_iso()
                 state.running.add(task.id)
+                state.executing.add(task.id)
                 worker = threading.Thread(
                     target=self._execute_task,
                     args=(page, task.id),
@@ -382,19 +676,34 @@ class AITaskScheduler:
         if self._sleep_func is not None:
             self._sleep_func(delay)
         else:
-            # Event.wait 让生产环境的退避可以被取消立即唤醒。
-            task.cancel_event.wait(delay)
+            # 分段等待既能被取消立即唤醒，也避免超大 Retry-After 超过
+            # threading.Condition 支持的 timeout 上限而让 worker 异常退出。
+            remaining = delay
+            while remaining > 0 and not task.cancel_event.is_set():
+                chunk = min(remaining, MAX_RETRY_WAIT_CHUNK_SECONDS)
+                started = time.monotonic()
+                if task.cancel_event.wait(chunk):
+                    return
+                elapsed = max(0.0, time.monotonic() - started)
+                remaining = max(
+                    0.0, remaining - (elapsed if elapsed > 0 else chunk))
 
     def _mark_terminal_locked(self, task: _Task, status: str,
                               *, result=None, error: str = "") -> None:
         state = self._pages[task.page]
+        now = self._clock_func()
+        if status == "succeeded":
+            self._record_success_duration_locked(state, task, now)
         task.status = status
         task.result = _safe_copy(result) if status == "succeeded" else None
         task.error = error
         task.progress = 1.0
         task.finished_at = _now_iso()
+        task.finished_monotonic = now
+        task.retry_ready_monotonic = None
         task.updated_at = task.finished_at
         state.running.discard(task.id)
+        state.executing.discard(task.id)
         if self._active_index.get(task.active_key()) == task.id:
             self._active_index.pop(task.active_key(), None)
         self._touch_locked(task.page)
@@ -410,9 +719,26 @@ class AITaskScheduler:
                         state.consecutive_successes = 0
                         self._mark_terminal_locked(task, "cancelled")
                         return
+                    while (task.id not in state.executing and
+                           len(state.executing) >= state.effective_concurrency and
+                           not task.cancel_requested and not self._closed):
+                        self._condition.wait()
+                    if task.cancel_requested or self._closed:
+                        state.consecutive_successes = 0
+                        self._mark_terminal_locked(task, "cancelled")
+                        return
+                    state.executing.add(task.id)
+                    is_retry = task.attempts > 0
                     task.attempts += 1
                     task.status = "running"
                     task.error = ""
+                    if is_retry:
+                        task.progress = None
+                        task.progress_attempt = 0
+                        task.message = ""
+                        task.partial_output = ""
+                    task.attempt_started_monotonic = self._clock_func()
+                    task.retry_ready_monotonic = None
                     task.updated_at = _now_iso()
                     runner_task = self._task_dict_locked(task)
                     self._touch_locked(page)
@@ -436,6 +762,7 @@ class AITaskScheduler:
 
                         task.rate_limit_retries += 1
                         state.consecutive_successes = 0
+                        state.executing.discard(task.id)
                         state.effective_concurrency = max(
                             1, state.effective_concurrency - 1)
                         can_retry = task.rate_limit_retries <= self._max_retries
@@ -449,9 +776,10 @@ class AITaskScheduler:
                             f"请求限流，准备第 {task.rate_limit_retries} 次重试")
                         task.updated_at = _now_iso()
                         retry_after = _retry_after_seconds(error)
-                        delay = (min(self._backoff_cap, retry_after)
+                        delay = (retry_after
                                  if retry_after is not None
                                  else self._backoff_delay(task.rate_limit_retries))
+                        task.retry_ready_monotonic = self._clock_func() + delay
                         self._touch_locked(page)
 
                     self._sleep_for_retry(task, delay)
@@ -494,6 +822,7 @@ class AITaskScheduler:
                 return self._task_dict_locked(task)
             if progress is not None:
                 task.progress = max(0.0, min(1.0, float(progress)))
+                task.progress_attempt = task.attempts
             if message is not None:
                 task.message = str(message)
             if partial_output is not None:
@@ -527,6 +856,15 @@ class AITaskScheduler:
                     continue
                 if kind is not None and task.kind != str(kind):
                     continue
+                if task.cancel_requested:
+                    continue
+                now = self._clock_func()
+                task.cancel_estimate_seconds = min(
+                    CANCEL_RELEASE_PRIOR_SECONDS,
+                    self._task_remaining_seconds_locked(
+                        self._pages[task.page], task, now),
+                )
+                task.cancel_requested_monotonic = now
                 task.cancel_requested = True
                 task.cancel_event.set()
                 cancelled_count += 1
@@ -541,9 +879,18 @@ class AITaskScheduler:
 
     def _page_snapshot_locked(self, page: str) -> dict:
         state = self._pages[page]
-        tasks = [self._task_dict_locked(self._tasks[task_id])
-                 for task_id in self._task_order
-                 if self._tasks[task_id].page == page]
+        task_objects = [self._tasks[task_id] for task_id in self._task_order
+                        if self._tasks[task_id].page == page]
+        eta, task_eta, task_confidence = self._page_eta_locked(
+            page,
+            [task for task in task_objects if task.status in ACTIVE_STATUSES],
+            self._clock_func(),
+        )
+        tasks = [self._task_dict_locked(
+            task,
+            eta_seconds=task_eta.get(task.id),
+            eta_confidence=task_confidence.get(task.id),
+        ) for task in task_objects]
         counts = {status: 0 for status in
                   ("queued", "running", "retrying", "succeeded", "failed", "cancelled")}
         for task in tasks:
@@ -563,6 +910,7 @@ class AITaskScheduler:
                 "total": total,
                 "completed": completed,
                 "percent": round(completed * 100 / total) if total else 0,
+                **eta,
                 **counts,
             },
             "tasks": tasks,

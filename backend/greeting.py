@@ -53,8 +53,62 @@ def _resume_context(resume_id=None):
     return (prof.get("resume_text") or "").strip(), int(prof["id"]), int(prof["revision"])
 
 
+def _parse_variants(raw) -> list[str]:
+    """兼容历史脏数据，只保留可实际使用的非空文案。"""
+    try:
+        value = json.loads(raw or "[]") if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value
+            if isinstance(item, str) and item.strip()]
+
+
+def _is_completed(row) -> bool:
+    """当前修订已有三版候选或有效选定文案，即视为生成完成。"""
+    return bool(str(row["chosen"] or "").strip()) or len(
+        _parse_variants(row["variants"])) >= 3
+
+
+def completed_job_keys(job_keys: list, resume_id: int, resume_revision: int) -> set:
+    """返回当前简历修订下已有可用招呼语的岗位，供单个与批量任务复用。"""
+    keys = list(dict.fromkeys(str(key) for key in job_keys if key))
+    if not keys:
+        return set()
+    marks = ",".join("?" for _ in keys)
+    rows = get_db().execute(
+        "SELECT job_key,variants,chosen FROM greetings WHERE resume_id=? "
+        "AND resume_revision=? AND job_key IN (" + marks + ")",
+        [int(resume_id), int(resume_revision), *keys],
+    ).fetchall()
+    return {row["job_key"] for row in rows if _is_completed(row)}
+
+
+def _completed_greeting(job_key: str, resume_id: int, resume_revision: int):
+    rows = get_db().execute(
+        "SELECT * FROM greetings WHERE job_key=? AND resume_id=? "
+        "AND resume_revision=? ORDER BY id DESC",
+        (job_key, int(resume_id), int(resume_revision)),
+    ).fetchall()
+    return next((row for row in rows if _is_completed(row)), None)
+
+
+def _existing_result(row) -> dict:
+    return {
+        "id": row["id"], "job_key": row["job_key"],
+        "variants": _parse_variants(row["variants"]),
+        "variant_labels": VARIANT_LABELS, "source": "existing",
+        "resume_id": row["resume_id"],
+        "resume_revision": row["resume_revision"],
+        "chosen": str(row["chosen"] or "").strip(),
+        "status": row["status"], "reused_existing": True,
+    }
+
+
 def generate(job_key: str, client=None, resume_id: int = None,
-             fallback_on_error: bool = True, on_delta=None, cancelled=None) -> dict:
+             fallback_on_error: bool = True, on_delta=None, cancelled=None,
+             force: bool = False) -> dict:
     """为岗位生成 3 个招呼语变体并入队（status=draft）。"""
     conn = get_db()
     row = conn.execute(
@@ -63,6 +117,10 @@ def generate(job_key: str, client=None, resume_id: int = None,
     if row is None:
         raise llm.LLMError(f"岗位不存在: {job_key}")
     resume, resume_id, resume_revision = _resume_context(resume_id)
+    if not force:
+        existing = _completed_greeting(job_key, resume_id, resume_revision)
+        if existing is not None:
+            return _existing_result(existing)
     l2 = json.loads(row["l2_detail"] or "{}")
     if resume_id is not None:
         from . import resumes
@@ -111,8 +169,10 @@ def generate(job_key: str, client=None, resume_id: int = None,
         exist = conn.execute("SELECT id FROM greetings WHERE job_key=? AND resume_id IS NULL "
                              "AND status IN ('draft','approved')", (job_key,)).fetchone()
     else:
-        exist = conn.execute("SELECT id FROM greetings WHERE job_key=? AND resume_id=? "
-                             "AND status IN ('draft','approved')", (job_key, resume_id)).fetchone()
+        exist = conn.execute(
+            "SELECT id FROM greetings WHERE job_key=? AND resume_id=? "
+            "AND status IN ('draft','approved') ORDER BY id DESC LIMIT 1",
+            (job_key, resume_id)).fetchone()
     if exist:
         conn.execute("UPDATE greetings SET variants=?, chosen='', status='draft', "
                      "resume_revision=?, delivery_channel='', delivery_status='', updated_at=? "
@@ -130,7 +190,8 @@ def generate(job_key: str, client=None, resume_id: int = None,
     conn.commit()
     return {"id": gid, "job_key": job_key, "variants": variants,
             "variant_labels": VARIANT_LABELS, "source": source,
-            "resume_id": resume_id, "resume_revision": resume_revision}
+            "resume_id": resume_id, "resume_revision": resume_revision,
+            "reused_existing": False}
 
 
 def list_queue(status: str = "") -> list:

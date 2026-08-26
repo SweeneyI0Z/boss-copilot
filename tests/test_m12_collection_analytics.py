@@ -24,6 +24,7 @@ class M12DatabaseTestCase(unittest.TestCase):
             collector._state.update({
                 "running": False, "current": "", "phase": "", "log": [],
                 "run_id": None, "cancel": False, "risk_signal": "",
+                "eta_model": None,
                 "progress": {"list_total": 0, "list_completed": 0,
                              "detail_total": 0, "detail_completed": 0},
             })

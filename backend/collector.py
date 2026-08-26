@@ -4,10 +4,12 @@
 失败不会撤销已导入列表，也不会触发错误的下架 diff，可稍后单独重试缺失 JD。
 """
 import json
+import math
 import os
 import queue
 import re
 import signal
+import statistics
 import subprocess
 import threading
 import time
@@ -26,6 +28,14 @@ RESULT_DIR = config.COLLECT_RESULT_DIR
 ITEM_GAP_SEC = 120
 MAX_SEARCH_COMBINATIONS = 20
 MAX_COMPANY_PAGES = 30
+ETA_DEFAULT_LIST_SECONDS_PER_PAGE = 45.0
+ETA_DEFAULT_DETAIL_SECONDS_PER_JOB = 12.0
+ETA_DEFAULT_JOBS_PER_PAGE = 15.0
+ETA_SEED_WEIGHT = 3.0
+ETA_SAMPLE_LIMIT = 12
+ETA_MAX_LIST_SECONDS_PER_PAGE = 900.0
+ETA_MAX_DETAIL_SECONDS_PER_JOB = 300.0
+ETA_MAX_JOBS_PER_PAGE = 100.0
 FILTER_KEYS = ("scale", "stage", "salary", "experience", "degree", "industry")
 FILTER_VALUE_MAPS = {
     "scale": {"0-20人": "301", "20-99人": "302", "100-499人": "303",
@@ -77,19 +87,124 @@ _state = {
     "paused_seconds": 0.0, "worker_ident": None,
     "fetch_details": False,
     "phase_started_at": None, "phase_pause_baseline": 0.0,
+    "eta_model": None,
     "progress": _new_progress(),
 }
 
 
-def _estimate_eta(completed: int, total: int, elapsed: float):
-    """按当前阶段观察速率估算剩余秒数；无完成样本时不猜。"""
-    completed = max(0, int(completed or 0))
-    total = max(0, int(total or 0))
-    if total <= completed:
-        return 0 if total else None
-    if completed <= 0 or elapsed is None or elapsed <= 0:
-        return None
-    return max(0, int(round((total - completed) * float(elapsed) / completed)))
+def _median(values, fallback: float) -> float:
+    cleaned = []
+    for value in values:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed) and parsed > 0:
+            cleaned.append(parsed)
+    return float(statistics.median(cleaned)) if cleaned else float(fallback)
+
+
+def _bounded_positive(value, fallback: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    if not math.isfinite(parsed) or parsed <= 0 or parsed > maximum:
+        return float(fallback)
+    return parsed
+
+
+def _historical_eta_priors() -> dict:
+    """从近期采集统计读取稳健先验；旧运行没有 timing 时自然回退默认值。"""
+    rows = get_db().execute(
+        "SELECT stats FROM collect_runs WHERE status IN ('succeeded','partial') "
+        "ORDER BY id DESC LIMIT 100").fetchall()
+    list_rates = []
+    detail_rates = []
+    job_rates = []
+    for row in rows:
+        try:
+            timing = (json.loads(row["stats"] or "{}") or {}).get("timing") or {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not timing:
+            continue
+        try:
+            list_pages = float(timing.get("list_page_units") or 0)
+            list_seconds = float(timing.get("list_active_seconds") or 0)
+            detail_completed = int(timing.get("detail_completed") or 0)
+            detail_seconds = float(timing.get("detail_active_seconds") or 0)
+            jobs_discovered = int(timing.get("jobs_discovered") or 0)
+        except (TypeError, ValueError):
+            continue
+        list_rate = list_seconds / list_pages if list_pages > 0 else 0
+        detail_rate = detail_seconds / detail_completed if detail_completed > 0 else 0
+        job_rate = jobs_discovered / list_pages if list_pages > 0 else 0
+        if 0 < list_rate <= ETA_MAX_LIST_SECONDS_PER_PAGE and len(list_rates) < 20:
+            list_rates.append(list_rate)
+        if 0 < detail_rate <= ETA_MAX_DETAIL_SECONDS_PER_JOB and len(detail_rates) < 20:
+            detail_rates.append(detail_rate)
+        if 0 < job_rate <= ETA_MAX_JOBS_PER_PAGE and len(job_rates) < 20:
+            job_rates.append(job_rate)
+        if min(len(list_rates), len(detail_rates), len(job_rates)) >= 20:
+            break
+    return {
+        "list_seconds_per_page": _median(
+            list_rates, ETA_DEFAULT_LIST_SECONDS_PER_PAGE),
+        "detail_seconds_per_job": _median(
+            detail_rates, ETA_DEFAULT_DETAIL_SECONDS_PER_JOB),
+        "jobs_per_page": _median(job_rates, ETA_DEFAULT_JOBS_PER_PAGE),
+    }
+
+
+def _new_eta_model(tasks: list, priors: dict = None) -> dict:
+    priors = dict(priors or _historical_eta_priors())
+    pages = [max(1, int(task.get("pages") or 1)) for task in (tasks or [])]
+    return {
+        "task_pages": pages,
+        "list_seconds_per_page": _bounded_positive(
+            priors.get("list_seconds_per_page"), ETA_DEFAULT_LIST_SECONDS_PER_PAGE,
+            ETA_MAX_LIST_SECONDS_PER_PAGE),
+        "detail_seconds_per_job": _bounded_positive(
+            priors.get("detail_seconds_per_job"), ETA_DEFAULT_DETAIL_SECONDS_PER_JOB,
+            ETA_MAX_DETAIL_SECONDS_PER_JOB),
+        "jobs_per_page": _bounded_positive(
+            priors.get("jobs_per_page"), ETA_DEFAULT_JOBS_PER_PAGE,
+            ETA_MAX_JOBS_PER_PAGE),
+        "list_samples": [],
+        "current_task_index": None, "current_task_started_at": None,
+        "current_task_pause_baseline": 0.0,
+        "gap_after_index": None, "gap_started_at": None,
+        "gap_pause_baseline": 0.0, "gaps_completed": 0,
+        "detail_started_at": None, "detail_pause_baseline": 0.0,
+        "detail_last_at": None, "detail_last_pause_baseline": 0.0,
+        "detail_last_completed": 0, "detail_samples": [],
+    }
+
+
+def _blended_rate(seed: float, samples: list) -> float:
+    """用中位数抑制偶发慢任务，并保留先验避免首个样本造成大跳变。"""
+    recent = []
+    for value in (samples or [])[-ETA_SAMPLE_LIMIT:]:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed) and parsed > 0:
+            recent.append(parsed)
+    if not recent:
+        return max(1.0, float(seed))
+    observed = statistics.median(recent)
+    weight = min(float(len(recent)), 6.0)
+    return max(1.0, (float(seed) * ETA_SEED_WEIGHT + observed * weight)
+               / (ETA_SEED_WEIGHT + weight))
+
+
+def _active_elapsed_locked(started_at, pause_baseline: float, now: float) -> float:
+    if started_at is None:
+        return 0.0
+    paused = max(0.0, _paused_duration_locked(now) - float(pause_baseline or 0.0))
+    return max(0.0, float(now) - float(started_at) - paused)
 
 
 def _phase_elapsed_locked(now: float = None):
@@ -102,10 +217,99 @@ def _phase_elapsed_locked(now: float = None):
     return max(0.0, now - float(started_at) - paused)
 
 
+def _list_eta_locked(progress: dict, now: float, model: dict) -> float:
+    pages = list(model.get("task_pages") or [])
+    total_tasks = len(pages)
+    if not total_tasks:
+        return 0.0
+    completed_tasks = min(total_tasks, max(0, int(progress.get("list_completed") or 0)))
+    rate = _blended_rate(model["list_seconds_per_page"], [
+        sample["seconds"] / sample["pages"] for sample in model.get("list_samples") or []
+        if sample.get("seconds", 0) > 0 and sample.get("pages", 0) > 0
+    ])
+    remaining = 0.0
+    current_index = model.get("current_task_index")
+    cancel_requested = bool(_state.get("cancel"))
+    if cancel_requested:
+        remaining_indexes = ([current_index]
+                             if current_index is not None
+                             and completed_tasks <= current_index < total_tasks else [])
+    else:
+        remaining_indexes = range(completed_tasks, total_tasks)
+    for index in remaining_indexes:
+        estimated = pages[index] * rate
+        if index == current_index:
+            elapsed = _active_elapsed_locked(
+                model.get("current_task_started_at"),
+                model.get("current_task_pause_baseline", 0.0), now)
+            # 超过先验时仍保留一个小尾部，避免 ETA 在任务实际完成前归零。
+            estimated = max(estimated, elapsed + rate * 0.25)
+            remaining += max(0.0, estimated - elapsed)
+        else:
+            remaining += estimated
+
+    active_gap = not cancel_requested and model.get("gap_after_index") is not None
+    gap_remaining = 0.0
+    if active_gap:
+        gap_elapsed = _active_elapsed_locked(
+            model.get("gap_started_at"), model.get("gap_pause_baseline", 0.0), now)
+        gap_remaining = max(0.0, float(ITEM_GAP_SEC) - gap_elapsed)
+    gaps_total = max(0, total_tasks - 1)
+    future_gaps = (0 if cancel_requested else max(
+        0, gaps_total - int(model.get("gaps_completed") or 0)
+        - (1 if active_gap else 0)))
+    remaining += gap_remaining + future_gaps * float(ITEM_GAP_SEC)
+
+    if _state.get("fetch_details") and not cancel_requested:
+        all_pages = max(1, sum(pages))
+        completed_pages = sum(pages[:completed_tasks])
+        known_jobs = max(0, int(progress.get("jobs_discovered") or 0))
+        known_complete = min(known_jobs, max(0, int(progress.get("jd_completed") or 0)))
+        seeded_jobs = model["jobs_per_page"] * all_pages
+        if completed_tasks >= total_tasks:
+            projected_jobs = known_jobs
+        elif completed_pages > 0:
+            observed_projection = known_jobs * all_pages / completed_pages
+            confidence = min(0.8, completed_pages / all_pages)
+            projected_jobs = max(known_jobs, seeded_jobs * (1.0 - confidence)
+                                 + observed_projection * confidence)
+        else:
+            projected_jobs = max(known_jobs, seeded_jobs)
+        missing_ratio = ((known_jobs - known_complete) / known_jobs
+                         if known_jobs else 1.0)
+        projected_missing = max(known_jobs - known_complete,
+                                int(round(projected_jobs * missing_ratio)))
+        detail_rate = _blended_rate(
+            model["detail_seconds_per_job"], model.get("detail_samples") or [])
+        remaining += projected_missing * detail_rate
+    return remaining
+
+
+def _detail_eta_locked(progress: dict, now: float, model: dict) -> float:
+    total = max(0, int(progress.get("detail_total") or 0))
+    if not total:
+        total = max(0, int(progress.get("jobs_total") or 0)
+                    - int(progress.get("jd_completed") or 0))
+    completed = min(total, max(0, int(progress.get("detail_completed") or 0)))
+    remaining_items = max(0, total - completed)
+    if not remaining_items:
+        return 0.0
+    rate = _blended_rate(
+        model["detail_seconds_per_job"], model.get("detail_samples") or [])
+    since_progress = _active_elapsed_locked(
+        model.get("detail_last_at") or model.get("detail_started_at"),
+        model.get("detail_last_pause_baseline")
+        if model.get("detail_last_at") is not None
+        else model.get("detail_pause_baseline", 0.0), now)
+    estimated = remaining_items * rate
+    return max(rate * 0.25, estimated - since_progress)
+
+
 def _progress_snapshot_locked(now: float = None) -> dict:
     progress = _new_progress()
     progress.update(_state.get("progress") or {})
     phase = _state.get("phase") or ""
+    now = time.monotonic() if now is None else float(now)
     if phase == "list":
         completed = progress["list_completed"]
         total = progress["list_total"]
@@ -128,10 +332,15 @@ def _progress_snapshot_locked(now: float = None) -> dict:
         progress["eta_seconds"] = None
         return progress
 
-    completed = max(0, int(completed or 0))
-    total = max(0, int(total or 0))
-    progress["eta_seconds"] = _estimate_eta(
-        completed, total, _phase_elapsed_locked(now))
+    model = _state.get("eta_model")
+    if not model:
+        progress["eta_seconds"] = None
+    elif phase == "list":
+        progress["eta_seconds"] = max(0, int(round(
+            _list_eta_locked(progress, now, model))))
+    else:
+        progress["eta_seconds"] = max(0, int(round(
+            _detail_eta_locked(progress, now, model))))
     return progress
 
 
@@ -167,6 +376,15 @@ def _job_completeness(keys) -> tuple[set, set]:
             eligible.add(row["job_key"])
             if str(row["jd"] or "").strip():
                 complete.add(row["job_key"])
+    return eligible, complete
+
+
+def _update_discovered_progress(keys) -> tuple[set, set]:
+    """同步当前已发现岗位与已有 JD，供列表阶段估算详情工作量。"""
+    eligible, complete = _job_completeness(keys)
+    _set_progress(
+        jobs_discovered=len(eligible), jobs_total=len(eligible),
+        jd_total=len(eligible), jd_completed=len(complete))
     return eligible, complete
 
 
@@ -374,6 +592,7 @@ def _cleanup_worker_control(run_id: int) -> None:
         _state["worker_ident"] = None
         _state["phase_started_at"] = None
         _state["phase_pause_baseline"] = 0.0
+        _state["eta_model"] = None
         _state_condition.notify_all()
 
 
@@ -398,6 +617,126 @@ def _set_phase(run_id: int, phase: str) -> bool:
 def _set_progress(**values) -> None:
     with _state_lock:
         _state["progress"].update(values)
+
+
+def _eta_start_list_task(index: int) -> None:
+    with _state_lock:
+        model = _state.get("eta_model")
+        if not model:
+            return
+        now = time.monotonic()
+        model["current_task_index"] = int(index)
+        model["current_task_started_at"] = now
+        model["current_task_pause_baseline"] = _paused_duration_locked(now)
+
+
+def _eta_finish_list_task(index: int, usable: bool = True) -> None:
+    with _state_lock:
+        model = _state.get("eta_model")
+        if not model or model.get("current_task_index") != int(index):
+            return
+        now = time.monotonic()
+        duration = _active_elapsed_locked(
+            model.get("current_task_started_at"),
+            model.get("current_task_pause_baseline", 0.0), now)
+        pages = model.get("task_pages") or []
+        page_count = pages[index] if index < len(pages) else 1
+        if usable and duration > 0:
+            model["list_samples"].append({"seconds": duration, "pages": page_count})
+            model["list_samples"] = model["list_samples"][-ETA_SAMPLE_LIMIT:]
+        model["current_task_index"] = None
+        model["current_task_started_at"] = None
+
+
+def _eta_start_gap(index: int) -> None:
+    with _state_lock:
+        model = _state.get("eta_model")
+        if not model:
+            return
+        now = time.monotonic()
+        model["gap_after_index"] = int(index)
+        model["gap_started_at"] = now
+        model["gap_pause_baseline"] = _paused_duration_locked(now)
+
+
+def _eta_finish_gap(index: int, completed: bool) -> None:
+    with _state_lock:
+        model = _state.get("eta_model")
+        if not model or model.get("gap_after_index") != int(index):
+            return
+        if completed:
+            model["gaps_completed"] = max(
+                int(model.get("gaps_completed") or 0), int(index) + 1)
+        model["gap_after_index"] = None
+        model["gap_started_at"] = None
+
+
+def _eta_start_details() -> None:
+    with _state_lock:
+        model = _state.get("eta_model")
+        if not model:
+            return
+        now = time.monotonic()
+        baseline = _paused_duration_locked(now)
+        model["detail_started_at"] = now
+        model["detail_pause_baseline"] = baseline
+        model["detail_last_at"] = now
+        model["detail_last_pause_baseline"] = baseline
+        model["detail_last_completed"] = 0
+
+
+def _eta_record_detail_progress(completed: int) -> None:
+    with _state_lock:
+        model = _state.get("eta_model")
+        if not model:
+            return
+        completed = max(0, int(completed or 0))
+        previous = max(0, int(model.get("detail_last_completed") or 0))
+        if completed <= previous:
+            return
+        now = time.monotonic()
+        elapsed = _active_elapsed_locked(
+            model.get("detail_last_at") or model.get("detail_started_at"),
+            model.get("detail_last_pause_baseline", 0.0), now)
+        delta = completed - previous
+        if elapsed > 0:
+            model["detail_samples"].extend([elapsed / delta] * delta)
+            model["detail_samples"] = model["detail_samples"][-ETA_SAMPLE_LIMIT:]
+        model["detail_last_completed"] = completed
+        model["detail_last_at"] = now
+        model["detail_last_pause_baseline"] = _paused_duration_locked(now)
+
+
+def _timing_report_locked(now: float = None) -> dict:
+    model = _state.get("eta_model")
+    if not model:
+        return {}
+    now = time.monotonic() if now is None else float(now)
+    list_samples = model.get("list_samples") or []
+    detail_phase_seconds = _active_elapsed_locked(
+        model.get("detail_started_at"), model.get("detail_pause_baseline", 0.0), now)
+    detail_samples = []
+    for value in model.get("detail_samples") or []:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed) and parsed > 0:
+            detail_samples.append(parsed)
+    progress = _state.get("progress") or {}
+    return {
+        "list_active_seconds": round(sum(
+            float(sample.get("seconds") or 0) for sample in list_samples), 3),
+        "list_page_units": sum(
+            int(sample.get("pages") or 0) for sample in list_samples),
+        # 只持久化已完成岗位之间的有效样本，避免 partial 末尾超时污染先验。
+        "detail_active_seconds": round(sum(detail_samples), 3),
+        "detail_completed": len(detail_samples),
+        "detail_phase_seconds": round(detail_phase_seconds, 3),
+        "detail_result_completed": max(
+            0, int(progress.get("detail_completed") or 0)),
+        "jobs_discovered": max(0, int(progress.get("jobs_discovered") or 0)),
+    }
 
 
 def _is_cancelled() -> bool:
@@ -635,6 +974,7 @@ def _begin_run(kind: str, params: dict, tasks: list) -> int:
              "queued"))
         task["_task_id"] = row.lastrowid
     conn.commit()
+    eta_model = _new_eta_model(tasks)
     with _state_condition:
         phase_started_at = time.monotonic()
         progress = _new_progress()
@@ -646,7 +986,8 @@ def _begin_run(kind: str, params: dict, tasks: list) -> int:
                        "worker_ident": None,
                        "fetch_details": bool(params.get("fetch_details", True)),
                        "phase_started_at": phase_started_at,
-                       "phase_pause_baseline": 0.0, "progress": progress})
+                       "phase_pause_baseline": 0.0, "eta_model": eta_model,
+                       "progress": progress})
         _state_condition.notify_all()
     return run_id
 
@@ -658,6 +999,9 @@ def _finish_run(run_id: int, report: dict, run_status: str,
                and _state.get("paused") and not _state.get("cancel")):
             _state_condition.wait(timeout=0.5)
         conn = get_db()
+        timing = _timing_report_locked()
+        if timing:
+            report["timing"] = timing
         conn.execute(
             "UPDATE collect_runs SET stats=?,finished_at=?,status=?,phase=?,"
             "data_source_at=?,risk_signal=?,paused=0 WHERE id=?",
@@ -888,21 +1232,27 @@ def _import_partial(path: Path) -> dict:
     return importer.import_scraper_files([path], record_run=False)
 
 
-def _wait_between_tasks() -> bool:
+def _wait_between_tasks(task_index: int = 0) -> bool:
+    _eta_start_gap(task_index)
     started_at = time.monotonic()
     with _state_lock:
         pause_baseline = _paused_duration_locked(started_at)
-    while True:
-        _wait_for_resume()
-        if _is_cancelled():
-            return False
-        with _state_lock:
-            now = time.monotonic()
-            paused_delta = _paused_duration_locked(now) - pause_baseline
-            remaining = started_at + ITEM_GAP_SEC + paused_delta - now
-        if remaining <= 0:
-            return True
-        time.sleep(min(0.5, remaining))
+    completed = False
+    try:
+        while True:
+            _wait_for_resume()
+            if _is_cancelled():
+                return False
+            with _state_lock:
+                now = time.monotonic()
+                paused_delta = _paused_duration_locked(now) - pause_baseline
+                remaining = started_at + ITEM_GAP_SEC + paused_delta - now
+            if remaining <= 0:
+                completed = True
+                return True
+            time.sleep(min(0.5, remaining))
+    finally:
+        _eta_finish_gap(task_index, completed)
 
 
 def _all_missing_jd(keys: set) -> set:
@@ -959,6 +1309,7 @@ def _run_detail_phase(run_id: int, files: list[Path], task_ids: list[int],
         jobs_discovered=len(display_eligible), jobs_total=len(display_eligible),
         jd_total=len(display_eligible), jd_completed=len(display_complete),
         detail_total=len(missing), detail_completed=0)
+    _eta_start_details()
     if not missing:
         for task_id in task_ids:
             sync.update_run_task(task_id, "succeeded", stats={"missing_jd": 0},
@@ -992,6 +1343,7 @@ def _run_detail_phase(run_id: int, files: list[Path], task_ids: list[int],
         current_completed = max(0, len(complete_now) - initial_complete)
         if current_completed > completed:
             completed = current_completed
+            _eta_record_detail_progress(completed)
             _set_progress(detail_completed=completed,
                           jd_completed=len(display_complete_now))
             _log(f"JD 已入库 {completed}/{total}，岗位列表可立即查看")
@@ -1007,6 +1359,7 @@ def _run_detail_phase(run_id: int, files: list[Path], task_ids: list[int],
         _, complete_now = _job_completeness(eligible)
         _, display_complete_now = _job_completeness(display_eligible)
         completed = max(0, len(complete_now) - initial_complete)
+        _eta_record_detail_progress(completed)
         _set_progress(detail_completed=completed,
                       jd_completed=len(display_complete_now))
         for task_id in task_ids:
@@ -1024,6 +1377,7 @@ def _run_detail_phase(run_id: int, files: list[Path], task_ids: list[int],
         _, complete_now = _job_completeness(eligible)
         _, display_complete_now = _job_completeness(display_eligible)
         completed = max(0, len(complete_now) - initial_complete)
+        _eta_record_detail_progress(completed)
         _set_progress(detail_completed=completed,
                       jd_completed=len(display_complete_now))
         failure = classify_failure(error)
@@ -1077,6 +1431,8 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
             sync.update_run_task(task_id, "running")
             list_file = _result_path(run_id, task_id, task["type"] == "company")
             live_list_count = 0
+            task_succeeded = False
+            _eta_start_list_task(index)
 
             def import_list_snapshot(path: Path) -> None:
                 nonlocal live_list_count
@@ -1084,7 +1440,7 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
                 snapshot_keys = set(live_stats.get("job_keys") or [])
                 discovered_keys.update(snapshot_keys)
                 _attach_run_jobs(run_id, snapshot_keys, "collection_snapshot")
-                _set_progress(jobs_discovered=len(discovered_keys))
+                _update_discovered_progress(discovered_keys)
                 current_count = len(snapshot_keys)
                 if current_count > live_list_count:
                     live_list_count = current_count
@@ -1103,7 +1459,7 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
                 discovered_keys.update(current_keys)
                 detail_job_keys.update(current_keys)
                 _attach_run_jobs(run_id, current_keys, "collection")
-                _set_progress(jobs_discovered=len(discovered_keys))
+                _update_discovered_progress(discovered_keys)
                 _mark_account_success(account)
                 relation = sync.record_source_success(
                     run_id, task_id, task, current_keys)
@@ -1117,6 +1473,7 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
                     source_times.append(str(data["scraped_at"]))
                 sync.update_run_task(task_id, "list_succeeded", stats=stats,
                                      list_file=str(list_file))
+                task_succeeded = True
                 _log(f"{label} 完成: 新增 {stats['created']} / 刷新 {stats['updated']} / "
                      f"排除跳过 {stats['excluded_skipped']}")
             except (RuntimeError, subprocess.TimeoutExpired, OSError) as error:
@@ -1125,7 +1482,7 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
                 partial_keys = set(partial_stats.get("job_keys") or [])
                 discovered_keys.update(partial_keys)
                 _attach_run_jobs(run_id, partial_keys, "collection_partial")
-                _set_progress(jobs_discovered=len(discovered_keys))
+                _update_discovered_progress(discovered_keys)
                 report["partial"] = bool(partial_stats) or report["partial"]
                 report["items"].append({"task_key": task["task_key"],
                                         "partial": partial_stats,
@@ -1141,17 +1498,15 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
                     risk_signal = failure["message"]
                     break
             finally:
+                _eta_finish_list_task(index, usable=task_succeeded)
                 _set_progress(list_completed=index + 1)
 
             if index < len(tasks) - 1 and not risk_signal and not _is_cancelled():
                 _log(f"任务间隔等待 {ITEM_GAP_SEC}s")
-                if not _wait_between_tasks():
+                if not _wait_between_tasks(index):
                     report["cancelled"] = True
 
-        eligible_jobs, complete_jobs = _job_completeness(discovered_keys)
-        _set_progress(
-            jobs_discovered=len(eligible_jobs), jobs_total=len(eligible_jobs),
-            jd_total=len(eligible_jobs), jd_completed=len(complete_jobs))
+        eligible_jobs, complete_jobs = _update_discovered_progress(discovered_keys)
         _wait_for_resume()
         if risk_signal or _is_cancelled():
             report["cancelled"] = report["cancelled"] or _is_cancelled()
@@ -1242,7 +1597,7 @@ def start(kind: str, tasks: list, sync_mode: bool = False,
                        "paused_seconds": 0.0, "worker_ident": None,
                        "fetch_details": bool(fetch_details),
                        "phase_started_at": None, "phase_pause_baseline": 0.0,
-                       "progress": _new_progress()})
+                       "eta_model": None, "progress": _new_progress()})
     try:
         run_id = _begin_run(kind, {"tasks": normalized, "sync": sync_mode,
                                    "fetch_details": fetch_details,
@@ -1253,7 +1608,7 @@ def start(kind: str, tasks: list, sync_mode: bool = False,
                            "run_id": None, "paused": False, "process": None,
                            "pause_started_at": None, "paused_seconds": 0.0,
                            "worker_ident": None, "phase_started_at": None,
-                           "phase_pause_baseline": 0.0})
+                           "phase_pause_baseline": 0.0, "eta_model": None})
             _state_condition.notify_all()
         raise
     thread = threading.Thread(
@@ -1419,7 +1774,7 @@ def retry_missing(source_run_id: int = None) -> dict:
                        "process": None, "pause_started_at": None,
                        "paused_seconds": 0.0, "worker_ident": None,
                        "phase_started_at": None, "phase_pause_baseline": 0.0,
-                       "progress": _new_progress()})
+                       "eta_model": None, "progress": _new_progress()})
     if source_run_id is None:
         row = get_db().execute(
             "SELECT run_id FROM collect_run_tasks WHERE list_file<>'' "
@@ -1431,7 +1786,7 @@ def retry_missing(source_run_id: int = None) -> dict:
                            "run_id": None, "paused": False, "process": None,
                            "pause_started_at": None, "paused_seconds": 0.0,
                            "worker_ident": None, "phase_started_at": None,
-                           "phase_pause_baseline": 0.0})
+                           "phase_pause_baseline": 0.0, "eta_model": None})
             _state_condition.notify_all()
         return {"ok": False, "error": "没有可重试的采集记录"}
     try:
@@ -1446,7 +1801,7 @@ def retry_missing(source_run_id: int = None) -> dict:
                            "run_id": None, "paused": False, "process": None,
                            "pause_started_at": None, "paused_seconds": 0.0,
                            "worker_ident": None, "phase_started_at": None,
-                           "phase_pause_baseline": 0.0})
+                           "phase_pause_baseline": 0.0, "eta_model": None})
             _state_condition.notify_all()
         raise
     thread = threading.Thread(target=_retry_worker,
