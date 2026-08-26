@@ -201,14 +201,20 @@ def skip(greeting_id: int) -> dict:
     return {"ok": True}
 
 
-def pending_batch() -> list:
+def pending_batch(job_keys=None) -> list:
     """approved 且岗位仍 active 的批次（发送器消费）。"""
     conn = get_db()
+    keys = list(dict.fromkeys(str(key) for key in (job_keys or []) if key))
+    key_clause = ""
+    args = []
+    if keys:
+        key_clause = f"AND g.job_key IN ({','.join('?' for _ in keys)}) "
+        args.extend(keys)
     rows = conn.execute(
         "SELECT g.id, g.job_key, g.chosen, g.resume_id, g.resume_revision, "
         "j.title, j.company, j.job_link FROM greetings g "
         "JOIN jobs j ON j.job_key=g.job_key LEFT JOIN resumes r ON r.id=g.resume_id "
         "WHERE g.status='approved' AND j.status='active' "
         "AND g.resume_id IS NOT NULL AND g.resume_revision=r.revision "
-        "ORDER BY j.composite DESC").fetchall()
+        f"{key_clause}ORDER BY j.composite DESC", args).fetchall()
     return [dict(r) for r in rows]

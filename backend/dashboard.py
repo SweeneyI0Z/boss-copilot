@@ -1,6 +1,7 @@
 """总览看板聚合：只读数据库缓存，不触发 Chrome 或采集任务。"""
 from datetime import date, datetime, timedelta, timezone
 
+from .collection_runs import visible_jobs_clause
 from .db import get_db, get_setting
 
 
@@ -21,13 +22,21 @@ def _simple_period_counts(table: str, condition: str, time_field: str,
 
 
 def _greeting_counts() -> dict:
-    row = get_db().execute("""
+    visible = visible_jobs_clause("j")
+    row = get_db().execute(f"""
         WITH events AS (
-          SELECT job_key, COALESCE(confirmed_at, sent_at, created_at) event_at
-          FROM greetings
-          WHERE delivery_status='confirmed' OR status='sent'
+          SELECT g.job_key, COALESCE(g.confirmed_at, g.sent_at, g.created_at) event_at
+          FROM greetings g JOIN jobs j ON j.job_key=g.job_key
+          WHERE (g.delivery_status='confirmed' OR g.status='sent') AND {visible}
           UNION ALL
-          SELECT job_key, created_at FROM sent_log WHERE ok=1
+          SELECT s.job_key, s.created_at FROM sent_log s
+          JOIN jobs j ON j.job_key=s.job_key WHERE s.ok=1 AND {visible}
+          UNION ALL
+          SELECT w.job_key,
+            COALESCE(w.greeted_at, w.applied_at, w.interviewed_at) event_at
+          FROM job_workflow_states w JOIN jobs j ON j.job_key=w.job_key
+          WHERE (w.greeted_at IS NOT NULL OR w.applied_at IS NOT NULL
+            OR w.interviewed_at IS NOT NULL) AND {visible}
         ), confirmed AS (
           SELECT job_key, MAX(event_at) event_at FROM events GROUP BY job_key
         )
@@ -37,6 +46,39 @@ def _greeting_counts() -> dict:
         FROM confirmed
     """).fetchone()
     return {key: int(row[key] or 0) for key in ("total", "today", "last_7_days")}
+
+
+def _application_counts() -> dict:
+    """真实投递与人工阶段按岗位和简历去重，平台确认优先。"""
+    visible = visible_jobs_clause("j")
+    row = get_db().execute(f"""
+        WITH events AS (
+          SELECT a.job_key, a.resume_id, a.status,
+            COALESCE(a.confirmed_at, a.updated_at, a.created_at) event_at
+          FROM applications a JOIN jobs j ON j.job_key=a.job_key
+          WHERE a.status IN ('platform_confirmed','manual_confirmed') AND {visible}
+          UNION ALL
+          SELECT w.job_key, w.resume_id, 'manual_confirmed' status,
+            COALESCE(w.applied_at, w.interviewed_at) event_at
+          FROM job_workflow_states w JOIN jobs j ON j.job_key=w.job_key
+          WHERE (w.applied_at IS NOT NULL OR w.interviewed_at IS NOT NULL)
+            AND {visible}
+        ), confirmed AS (
+          SELECT job_key, resume_id,
+            CASE WHEN MAX(CASE WHEN status='platform_confirmed' THEN 1 ELSE 0 END)=1
+              THEN 'platform_confirmed' ELSE 'manual_confirmed' END status,
+            MAX(event_at) event_at
+          FROM events GROUP BY job_key, resume_id
+        )
+        SELECT COUNT(*) total,
+          SUM(CASE WHEN datetime(event_at) >= datetime('now','start of day') THEN 1 ELSE 0 END) today,
+          SUM(CASE WHEN datetime(event_at) >= datetime('now','-7 days') THEN 1 ELSE 0 END) last_7_days,
+          SUM(CASE WHEN status='platform_confirmed' THEN 1 ELSE 0 END) platform_confirmed,
+          SUM(CASE WHEN status='manual_confirmed' THEN 1 ELSE 0 END) manual_confirmed
+        FROM confirmed
+    """).fetchone()
+    return {key: int(row[key] or 0) for key in (
+        "total", "today", "last_7_days", "platform_confirmed", "manual_confirmed")}
 
 
 def _parse_time(value: str):
@@ -139,18 +181,14 @@ def _risk_status() -> dict:
 def get_dashboard(collector_state: dict = None) -> dict:
     """返回首页完整快照；collector_state 可由接口传入内存运行态。"""
     conn = get_db()
-    jobs = _simple_period_counts("jobs", "1=1", "first_seen_at")
+    visible = visible_jobs_clause("j")
+    jobs = _simple_period_counts("jobs j", visible, "j.first_seen_at")
     jobs["active"] = conn.execute(
-        "SELECT COUNT(*) c FROM jobs WHERE status='active'").fetchone()["c"]
+        f"SELECT COUNT(*) c FROM jobs j WHERE j.status='active' AND {visible}"
+    ).fetchone()["c"]
     favorites = _simple_period_counts(
-        "jobs", "favorite_at IS NOT NULL", "favorite_at")
-    applications = _simple_period_counts(
-        "applications", "status IN ('platform_confirmed','manual_confirmed')",
-        "confirmed_at")
-    for status in ("platform_confirmed", "manual_confirmed"):
-        applications[status] = conn.execute(
-            "SELECT COUNT(*) c FROM applications WHERE status=?",
-            (status,)).fetchone()["c"]
+        "jobs j", f"j.favorite_at IS NOT NULL AND {visible}", "j.favorite_at")
+    applications = _application_counts()
     greetings = _greeting_counts()
     accounts = _account_status()
     collection = _collection_status(collector_state)

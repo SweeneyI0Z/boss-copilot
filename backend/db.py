@@ -111,7 +111,17 @@ CREATE TABLE IF NOT EXISTS collect_runs (
   data_source_at TEXT,                     -- 文件内数据时间；与运行完成时间分开
   risk_signal TEXT NOT NULL DEFAULT '',
   phase TEXT NOT NULL DEFAULT '',
-  cancel_requested INTEGER NOT NULL DEFAULT 0
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,       -- 是否纳入岗位列表/总览/分析
+  paused INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS job_run_items (
+  run_id INTEGER NOT NULL REFERENCES collect_runs(id) ON DELETE CASCADE,
+  job_key TEXT NOT NULL REFERENCES jobs(job_key) ON DELETE CASCADE,
+  source TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(run_id, job_key)
 );
 
 CREATE TABLE IF NOT EXISTS collect_run_tasks (
@@ -239,6 +249,16 @@ CREATE TABLE IF NOT EXISTS applications (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(job_key, resume_id)
+);
+
+CREATE TABLE IF NOT EXISTS job_workflow_states (
+  job_key TEXT NOT NULL REFERENCES jobs(job_key) ON DELETE CASCADE,
+  resume_id INTEGER NOT NULL REFERENCES resumes(id) ON DELETE CASCADE,
+  greeted_at TEXT,
+  applied_at TEXT,
+  interviewed_at TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(job_key, resume_id)
 );
 
 CREATE TABLE IF NOT EXISTS job_collection_hits (
@@ -428,6 +448,8 @@ def init_db() -> None:
         "risk_signal": "TEXT NOT NULL DEFAULT ''",
         "phase": "TEXT NOT NULL DEFAULT ''",
         "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+        "enabled": "INTEGER NOT NULL DEFAULT 1",
+        "paused": "INTEGER NOT NULL DEFAULT 0",
     })
     _add_columns(conn, "interviews", {
         "resume_id": "INTEGER",
@@ -456,8 +478,12 @@ def init_db() -> None:
           ON job_collection_hits(search_key, is_active);
         CREATE INDEX IF NOT EXISTS idx_collection_hits_job_active
           ON job_collection_hits(job_key, is_active);
+        CREATE INDEX IF NOT EXISTS idx_job_run_items_job
+          ON job_run_items(job_key, run_id);
         CREATE INDEX IF NOT EXISTS idx_favorite_hits_job
           ON job_favorite_hits(job_key);
+        CREATE INDEX IF NOT EXISTS idx_workflow_resume
+          ON job_workflow_states(resume_id, updated_at);
         CREATE TRIGGER IF NOT EXISTS job_score_baselines_no_update
         BEFORE UPDATE ON job_score_baselines
         BEGIN
@@ -469,6 +495,25 @@ def init_db() -> None:
         "WHEN finished_at IS NULL THEN 'running' "
         "WHEN stats LIKE '%\"error\"%' THEN 'failed' ELSE 'succeeded' END "
         "WHERE status='' OR status IS NULL")
+    conn.execute(
+        "INSERT OR IGNORE INTO job_run_items(run_id,job_key,source,created_at) "
+        "SELECT DISTINCT run_id,job_key,'collection_hit',COALESCE(first_seen_at,?) "
+        "FROM job_collection_hits", (now_iso(),))
+    conn.execute(
+        "INSERT OR IGNORE INTO job_run_items(run_id,job_key,source,created_at) "
+        "SELECT (SELECT id FROM collect_runs WHERE kind IN ('xlsx_import','json_import') "
+        "ORDER BY id DESC LIMIT 1),j.job_key,'legacy_import',? FROM jobs j "
+        "WHERE j.source='import' AND EXISTS(SELECT 1 FROM collect_runs "
+        "WHERE kind IN ('xlsx_import','json_import')) AND NOT EXISTS("
+        "SELECT 1 FROM job_run_items m WHERE m.job_key=j.job_key)", (now_iso(),))
+    conn.execute(
+        "INSERT OR IGNORE INTO job_run_items(run_id,job_key,source,created_at) "
+        "SELECT (SELECT id FROM collect_runs WHERE kind='favorite_sync' "
+        "ORDER BY id DESC LIMIT 1),j.job_key,'legacy_favorite',? FROM jobs j "
+        "WHERE EXISTS(SELECT 1 FROM collect_runs WHERE kind='favorite_sync') "
+        "AND EXISTS(SELECT 1 FROM job_favorite_hits f WHERE f.job_key=j.job_key) "
+        "AND NOT EXISTS(SELECT 1 FROM job_run_items m WHERE m.job_key=j.job_key)",
+        (now_iso(),))
     conn.commit()
 
 

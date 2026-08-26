@@ -5,6 +5,7 @@
 """
 from collections import defaultdict
 
+from .collection_runs import visible_jobs_clause
 from .db import get_db
 
 
@@ -115,7 +116,9 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
         "SELECT h.job_key,h.keyword,h.province,h.city,h.city_code,h.last_seen_at,"
         "j.salary_min,j.salary_max,j.salary_months,j.experience,j.degree,j.industry,"
         "j.scale,j.status,COALESCE(j.headhunter_override,j.is_headhunter,0) headhunter,"
-        f"{score_select} FROM job_collection_hits h JOIN jobs j ON j.job_key=h.job_key "
+        f"{score_select} FROM job_collection_hits h "
+        "JOIN collect_runs cr ON cr.id=h.run_id AND cr.enabled=1 "
+        "JOIN jobs j ON j.job_key=h.job_key "
         f"{score_join} WHERE {' AND '.join(clauses)} AND j.status<>'excluded'"
     )
     reliable_rows = [dict(row) for row in get_db().execute(
@@ -132,7 +135,8 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
             "j.degree,j.industry,j.scale,j.status,"
             "COALESCE(j.headhunter_override,j.is_headhunter,0) headhunter,"
             f"{score_select} FROM jobs j {score_join} "
-            "WHERE j.status NOT IN ('excluded','delisted')"
+            "WHERE j.status NOT IN ('excluded','delisted') AND "
+            f"{visible_jobs_clause('j')}"
         )
         rows = [dict(row) for row in get_db().execute(
             current_sql, score_args).fetchall()]
@@ -163,7 +167,9 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
     trend_clauses, trend_args = _where(trend_filters, "h", current_only=False)
     trend_sql = (
         "SELECT substr(h.last_seen_at,1,10) day,COUNT(DISTINCT h.job_key) count "
-        "FROM job_collection_hits h JOIN jobs j ON j.job_key=h.job_key WHERE "
+        "FROM job_collection_hits h "
+        "JOIN collect_runs cr ON cr.id=h.run_id AND cr.enabled=1 "
+        "JOIN jobs j ON j.job_key=h.job_key WHERE "
         + (" AND ".join(trend_clauses) + " AND " if trend_clauses else "")
         + "j.status<>'excluded' GROUP BY day ORDER BY day"
     )

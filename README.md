@@ -66,6 +66,8 @@ cd ~/project/boss-copilot
 | M11 | 多简历评分/三版招呼语/平台协同投递 | 2ab779b |
 | M12 | 模块化采集/精确来源归因/数据分析 | bced668 |
 | M13 | 双账号BOSS收藏同步/增量合并/JD补齐 | 本次提交 |
+| M15 | 全模拟前端体验重构/向导/采集工作台/响应式布局 | 7fc0e4a |
+| M16 | 前后端真实接入/采集暂停恢复与来源启停/岗位求职阶段 | 本次改动 |
 
 ## 发送护栏（不可关闭）
 
@@ -90,6 +92,8 @@ backend/
   importer.py    xlsx / scraper JSON 导入（评分基线保护）
   collector.py   在线采集执行器（后台线程，调 scraper，任务间隔 120s）
   favorites.py   双账号BOSS收藏同步（推荐页感兴趣Tab只读 + 增量合并）
+  collection_runs.py 采集来源归属、启停与 xlsx 导出
+  workflow.py    岗位已打招呼/已投递/已面试阶段聚合
   sync.py        同步刷新：同词下架 diff / HR 活跃度剔除 / P 级漂移报告
   scoring/l1.py  L1 电算评分（《岗位筛选评分规则》全量落码）
   scoring/l2.py  L2 LLM 精评（LLM 只出维度分，算术代码合成）

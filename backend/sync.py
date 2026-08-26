@@ -138,6 +138,9 @@ def record_source_success(run_id: int, task_id: int, task: dict,
         conn.execute(
             "UPDATE jobs SET status='active' WHERE job_key=? AND status='delisted'",
             (job_key,))
+        conn.execute(
+            "INSERT OR IGNORE INTO job_run_items(run_id,job_key,source,created_at) "
+            "VALUES(?,?,?,?)", (run_id, job_key, "collection", ts))
 
     missing = previous - fresh if allow_missing_diff else set()
     delisted = []

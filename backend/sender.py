@@ -185,7 +185,7 @@ def send_one(cdp_cli, sid, job_link: str, text: str) -> dict:
             "error": "页面未出现可确认的已发送消息，请人工核验，系统不会自动重试"}
 
 
-def send_batch() -> dict:
+def send_batch(job_keys=None) -> dict:
     """消费 approved 队列，全程护栏。返回执行报告。"""
     from . import greeting
     if halted_today():
@@ -204,7 +204,7 @@ def send_batch() -> dict:
     if login.get("logged_in") is not True:
         return {"ok": False, "error": "沟通号未登录：请到「账号管理」页打开登录页完成登录"}
 
-    batch = greeting.pending_batch()
+    batch = greeting.pending_batch(job_keys)
     sent, skipped, failed, needs_review = 0, [], [], []
     import websocket
 

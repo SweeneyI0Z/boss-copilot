@@ -125,13 +125,19 @@ def upsert_job(job: dict) -> tuple[str, bool]:
 
 def _record_run(kind: str, params: dict, stats: dict, data_source_at: str = ""):
     conn = get_db()
-    conn.execute(
+    run_id = conn.execute(
         "INSERT INTO collect_runs(kind, params, stats, started_at, finished_at, status, "
         "data_source_at, phase) VALUES(?,?,?,?,?,'succeeded',?,'finished')",
         (kind, json.dumps(params, ensure_ascii=False),
          json.dumps(stats, ensure_ascii=False), now_iso(), now_iso(),
-         data_source_at or None))
+         data_source_at or None)).lastrowid
+    ts = now_iso()
+    for job_key in dict.fromkeys(stats.get("job_keys") or []):
+        conn.execute(
+            "INSERT OR IGNORE INTO job_run_items(run_id,job_key,source,created_at) "
+            "VALUES(?,?,?,?)", (run_id, job_key, kind, ts))
     conn.commit()
+    return run_id
 
 
 # ── xlsx 导入（人工整理版：总览 + JD详情 + L1/L2 历史评分）──────────────
@@ -153,6 +159,7 @@ def import_xlsx(path: str) -> dict:
     l2_by_seq = {int(_num(r["序号"])): r for r in l2 if _num(r.get("序号")) is not None}
 
     created = updated = excluded_skipped = 0
+    touched = []
     for r in overview:
         seq = _num(r.get("序号"))
         if seq is None:
@@ -210,6 +217,7 @@ def import_xlsx(path: str) -> dict:
             excluded_skipped += 1
             continue
         job_key, is_new = upsert_job(job)
+        touched.append(job_key)
         imported_score = {
             field: job[field] for field in (
                 "l1_score", "l1_detail", "match_rough", "composite_rough",
@@ -232,7 +240,8 @@ def import_xlsx(path: str) -> dict:
 
     stats = {"total": created + updated, "created": created, "updated": updated,
              "excluded_skipped": excluded_skipped,
-             "with_jd": len(jd_by_seq), "with_l2": len(l2_by_seq)}
+             "with_jd": len(jd_by_seq), "with_l2": len(l2_by_seq),
+             "job_keys": list(dict.fromkeys(touched))}
     try:
         source_at = datetime.fromtimestamp(Path(path).stat().st_mtime).astimezone().isoformat(
             timespec="seconds")

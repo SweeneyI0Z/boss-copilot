@@ -1,4 +1,4 @@
-"""M10/M15 前端静态回归：信息架构、关键交互与无构建约束。"""
+"""M10/M16 前端静态回归：信息架构、真实 API 与无构建约束。"""
 import unittest
 from pathlib import Path
 
@@ -23,13 +23,21 @@ class FrontendWorkspaceTests(unittest.TestCase):
         self.assertIn("'/greetings': '/jobcard'", self.source)
         self.assertIn("'/interview': '/jobcard'", self.source)
 
-    def test_demo_frontend_never_calls_real_business_api(self):
-        self.assertNotIn("fetch(", self.source)
-        self.assertNotIn("/api/", self.source)
+    def test_frontend_bootstraps_from_real_business_api(self):
+        self.assertIn("fetch(path", self.source)
+        self.assertIn("const apiClient", self.source)
+        self.assertIn("async function bootstrap()", self.source)
+        self.assertIn("Promise.allSettled", self.source)
+        self.assertIn("部分数据加载失败", self.source)
+        self.assertIn("/api/dashboard", self.source)
+        self.assertIn("/api/jobs", self.source)
+        self.assertNotIn("INITIAL_JOBS", self.source)
+        self.assertNotIn("INITIAL_RUNS", self.source)
+        self.assertNotIn("INITIAL_RESUMES", self.source)
         self.assertNotIn("window.open", self.source)
         self.assertNotIn("alert(", self.source)
-        self.assertIn("演示数据", self.source)
-        self.assertIn("不连接真实账号", self.source)
+        self.assertNotIn("演示数据", self.source)
+        self.assertIn("本地后端已连接", self.source)
 
     def test_chat_and_standalone_greeting_views_are_removed(self):
         for symbol in ("MessagesView", "GreetingsView", "InterviewView"):
@@ -57,14 +65,17 @@ class FrontendWorkspaceTests(unittest.TestCase):
             self.assertIn(text, self.source)
         self.assertIn('v-model="selectedKeys"', self.source)
         self.assertIn("async function executeBatch", self.source)
-        self.assertIn("本次仅演示护栏确认", self.source)
+        self.assertIn("/api/greeting/send-batch", self.source)
+        self.assertIn("每日上限、随机间隔、同公司去重和风控熔断", self.source)
 
     def test_resume_and_collect_workflows_are_present(self):
         for text in ("Markdown 预览", "档案名称", "简历正文", "新建采集计划",
-                     "AI 自动生成", "手动选择", "采集完整JD（推荐）", "导出 Excel 兼容文件"):
+                     "AI 自动生成", "手动选择", "采集完整JD（推荐）", "导出 Excel"):
             self.assertIn(text, self.source)
         self.assertIn("DOMPurify.sanitize", self.source)
         self.assertIn("marked.parse", self.source)
+        self.assertIn("/api/resumes", self.source)
+        self.assertIn("/api/collect/run", self.source)
 
     def test_native_charts_and_responsive_constraints_are_present(self):
         self.assertIn("const SvgBars", self.source)

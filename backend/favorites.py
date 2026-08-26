@@ -434,13 +434,13 @@ def _mark_account_success(account: str) -> None:
     get_db().commit()
 
 
-def merge_account_hits(account: str, raw_jobs: list) -> dict:
+def merge_account_hits(account: str, raw_jobs: list, run_id: int = None) -> dict:
     """增量合并一个账号的收藏列表：upsert 岗位 + 记录账号命中 + 点亮新收藏。"""
     conn = get_db()
     ts = now_iso()
     stats = {"total": len(raw_jobs), "created": 0, "updated": 0, "invalid": 0,
              "excluded_skipped": 0, "new_hits": 0, "refreshed": 0,
-             "newly_favorited": 0}
+             "newly_favorited": 0, "job_keys": []}
     for raw in raw_jobs:
         job = importer._job_from_scraper(raw, "favorite", {})
         if not job["title"] or not job["company"]:
@@ -453,6 +453,11 @@ def merge_account_hits(account: str, raw_jobs: list) -> dict:
             stats["excluded_skipped"] += 1
             continue
         key, is_new = importer.upsert_job(job)
+        stats["job_keys"].append(key)
+        if run_id is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO job_run_items(run_id,job_key,source,created_at) "
+                "VALUES(?,?,?,?)", (int(run_id), key, f"favorite:{account}", ts))
         stats["created"] += is_new
         stats["updated"] += not is_new
         hit = conn.execute(
@@ -585,7 +590,7 @@ def _sync_worker(run_id: int, accounts: list, max_pages: int, reader_factory) ->
                     report["cancelled"] = True
                     break
                 report["files"][account] = _write_list_file(run_id, account, raw_jobs)
-                stats = merge_account_hits(account, raw_jobs)
+                stats = merge_account_hits(account, raw_jobs, run_id)
                 _mark_account_success(account)
                 report["accounts"].append({
                     "account": account, "label": label, "ok": True,

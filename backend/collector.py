@@ -7,6 +7,7 @@ import json
 import os
 import queue
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -56,9 +57,12 @@ DEFAULT_COLLECT_CONFIG = {
 }
 
 _state_lock = threading.RLock()
+_state_condition = threading.Condition(_state_lock)
 _state = {
     "running": False, "current": "", "phase": "", "log": [],
     "run_id": None, "cancel": False, "risk_signal": "",
+    "paused": False, "process": None, "pause_started_at": None,
+    "paused_seconds": 0.0, "worker_ident": None,
     "progress": {"list_total": 0, "list_completed": 0,
                  "detail_total": 0, "detail_completed": 0},
 }
@@ -68,6 +72,7 @@ def _state_snapshot() -> dict:
     return {
         "running": _state["running"], "current": _state["current"],
         "phase": _state["phase"], "run_id": _state["run_id"],
+        "paused": bool(_state["paused"]),
         "cancel_requested": bool(_state["cancel"]),
         "risk_signal": _state["risk_signal"],
         "progress": dict(_state["progress"]), "log": list(_state["log"][-40:]),
@@ -77,7 +82,7 @@ def _state_snapshot() -> dict:
 def status() -> dict:
     with _state_lock:
         result = _state_snapshot()
-    if not result["run_id"]:
+    if not result["run_id"] and not result["running"]:
         latest = get_db().execute(
             "SELECT run_id FROM collect_run_tasks WHERE list_file<>'' "
             "ORDER BY run_id DESC,id DESC LIMIT 1").fetchone()
@@ -86,8 +91,11 @@ def status() -> dict:
             result["phase"] = "finished"
     if result["run_id"]:
         run = get_db().execute(
-            "SELECT kind,status,stats,params,finished_at FROM collect_runs WHERE id=?",
+            "SELECT kind,status,stats,params,finished_at,paused "
+            "FROM collect_runs WHERE id=?",
             (result["run_id"],)).fetchone()
+        if run:
+            result["paused"] = bool(run["paused"])
         data_run_id = result["run_id"]
         if run and run["kind"] == "detail_retry":
             try:
@@ -166,12 +174,82 @@ def _log(message: str) -> None:
         _state["log"].append(f"{datetime.now().strftime('%H:%M:%S')} {message}")
 
 
-def _set_phase(run_id: int, phase: str) -> None:
-    get_db().execute("UPDATE collect_runs SET phase=? WHERE id=?", (phase, run_id))
-    get_db().commit()
-    with _state_lock:
+def _paused_duration_locked(now: float = None) -> float:
+    """返回本轮累计暂停时长；调用方必须持有 ``_state_lock``。"""
+    total = float(_state.get("paused_seconds") or 0.0)
+    started_at = _state.get("pause_started_at")
+    if _state.get("paused") and started_at is not None:
+        total += (time.monotonic() if now is None else now) - started_at
+    return total
+
+
+def _wait_for_resume() -> bool:
+    """暂停时阻塞当前阶段；返回 False 表示等待期间收到取消。"""
+    with _state_condition:
+        while (_state.get("running") and _state.get("paused")
+               and not _state.get("cancel")):
+            _state_condition.wait(timeout=0.5)
+        return not bool(_state.get("cancel"))
+
+
+def _signal_process(process, process_signal) -> bool:
+    """仅在 Unix 向仍存活的 scraper 子进程发送暂停或恢复信号。"""
+    if os.name != "posix" or process is None or process_signal is None:
+        return False
+    try:
+        if process.poll() is not None:
+            return False
+        process.send_signal(process_signal)
+        return True
+    except OSError:
+        return False
+
+
+def _register_process(process) -> bool:
+    with _state_condition:
+        if (not _state.get("running")
+                or _state.get("worker_ident") != threading.get_ident()):
+            return False
+        _state["process"] = process
+        if _state.get("paused"):
+            _signal_process(process, getattr(signal, "SIGSTOP", None))
+        return True
+
+
+def _clear_process(process) -> None:
+    with _state_condition:
+        if _state.get("process") is process:
+            _state["process"] = None
+
+
+def _cleanup_worker_control(run_id: int) -> None:
+    """工作线程退出时只清理属于本轮的内存控制句柄。"""
+    with _state_condition:
+        if _state.get("run_id") != run_id:
+            return
+        if _state.get("paused"):
+            _signal_process(_state.get("process"), getattr(signal, "SIGCONT", None))
+        _state["paused"] = False
+        _state["process"] = None
+        _state["pause_started_at"] = None
+        _state["paused_seconds"] = 0.0
+        _state["worker_ident"] = None
+        _state_condition.notify_all()
+
+
+def _set_phase(run_id: int, phase: str) -> bool:
+    """阶段切换与暂停原子互斥，避免暂停后继续进入下一阶段。"""
+    with _state_condition:
+        while (_state.get("running") and _state.get("paused")
+               and not _state.get("cancel")):
+            _state_condition.wait(timeout=0.5)
+        if _state.get("cancel"):
+            return False
+        get_db().execute("UPDATE collect_runs SET phase=? WHERE id=?", (phase, run_id))
+        get_db().commit()
         if _state["run_id"] == run_id:
             _state["phase"] = phase
+    return True
 
 
 def _set_progress(**values) -> None:
@@ -379,30 +457,42 @@ def _begin_run(kind: str, params: dict, tasks: list) -> int:
              "queued"))
         task["_task_id"] = row.lastrowid
     conn.commit()
-    with _state_lock:
+    with _state_condition:
         _state.update({"running": True, "current": kind, "phase": "list",
                        "log": [], "run_id": run_id, "cancel": False,
-                       "risk_signal": "",
+                       "risk_signal": "", "paused": False, "process": None,
+                       "pause_started_at": None, "paused_seconds": 0.0,
+                       "worker_ident": None,
                        "progress": {"list_total": len(tasks), "list_completed": 0,
                                     "detail_total": 0, "detail_completed": 0}})
+        _state_condition.notify_all()
     return run_id
 
 
 def _finish_run(run_id: int, report: dict, run_status: str,
                 data_source_at: str = "", risk_signal: str = "") -> None:
-    conn = get_db()
-    conn.execute(
-        "UPDATE collect_runs SET stats=?,finished_at=?,status=?,phase=?,"
-        "data_source_at=?,risk_signal=? WHERE id=?",
-        (json.dumps(report, ensure_ascii=False), now_iso(), run_status, "finished",
-         data_source_at or None, risk_signal, run_id))
-    conn.commit()
-    with _state_lock:
+    with _state_condition:
+        while (_state.get("run_id") == run_id and _state.get("running")
+               and _state.get("paused") and not _state.get("cancel")):
+            _state_condition.wait(timeout=0.5)
+        conn = get_db()
+        conn.execute(
+            "UPDATE collect_runs SET stats=?,finished_at=?,status=?,phase=?,"
+            "data_source_at=?,risk_signal=?,paused=0 WHERE id=?",
+            (json.dumps(report, ensure_ascii=False), now_iso(), run_status, "finished",
+             data_source_at or None, risk_signal, run_id))
+        conn.commit()
         if _state["run_id"] == run_id:
             _state["running"] = False
             _state["current"] = ""
             _state["phase"] = "finished"
             _state["risk_signal"] = risk_signal
+            _state["paused"] = False
+            _state["process"] = None
+            _state["pause_started_at"] = None
+            _state["paused_seconds"] = 0.0
+            _state["worker_ident"] = None
+            _state_condition.notify_all()
 
 
 def _result_path(run_id: int, task_id: int, company: bool = False) -> Path:
@@ -463,6 +553,7 @@ def _run_scraper_streamed(command: list, timeout: int, env: dict,
     proc = subprocess.Popen(
         command, cwd=str(SCRAPER_DIR), stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+    controlled = _register_process(proc)
     lines = []
     output_queue = queue.Queue()
     finished = object()
@@ -477,12 +568,22 @@ def _run_scraper_streamed(command: list, timeout: int, env: dict,
 
     reader = threading.Thread(target=read_output, daemon=True)
     reader.start()
-    deadline = time.monotonic() + timeout
+    started_at = time.monotonic()
+    with _state_lock:
+        pause_baseline = _paused_duration_locked(started_at) if controlled else 0.0
     signature = initial_signature
     stream_finished = False
     try:
         while not stream_finished:
-            if time.monotonic() >= deadline:
+            # SIGSTOP 期间不消费 scraper 超时预算；取消只在当前子进程结束后生效。
+            if controlled:
+                _wait_for_resume()
+            with _state_lock:
+                now = time.monotonic()
+                paused_delta = (_paused_duration_locked(now) - pause_baseline
+                                if controlled else 0.0)
+                timed_out = now >= started_at + timeout + paused_delta
+            if timed_out:
                 proc.kill()
                 proc.wait()
                 raise subprocess.TimeoutExpired(command, timeout,
@@ -526,6 +627,8 @@ def _run_scraper_streamed(command: list, timeout: int, env: dict,
         reader.join(timeout=1)
         if proc.stdout:
             proc.stdout.close()
+        if controlled:
+            _clear_process(proc)
 
 
 _RISK_PATTERNS = (
@@ -600,12 +703,20 @@ def _import_partial(path: Path) -> dict:
 
 
 def _wait_between_tasks() -> bool:
-    deadline = time.monotonic() + ITEM_GAP_SEC
-    while time.monotonic() < deadline:
+    started_at = time.monotonic()
+    with _state_lock:
+        pause_baseline = _paused_duration_locked(started_at)
+    while True:
+        _wait_for_resume()
         if _is_cancelled():
             return False
-        time.sleep(min(0.5, max(0, deadline - time.monotonic())))
-    return True
+        with _state_lock:
+            now = time.monotonic()
+            paused_delta = _paused_duration_locked(now) - pause_baseline
+            remaining = started_at + ITEM_GAP_SEC + paused_delta - now
+        if remaining <= 0:
+            return True
+        time.sleep(min(0.5, remaining))
 
 
 def _all_missing_jd(keys: set) -> set:
@@ -733,6 +844,9 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
     risk_signal = ""
     account = ""
     try:
+        with _state_condition:
+            if _state.get("run_id") == run_id:
+                _state["worker_ident"] = threading.get_ident()
         account = cdp.account_for("collect")
         account_label = cdp.config.ACCOUNTS[account]["label"]
         cdp_port = cdp.config.ACCOUNTS[account]["cdp_port"]
@@ -744,7 +858,7 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
 
         for index, task in enumerate(tasks):
             task_id = task["_task_id"]
-            if _is_cancelled():
+            if not _wait_for_resume() or _is_cancelled():
                 report["cancelled"] = True
                 sync.update_run_task(task_id, "cancelled", finished=True)
                 continue
@@ -812,6 +926,7 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
                 if not _wait_between_tasks():
                     report["cancelled"] = True
 
+        _wait_for_resume()
         if risk_signal or _is_cancelled():
             report["cancelled"] = report["cancelled"] or _is_cancelled()
             for task_id in successful_task_ids:
@@ -826,20 +941,28 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
                 if row and row["status"] == "queued":
                     sync.update_run_task(task["_task_id"], "cancelled", finished=True)
         elif fetch_details and successful_files:
-            _set_phase(run_id, "details")
-            detail_source, detail_risk = _run_detail_phase(
-                run_id, successful_files, successful_task_ids, cdp_port, report)
-            if detail_source:
-                source_times.append(detail_source)
-            if detail_risk:
-                risk_signal = detail_risk
-                _mark_account_failure(account, {"kind": "risk", "risk": True,
-                                                "message": detail_risk})
-                report["partial"] = True
+            if not _set_phase(run_id, "details"):
+                report["cancelled"] = True
+                for task_id in successful_task_ids:
+                    sync.update_run_task(
+                        task_id, "partial", error="采集已取消，未执行详情阶段",
+                        finished=True)
+            else:
+                detail_source, detail_risk = _run_detail_phase(
+                    run_id, successful_files, successful_task_ids, cdp_port, report)
+                if detail_source:
+                    source_times.append(detail_source)
+                if detail_risk:
+                    risk_signal = detail_risk
+                    _mark_account_failure(account, {"kind": "risk", "risk": True,
+                                                    "message": detail_risk})
+                    report["partial"] = True
         else:
             for task_id in successful_task_ids:
                 sync.update_run_task(task_id, "succeeded", finished=True)
 
+        if not _wait_for_resume():
+            report["cancelled"] = True
         if sync_mode and not risk_signal and not report["cancelled"]:
             inactive = sync.apply_hr_inactive()
             report["hr_inactive"] = inactive
@@ -858,7 +981,7 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
         _log("采集结束" if run_status == "succeeded" else f"采集结束: {run_status}")
         _finish_run(run_id, report, run_status,
                     max(source_times) if source_times else "", risk_signal)
-    except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as error:
+    except Exception as error:
         failure = classify_failure(error)
         if account:
             _mark_account_failure(account, failure)
@@ -869,6 +992,8 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
                                  error=failure["message"], finished=True)
         _finish_run(run_id, report, "failed", "",
                     failure["message"] if failure["risk"] else "")
+    finally:
+        _cleanup_worker_control(run_id)
 
 
 def start(kind: str, tasks: list, sync_mode: bool = False,
@@ -884,19 +1009,30 @@ def start(kind: str, tasks: list, sync_mode: bool = False,
         if _state["running"]:
             return {"ok": False, "error": "已有采集任务在运行",
                     "status": _state_snapshot()}
-        _state["running"] = True
+        _state.update({"running": True, "current": "启动中", "phase": "starting",
+                       "run_id": None, "cancel": False, "paused": False,
+                       "process": None, "pause_started_at": None,
+                       "paused_seconds": 0.0, "worker_ident": None})
     try:
         run_id = _begin_run(kind, {"tasks": normalized, "sync": sync_mode,
                                    "fetch_details": fetch_details,
                                    "resume_id": int(resume_id or 0)}, normalized)
     except Exception:
-        with _state_lock:
-            _state["running"] = False
+        with _state_condition:
+            _state.update({"running": False, "current": "", "phase": "",
+                           "run_id": None, "paused": False, "process": None,
+                           "pause_started_at": None, "paused_seconds": 0.0,
+                           "worker_ident": None})
+            _state_condition.notify_all()
         raise
     thread = threading.Thread(
         target=_worker, args=(run_id, kind, normalized, sync_mode, fetch_details),
         daemon=True)
-    thread.start()
+    try:
+        thread.start()
+    except Exception as error:
+        _finish_run(run_id, {"error": f"后台线程启动失败: {error}"}, "failed")
+        raise
     return {"ok": True, "run_id": run_id}
 
 
@@ -912,22 +1048,97 @@ def start_config(body: dict, resume_id=None, sync_mode: bool = False) -> dict:
 
 
 def cancel() -> dict:
-    with _state_lock:
+    with _state_condition:
         if not _state["running"]:
             return {"ok": True, "running": False}
+        if not _state.get("run_id"):
+            return {"ok": False, "running": True, "paused": False,
+                    "error": "采集正在启动，请稍后再取消"}
+        was_paused = bool(_state.get("paused"))
+        if was_paused:
+            now = time.monotonic()
+            started_at = _state.get("pause_started_at")
+            if started_at is not None:
+                _state["paused_seconds"] = float(
+                    _state.get("paused_seconds") or 0.0) + now - started_at
+            _signal_process(_state.get("process"), getattr(signal, "SIGCONT", None))
+            _state["paused"] = False
+            _state["pause_started_at"] = None
         _state["cancel"] = True
         run_id = _state["run_id"]
-    get_db().execute(
-        "UPDATE collect_runs SET cancel_requested=1 WHERE id=?", (run_id,))
-    get_db().commit()
-    _log("已请求取消；当前子进程结束后停止")
-    return {"ok": True, "running": True, "run_id": run_id}
+        get_db().execute(
+            "UPDATE collect_runs SET cancel_requested=1,paused=0 WHERE id=?", (run_id,))
+        get_db().commit()
+        _state_condition.notify_all()
+    message = ("已恢复暂停中的子进程并请求取消；当前子进程结束后停止"
+               if was_paused else "已请求取消；当前子进程结束后停止")
+    _log(message)
+    return {"ok": True, "running": True, "paused": False, "run_id": run_id}
+
+
+def pause() -> dict:
+    """暂停当前采集，并在 Unix 上真实挂起正在运行的 scraper 子进程。"""
+    with _state_condition:
+        if not _state["running"]:
+            return {"ok": True, "running": False, "paused": False}
+        run_id = _state["run_id"]
+        if not run_id:
+            return {"ok": False, "running": True, "paused": False,
+                    "error": "采集正在启动，请稍后再暂停"}
+        if _state.get("cancel"):
+            return {"ok": False, "running": True, "paused": False,
+                    "cancel_requested": True, "run_id": run_id,
+                    "error": "采集已请求取消，不能再暂停"}
+        if not _state.get("paused"):
+            _state["paused"] = True
+            _state["pause_started_at"] = time.monotonic()
+            _signal_process(_state.get("process"), getattr(signal, "SIGSTOP", None))
+            get_db().execute("UPDATE collect_runs SET paused=1 WHERE id=?", (run_id,))
+            get_db().commit()
+            changed = True
+        else:
+            changed = False
+    if changed:
+        _log("采集已暂停")
+    return {"ok": True, "running": True, "paused": True, "run_id": run_id}
+
+
+def resume() -> dict:
+    """继续当前采集，并在 Unix 上恢复被挂起的 scraper 子进程。"""
+    with _state_condition:
+        if not _state["running"]:
+            return {"ok": True, "running": False, "paused": False}
+        run_id = _state["run_id"]
+        if not run_id:
+            return {"ok": False, "running": True, "paused": False,
+                    "error": "采集正在启动，请稍后再继续"}
+        if _state.get("paused"):
+            now = time.monotonic()
+            started_at = _state.get("pause_started_at")
+            if started_at is not None:
+                _state["paused_seconds"] = float(
+                    _state.get("paused_seconds") or 0.0) + now - started_at
+            _signal_process(_state.get("process"), getattr(signal, "SIGCONT", None))
+            _state["paused"] = False
+            _state["pause_started_at"] = None
+            get_db().execute("UPDATE collect_runs SET paused=0 WHERE id=?", (run_id,))
+            get_db().commit()
+            _state_condition.notify_all()
+            changed = True
+        else:
+            changed = False
+    if changed:
+        _log("采集已继续")
+    return {"ok": True, "running": True, "paused": False, "run_id": run_id}
 
 
 def _retry_worker(run_id: int, source_run_id: int, task: dict) -> None:
     report = {"source_run_id": source_run_id, "retry": True}
     account = ""
     try:
+        with _state_condition:
+            if _state.get("run_id") == run_id:
+                _state["worker_ident"] = threading.get_ident()
         account = cdp.account_for("collect")
         port = cdp.config.ACCOUNTS[account]["cdp_port"]
         launched = cdp.launch(account)
@@ -939,11 +1150,15 @@ def _retry_worker(run_id: int, source_run_id: int, task: dict) -> None:
         files = [Path(row["list_file"]) for row in rows if Path(row["list_file"]).exists()]
         if not files:
             raise ValueError("原采集任务没有可用列表文件")
-        _set_phase(run_id, "details")
+        if not _set_phase(run_id, "details"):
+            report["cancelled"] = True
+            sync.update_run_task(task["_task_id"], "cancelled", finished=True)
+            _finish_run(run_id, report, "cancelled")
+            return
         _, risk = _run_detail_phase(run_id, files, [task["_task_id"]], port, report)
         status_value = "partial" if report.get("details", {}).get("error") else "succeeded"
         _finish_run(run_id, report, status_value, "", risk)
-    except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as error:
+    except Exception as error:
         failure = classify_failure(error)
         if account:
             _mark_account_failure(account, failure)
@@ -952,6 +1167,8 @@ def _retry_worker(run_id: int, source_run_id: int, task: dict) -> None:
                              finished=True)
         _finish_run(run_id, report, "failed", "",
                     failure["message"] if failure["risk"] else "")
+    finally:
+        _cleanup_worker_control(run_id)
 
 
 def retry_missing(source_run_id: int = None) -> dict:
@@ -962,24 +1179,45 @@ def retry_missing(source_run_id: int = None) -> dict:
         if _state["running"]:
             return {"ok": False, "error": "已有采集任务在运行",
                     "status": _state_snapshot()}
-        _state["running"] = True
+        _state.update({"running": True, "current": "启动中", "phase": "starting",
+                       "run_id": None, "cancel": False, "paused": False,
+                       "process": None, "pause_started_at": None,
+                       "paused_seconds": 0.0, "worker_ident": None})
     if source_run_id is None:
         row = get_db().execute(
             "SELECT run_id FROM collect_run_tasks WHERE list_file<>'' "
             "ORDER BY run_id DESC LIMIT 1").fetchone()
         source_run_id = row["run_id"] if row else None
     if not source_run_id:
-        with _state_lock:
-            _state["running"] = False
+        with _state_condition:
+            _state.update({"running": False, "current": "", "phase": "",
+                           "run_id": None, "paused": False, "process": None,
+                           "pause_started_at": None, "paused_seconds": 0.0,
+                           "worker_ident": None})
+            _state_condition.notify_all()
         return {"ok": False, "error": "没有可重试的采集记录"}
-    task = _normalize_task({"type": "company", "brand_id": f"retry-{source_run_id}",
-                            "name": "仅补缺失JD", "pages": 1})
-    task["kind"] = "detail_retry"
-    task["task_key"] = f"detail-retry:{source_run_id}"
-    run_id = _begin_run("detail_retry", {"source_run_id": source_run_id}, [task])
+    try:
+        task = _normalize_task({"type": "company", "brand_id": f"retry-{source_run_id}",
+                                "name": "仅补缺失JD", "pages": 1})
+        task["kind"] = "detail_retry"
+        task["task_key"] = f"detail-retry:{source_run_id}"
+        run_id = _begin_run("detail_retry", {"source_run_id": source_run_id}, [task])
+    except Exception:
+        with _state_condition:
+            _state.update({"running": False, "current": "", "phase": "",
+                           "run_id": None, "paused": False, "process": None,
+                           "pause_started_at": None, "paused_seconds": 0.0,
+                           "worker_ident": None})
+            _state_condition.notify_all()
+        raise
     thread = threading.Thread(target=_retry_worker,
                               args=(run_id, int(source_run_id), task), daemon=True)
-    thread.start()
+    try:
+        thread.start()
+    except Exception as error:
+        _finish_run(run_id, {"source_run_id": source_run_id,
+                             "error": f"后台线程启动失败: {error}"}, "failed")
+        raise
     return {"ok": True, "run_id": run_id, "source_run_id": int(source_run_id)}
 
 

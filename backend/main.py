@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -26,8 +26,8 @@ def _startup():
     init_db()
     # 上次进程退出时遗留的运行中任务不可能继续，明确标为中断。
     get_db().execute(
-        "UPDATE collect_runs SET status='interrupted',finished_at=?,phase='finished' "
-        "WHERE finished_at IS NULL AND status='running'", (now_iso(),))
+        "UPDATE collect_runs SET status='interrupted',finished_at=?,phase='finished',paused=0 "
+        "WHERE finished_at IS NULL AND status IN ('running','paused')", (now_iso(),))
     get_db().commit()
 
 
@@ -303,6 +303,26 @@ def job_headhunter(job_key: str, body: dict):
         raise HTTPException(400, str(e))
 
 
+@app.get("/api/jobs/{job_key}/workflow")
+def job_workflow_get(job_key: str, resume_id: Optional[int] = None):
+    from . import workflow
+    try:
+        return workflow.get_state(job_key, resume_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.put("/api/jobs/{job_key}/workflow")
+def job_workflow_update(job_key: str, body: dict):
+    from . import workflow
+    try:
+        return workflow.set_stage(
+            job_key, str(body.get("stage", "")), bool(body.get("enabled", True)),
+            body.get("resume_id"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/applications")
 def applications_list(status: str = "", resume_id: Optional[int] = None,
                       limit: int = 100, offset: int = 0):
@@ -397,13 +417,13 @@ def list_jobs(status: Optional[str] = "active", q: str = "", source: str = "",
               keyword: str = "", favorite: str = "all", headhunter: str = "all",
               resume_id: Optional[int] = None, sort: str = "composite",
               limit: int = 50, offset: int = 0):
-    from . import resumes
+    from . import collection_runs, resumes, workflow
     try:
         resume = resumes.get_default_resume() if resume_id is None else \
             resumes.get_resume(resume_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    where, args = ["1=1"], []
+    where, args = ["1=1", collection_runs.visible_jobs_clause("j")], []
     if status in (None, "", "active"):
         where.append("j.status='active'")
     elif status == "archived":
@@ -420,8 +440,9 @@ def list_jobs(status: Optional[str] = "active", q: str = "", source: str = "",
         where.append("(j.title LIKE ? OR j.company LIKE ?)")
         args += [f"%{q}%", f"%{q}%"]
     if keyword:
-        where.append("EXISTS (SELECT 1 FROM job_collection_hits h WHERE h.job_key=j.job_key "
-                     "AND h.keyword LIKE ? AND h.is_active=1)")
+        where.append("EXISTS (SELECT 1 FROM job_collection_hits h "
+                     "JOIN collect_runs hr ON hr.id=h.run_id AND hr.enabled=1 "
+                     "WHERE h.job_key=j.job_key AND h.keyword LIKE ? AND h.is_active=1)")
         args.append(f"%{keyword}%")
     if favorite == "only":
         where.append("j.favorite_at IS NOT NULL")
@@ -478,8 +499,26 @@ def list_jobs(status: Optional[str] = "active", q: str = "", source: str = "",
         item["is_favorite"] = bool(item.get("favorite_at"))
         item["effective_headhunter"] = bool(item.get("effective_headhunter"))
         items.append(item)
+    keys = [item["job_key"] for item in items]
+    states = workflow.states_for_jobs(keys, resume["id"])
+    details = {}
+    if keys:
+        marks = ",".join("?" for _ in keys)
+        details = {row["job_key"]: str(row["jd"] or "") for row in conn.execute(
+            f"SELECT job_key,jd FROM job_details WHERE job_key IN ({marks})", keys)}
+    welfare_words = ("五险一金", "年终奖", "带薪年假", "补充医疗", "餐补", "房补",
+                     "住房补贴", "交通补贴", "股票期权", "定期体检", "节日福利",
+                     "员工旅游", "弹性工作")
+    for item in items:
+        jd = details.get(item["job_key"], "")
+        text = f"{item.get('title', '')}\n{jd}"
+        item["has_weekend"] = "双休" in text
+        item["has_benefits"] = any(word in text for word in welfare_words)
+        item["workflow"] = states.get(item["job_key"], {})
+        item.update(states.get(item["job_key"], {}))
     counts = conn.execute(
-        "SELECT status, COUNT(*) c FROM jobs GROUP BY status").fetchall()
+        "SELECT status, COUNT(*) c FROM jobs j WHERE "
+        f"{collection_runs.visible_jobs_clause('j')} GROUP BY status").fetchall()
     return {"total": total, "items": items,
             "status_counts": {r["status"]: r["c"] for r in counts},
             "resume_id": resume["id"], "resume_revision": resume["revision"]}
@@ -487,7 +526,7 @@ def list_jobs(status: Optional[str] = "active", q: str = "", source: str = "",
 
 @app.get("/api/jobs/{job_key}")
 def job_detail(job_key: str, resume_id: Optional[int] = None):
-    from . import applications, resumes
+    from . import applications, resumes, workflow
     conn = get_db()
     job = conn.execute("SELECT * FROM jobs WHERE job_key=?", (job_key,)).fetchone()
     if job is None:
@@ -530,6 +569,14 @@ def job_detail(job_key: str, resume_id: Optional[int] = None):
     out["headhunter_manual"] = (None if out.get("headhunter_override") is None
                                 else bool(out.get("headhunter_override")))
     out["application"] = applications.get_application(job_key, resume["id"])
+    out["workflow"] = workflow.get_state(job_key, resume["id"])
+    out.update({key: out["workflow"][key]
+                for key in ("greeted", "applied", "interviewed")})
+    text = f"{out.get('title', '')}\n{out.get('jd', '')}"
+    out["has_weekend"] = "双休" in text
+    out["has_benefits"] = any(word in text for word in (
+        "五险一金", "年终奖", "带薪年假", "补充医疗", "餐补", "房补", "住房补贴",
+        "交通补贴", "股票期权", "定期体检", "节日福利", "员工旅游", "弹性工作"))
     return out
 
 
@@ -579,16 +626,44 @@ def favorites_sync_retry_details(body: dict = None):
 
 
 @app.get("/api/runs")
-def runs():
-    rows = get_db().execute(
-        "SELECT * FROM collect_runs ORDER BY id DESC LIMIT 20").fetchall()
-    out = []
-    for r in rows:
-        d = dict(r)
-        d["params"] = json.loads(d["params"] or "{}")
-        d["stats"] = json.loads(d["stats"] or "{}")
-        out.append(d)
-    return out
+def runs(limit: int = 100):
+    from . import collection_runs, collector
+    items = collection_runs.list_runs(limit)
+    current = collector.status()
+    for item in items:
+        if item["id"] != current.get("run_id"):
+            continue
+        item["runtime"] = {
+            "running": bool(current.get("running")),
+            "paused": bool(current.get("paused")),
+            "phase": current.get("phase", ""),
+            "current": current.get("current", ""),
+            "progress": current.get("progress") or {},
+        }
+    return items
+
+
+@app.put("/api/runs/{run_id}/enabled")
+def run_enabled(run_id: int, body: dict):
+    from . import collection_runs
+    try:
+        return collection_runs.set_enabled(run_id, bool(body.get("enabled", True)))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/api/runs/{run_id}/export")
+def run_export(run_id: int):
+    from . import collection_runs
+    try:
+        output = collection_runs.export_xlsx(run_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="collect-run-{run_id}.xlsx"'},
+    )
 
 
 # ── 评分 ────────────────────────────────────────────────────────
@@ -747,6 +822,24 @@ def collect_cancel():
     return collector.cancel()
 
 
+@app.post("/api/collect/pause")
+def collect_pause():
+    from . import collector
+    result = collector.pause()
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "采集暂停失败"))
+    return result
+
+
+@app.post("/api/collect/resume")
+def collect_resume():
+    from . import collector
+    result = collector.resume()
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "采集继续失败"))
+    return result
+
+
 @app.post("/api/collect/retry-details")
 def collect_retry_details(body: dict = None):
     from . import collector
@@ -840,7 +933,7 @@ def greeting_skip(gid: int):
 
 
 @app.post("/api/greeting/send-batch")
-def greeting_send_batch():
+def greeting_send_batch(body: dict = None):
     """后台线程发送 approved 批次（沟通号，全护栏）。"""
     from . import sender
     import threading
@@ -851,7 +944,7 @@ def greeting_send_batch():
 
     def _run():
         try:
-            _send_state.result = sender.send_batch()
+            _send_state.result = sender.send_batch((body or {}).get("job_keys"))
         except Exception as e:  # 线程兜底：任何异常都可见
             _send_state.result = {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]}
         _send_state.running = False
