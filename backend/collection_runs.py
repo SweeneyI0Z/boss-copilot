@@ -1,5 +1,6 @@
 """采集历史的来源归属、启停、删除和导出。"""
 import json
+import re
 from io import BytesIO
 from pathlib import Path
 
@@ -29,6 +30,22 @@ def _count_from_stats(stats: dict) -> int:
         if count:
             return count
     return 0
+
+
+def _legacy_config_name(conn, item: dict) -> str:
+    """给 M18 之前没有 params.name 的配置采集补可读名称。"""
+    if item.get("kind") != "config":
+        return ""
+    try:
+        resume_id = int((item.get("params") or {}).get("resume_id") or 0)
+    except (TypeError, ValueError):
+        resume_id = 0
+    row = conn.execute(
+        "SELECT name FROM resumes WHERE id=?", (resume_id,)).fetchone() if resume_id else None
+    resume_name = str(row["name"] if row else "未命名简历").strip()
+    resume_name = re.sub(r"[\r\n\t/\\]+", "-", resume_name)[:20] or "未命名简历"
+    date_text = str(item.get("started_at") or "")[:10].replace("-", "") or "未知日期"
+    return f"{date_text}-{resume_name}-{int(item['id']):04d}"
 
 
 def _insert_relations(conn, run_id: int, job_keys, source: str,
@@ -240,9 +257,14 @@ def set_enabled(run_id: int, enabled: bool) -> dict:
 
 def list_runs(limit: int = 100) -> list[dict]:
     recover_legacy_ownership()
-    rows = get_db().execute(
-        "SELECT r.*,COUNT(DISTINCT m.job_key) item_count FROM collect_runs r "
-        "LEFT JOIN job_run_items m ON m.run_id=r.id GROUP BY r.id "
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT r.*,COUNT(DISTINCT m.job_key) item_count,"
+        "COUNT(DISTINCT CASE WHEN length(trim(replace(replace(replace(replace("
+        "COALESCE(d.jd,''),char(9),''),char(10),''),char(13),''),'　',''))) > 0 "
+        "THEN m.job_key END) with_jd_count FROM collect_runs r "
+        "LEFT JOIN job_run_items m ON m.run_id=r.id "
+        "LEFT JOIN job_details d ON d.job_key=m.job_key GROUP BY r.id "
         "ORDER BY r.id DESC LIMIT ?", (max(1, min(int(limit), 500)),)).fetchall()
     result = []
     for row in rows:
@@ -259,7 +281,18 @@ def list_runs(limit: int = 100) -> list[dict]:
         item["result_count"] = item["owned_item_count"] or int(
             stats.get("total") or stats.get("touched") or 0)
         item["item_count"] = item["result_count"]
+        item["plan_name"] = str(
+            item["params"].get("name") or _legacy_config_name(conn, item))
         item["has_source_ownership"] = item["owned_item_count"] > 0
+        item["completeness_known"] = bool(
+            item["owned_item_count"] > 0 or item["result_count"] == 0)
+        if item["completeness_known"]:
+            item["with_jd_count"] = int(item.get("with_jd_count") or 0)
+            item["list_only_count"] = max(
+                0, item["owned_item_count"] - item["with_jd_count"])
+        else:
+            item["with_jd_count"] = None
+            item["list_only_count"] = None
         item["can_export"] = item["owned_item_count"] > 0
         result.append(item)
     return result

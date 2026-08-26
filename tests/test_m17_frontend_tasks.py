@@ -77,7 +77,7 @@ class FrontendTaskContractTests(unittest.TestCase):
                       "if (job.interviewed) return '已面试'",
                       "if (job.applied) return '已投递'",
                       "if (job.contacted) return '已打招呼'",
-                      "return '待开始'"):
+                      "return job.favorite ? '待开始' : ''"):
             self.assertIn(stage, self.app)
         self.assertRegex(
             self.css,
@@ -117,7 +117,7 @@ class FrontendTaskContractTests(unittest.TestCase):
         self.assertIn("if (type === 'analysis' || type === 'greeting')", batch)
         self.assertIn(
             "enqueueAi('workbench', type, "
-            "targets.map(job => job.job_key), true)", batch)
+            "targets.map(job => job.job_key))", batch)
         self.assertNotIn("await generateAnalysis(job, true)", batch)
         self.assertNotIn("await generateGreeting(job, true)", batch)
         self.assertIn(

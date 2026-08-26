@@ -56,6 +56,18 @@ DEFAULT_COLLECT_CONFIG = {
     "fetch_details": True,
 }
 
+
+def _new_progress() -> dict:
+    """构造兼容旧字段的岗位级采集进度。"""
+    return {
+        "list_total": 0, "list_completed": 0,
+        "detail_total": 0, "detail_completed": 0,
+        "jobs_discovered": 0, "jobs_total": 0,
+        "jd_total": 0, "jd_completed": 0,
+        "percent": 0, "eta_seconds": None,
+    }
+
+
 _state_lock = threading.RLock()
 _state_condition = threading.Condition(_state_lock)
 _state = {
@@ -63,9 +75,64 @@ _state = {
     "run_id": None, "cancel": False, "risk_signal": "",
     "paused": False, "process": None, "pause_started_at": None,
     "paused_seconds": 0.0, "worker_ident": None,
-    "progress": {"list_total": 0, "list_completed": 0,
-                 "detail_total": 0, "detail_completed": 0},
+    "fetch_details": False,
+    "phase_started_at": None, "phase_pause_baseline": 0.0,
+    "progress": _new_progress(),
 }
+
+
+def _estimate_eta(completed: int, total: int, elapsed: float):
+    """按当前阶段观察速率估算剩余秒数；无完成样本时不猜。"""
+    completed = max(0, int(completed or 0))
+    total = max(0, int(total or 0))
+    if total <= completed:
+        return 0 if total else None
+    if completed <= 0 or elapsed is None or elapsed <= 0:
+        return None
+    return max(0, int(round((total - completed) * float(elapsed) / completed)))
+
+
+def _phase_elapsed_locked(now: float = None):
+    started_at = _state.get("phase_started_at")
+    if started_at is None:
+        return None
+    now = time.monotonic() if now is None else float(now)
+    baseline = float(_state.get("phase_pause_baseline") or 0.0)
+    paused = max(0.0, _paused_duration_locked(now) - baseline)
+    return max(0.0, now - float(started_at) - paused)
+
+
+def _progress_snapshot_locked(now: float = None) -> dict:
+    progress = _new_progress()
+    progress.update(_state.get("progress") or {})
+    phase = _state.get("phase") or ""
+    if phase == "list":
+        completed = progress["list_completed"]
+        total = progress["list_total"]
+        ratio = min(1.0, completed / total) if total else 0.0
+        progress["percent"] = int(round(
+            ratio * (50 if _state.get("fetch_details") else 100)))
+    elif phase == "details":
+        completed = progress["detail_completed"]
+        total = progress["detail_total"]
+        jd_completed = max(0, int(progress.get("jd_completed") or 0))
+        jd_total = max(0, int(progress.get("jd_total") or 0))
+        ratio = min(1.0, jd_completed / jd_total) if jd_total else 1.0
+        progress["percent"] = min(100, 50 + int(round(ratio * 50)))
+    elif phase == "finished":
+        progress["eta_seconds"] = None
+        progress["percent"] = max(0, min(100, int(progress.get("percent") or 0)))
+        return progress
+    else:
+        progress["percent"] = 0
+        progress["eta_seconds"] = None
+        return progress
+
+    completed = max(0, int(completed or 0))
+    total = max(0, int(total or 0))
+    progress["eta_seconds"] = _estimate_eta(
+        completed, total, _phase_elapsed_locked(now))
+    return progress
 
 
 def _state_snapshot() -> dict:
@@ -75,8 +142,114 @@ def _state_snapshot() -> dict:
         "paused": bool(_state["paused"]),
         "cancel_requested": bool(_state["cancel"]),
         "risk_signal": _state["risk_signal"],
-        "progress": dict(_state["progress"]), "log": list(_state["log"][-40:]),
+        "progress": _progress_snapshot_locked(), "log": list(_state["log"][-40:]),
     }
+
+
+def _job_completeness(keys) -> tuple[set, set]:
+    """返回仍可用岗位集合及其中已具备非空 JD 的岗位集合。"""
+    wanted = {str(key) for key in (keys or []) if key}
+    if not wanted:
+        return set(), set()
+    conn = get_db()
+    eligible = set()
+    complete = set()
+    ordered = sorted(wanted)
+    for offset in range(0, len(ordered), 500):
+        chunk = ordered[offset:offset + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT j.job_key,j.status,d.jd FROM jobs j LEFT JOIN job_details d "
+            f"ON d.job_key=j.job_key WHERE j.job_key IN ({placeholders})", chunk)
+        for row in rows:
+            if row["status"] == "excluded":
+                continue
+            eligible.add(row["job_key"])
+            if str(row["jd"] or "").strip():
+                complete.add(row["job_key"])
+    return eligible, complete
+
+
+def _run_job_keys(run_id: int) -> set:
+    return {row["job_key"] for row in get_db().execute(
+        "SELECT job_key FROM job_run_items WHERE run_id=?", (int(run_id),))}
+
+
+def _attach_run_jobs(run_id: int, job_keys, source: str) -> None:
+    """即时记录本轮已落库岗位；来源快照是否成功仍由 sync 单独判断。"""
+    keys = list(dict.fromkeys(str(key) for key in (job_keys or []) if key))
+    if not keys:
+        return
+    conn = get_db()
+    ts = now_iso()
+    conn.executemany(
+        "INSERT OR IGNORE INTO job_run_items(run_id,job_key,source,created_at) "
+        "VALUES(?,?,?,?)", [(int(run_id), key, source, ts) for key in keys])
+    conn.commit()
+
+
+def _finished_progress(run, tasks: list, data_run_id: int) -> tuple[dict, int]:
+    """从持久化数据恢复已结束任务的岗位级进度。"""
+    list_tasks = [task for task in tasks if task.get("kind") != "detail_retry"]
+    list_completed = sum(task.get("status") not in ("queued", "running")
+                         for task in list_tasks)
+    keys = _run_job_keys(data_run_id)
+    if not keys and any(task.get("list_file") for task in list_tasks):
+        # 兼容升级前的部分采集：只读明确保存过的列表文件，不猜其他目录。
+        for task in list_tasks:
+            path = Path(task.get("list_file") or "")
+            if not path.is_file():
+                continue
+            try:
+                payload = _read_list(path)
+            except RuntimeError:
+                continue
+            for raw in payload.get("jobs", []):
+                keys.add(importer.job_key_from(
+                    raw.get("job_link", "") or raw.get("link", ""),
+                    raw.get("title", ""),
+                    raw.get("boss_name", "") or raw.get("company", ""),
+                    raw.get("salary", "")))
+    eligible, complete = _job_completeness(keys)
+    missing_count = len(eligible - complete)
+    try:
+        stats = json.loads(run["stats"] or "{}") if run else {}
+    except (json.JSONDecodeError, TypeError):
+        stats = {}
+    try:
+        params = json.loads(run["params"] or "{}") if run else {}
+    except (json.JSONDecodeError, TypeError):
+        params = {}
+    fetch_details = bool(params.get("fetch_details", True))
+    details = stats.get("details") or {}
+    details_attempted = "requested" in details
+    partial = details.get("partial") or {}
+    detail_total = int(details.get("requested") or 0)
+    detail_completed = int(details.get(
+        "updated", partial.get("updated", 0)) or 0)
+    if not detail_total and missing_count:
+        detail_total = missing_count
+    status_value = str(run["status"] or "") if run else ""
+    if status_value == "succeeded":
+        percent = 100
+    elif list_tasks:
+        list_ratio = min(1.0, list_completed / len(list_tasks))
+        if fetch_details and details_attempted:
+            jd_ratio = min(1.0, len(complete) / len(eligible)) if eligible else 1.0
+            percent = min(100, 50 + int(round(jd_ratio * 50)))
+        else:
+            percent = int(round(list_ratio * (50 if fetch_details else 100)))
+    else:
+        percent = 0
+    progress = _new_progress()
+    progress.update({
+        "list_total": len(list_tasks), "list_completed": list_completed,
+        "detail_total": detail_total, "detail_completed": detail_completed,
+        "jobs_discovered": len(eligible), "jobs_total": len(eligible),
+        "jd_total": len(eligible), "jd_completed": len(complete),
+        "percent": percent, "eta_seconds": None,
+    })
+    return progress, missing_count
 
 
 def status() -> dict:
@@ -119,35 +292,8 @@ def status() -> dict:
             tasks.append(item)
         result["tasks"] = tasks
         if not result["running"]:
-            list_tasks = [task for task in tasks if task.get("list_file")]
-            missing_count = get_db().execute(
-                "SELECT COUNT(DISTINCT h.job_key) c FROM job_collection_hits h "
-                "JOIN jobs j ON j.job_key=h.job_key "
-                "LEFT JOIN job_details d ON d.job_key=h.job_key "
-                "WHERE h.run_id=? AND j.status<>'excluded' "
-                "AND (d.jd IS NULL OR trim(d.jd)='')", (data_run_id,)).fetchone()["c"]
-            if not missing_count and any(task["status"] in ("partial", "failed")
-                                         for task in list_tasks):
-                keys = set()
-                for task in list_tasks:
-                    path = Path(task["list_file"])
-                    if not path.exists():
-                        continue
-                    try:
-                        payload = _read_list(path)
-                    except RuntimeError:
-                        continue
-                    for raw in payload.get("jobs", []):
-                        keys.add(importer.job_key_from(
-                            raw.get("job_link", "") or raw.get("link", ""),
-                            raw.get("title", ""),
-                            raw.get("boss_name", "") or raw.get("company", ""),
-                            raw.get("salary", "")))
-                missing_count = len(_all_missing_jd(keys))
-            result["progress"] = {
-                "list_total": len(list_tasks), "list_completed": len(list_tasks),
-                "detail_total": missing_count, "detail_completed": 0,
-            }
+            result["progress"], missing_count = _finished_progress(
+                run, tasks, data_run_id)
             result["retry_details_available"] = bool(missing_count)
             if run:
                 try:
@@ -158,14 +304,6 @@ def status() -> dict:
                     "status": run["status"], "stats": stats,
                     "finished_at": run["finished_at"],
                 }
-                details = stats.get("details") or {}
-                if "requested" in details:
-                    partial = details.get("partial") or {}
-                    result["progress"].update({
-                        "detail_total": int(details.get("requested") or 0),
-                        "detail_completed": int(details.get(
-                            "updated", partial.get("updated", 0)) or 0),
-                    })
     return result
 
 
@@ -234,6 +372,8 @@ def _cleanup_worker_control(run_id: int) -> None:
         _state["pause_started_at"] = None
         _state["paused_seconds"] = 0.0
         _state["worker_ident"] = None
+        _state["phase_started_at"] = None
+        _state["phase_pause_baseline"] = 0.0
         _state_condition.notify_all()
 
 
@@ -248,7 +388,10 @@ def _set_phase(run_id: int, phase: str) -> bool:
         get_db().execute("UPDATE collect_runs SET phase=? WHERE id=?", (phase, run_id))
         get_db().commit()
         if _state["run_id"] == run_id:
+            now = time.monotonic()
             _state["phase"] = phase
+            _state["phase_started_at"] = now
+            _state["phase_pause_baseline"] = _paused_duration_locked(now)
     return True
 
 
@@ -438,13 +581,48 @@ def _normalize_tasks(tasks: list) -> list:
     return normalized
 
 
+def _config_run_name(conn, run_id: int, params: dict, started_at: str) -> str:
+    """配置采集使用固定短名称；流水号直接复用永不回退的运行 ID。"""
+    resume_id = int(params.get("resume_id") or 0)
+    row = conn.execute(
+        "SELECT name FROM resumes WHERE id=? AND archived_at IS NULL", (resume_id,)
+    ).fetchone() if resume_id else None
+    if row is None:
+        row = conn.execute(
+            "SELECT name FROM resumes WHERE is_default=1 AND archived_at IS NULL "
+            "ORDER BY id LIMIT 1").fetchone()
+    resume_name = str(row["name"] if row else "未命名简历").strip()
+    resume_name = re.sub(r"[\r\n\t/\\]+", "-", resume_name) or "未命名简历"
+    resume_name = resume_name[:20]
+    date_text = str(started_at or now_iso())[:10].replace("-", "")
+    return f"{date_text}-{resume_name}-{int(run_id):04d}"
+
+
+def _saved_run_name(run_id: int) -> str:
+    row = get_db().execute(
+        "SELECT params FROM collect_runs WHERE id=?", (int(run_id),)).fetchone()
+    if row is None:
+        return ""
+    try:
+        params = json.loads(row["params"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    return str(params.get("name") or "")
+
+
 def _begin_run(kind: str, params: dict, tasks: list) -> int:
     conn = get_db()
+    params = dict(params or {})
+    started_at = now_iso()
     cur = conn.execute(
         "INSERT INTO collect_runs(kind,params,stats,started_at,status,phase) "
         "VALUES(?,?,?,?,?,?)",
-        (kind, json.dumps(params, ensure_ascii=False), "{}", now_iso(), "running", "list"))
+        (kind, json.dumps(params, ensure_ascii=False), "{}", started_at, "running", "list"))
     run_id = cur.lastrowid
+    if kind == "config":
+        params["name"] = _config_run_name(conn, run_id, params, started_at)
+        conn.execute("UPDATE collect_runs SET params=? WHERE id=?",
+                     (json.dumps(params, ensure_ascii=False), run_id))
     for task in tasks:
         row = conn.execute(
             "INSERT INTO collect_run_tasks("
@@ -458,13 +636,17 @@ def _begin_run(kind: str, params: dict, tasks: list) -> int:
         task["_task_id"] = row.lastrowid
     conn.commit()
     with _state_condition:
+        phase_started_at = time.monotonic()
+        progress = _new_progress()
+        progress["list_total"] = len(tasks)
         _state.update({"running": True, "current": kind, "phase": "list",
                        "log": [], "run_id": run_id, "cancel": False,
                        "risk_signal": "", "paused": False, "process": None,
                        "pause_started_at": None, "paused_seconds": 0.0,
                        "worker_ident": None,
-                       "progress": {"list_total": len(tasks), "list_completed": 0,
-                                    "detail_total": 0, "detail_completed": 0}})
+                       "fetch_details": bool(params.get("fetch_details", True)),
+                       "phase_started_at": phase_started_at,
+                       "phase_pause_baseline": 0.0, "progress": progress})
         _state_condition.notify_all()
     return run_id
 
@@ -483,6 +665,10 @@ def _finish_run(run_id: int, report: dict, run_status: str,
              data_source_at or None, risk_signal, run_id))
         conn.commit()
         if _state["run_id"] == run_id:
+            current = _progress_snapshot_locked()
+            current["percent"] = 100 if run_status == "succeeded" else current["percent"]
+            current["eta_seconds"] = None
+            _state["progress"] = current
             _state["running"] = False
             _state["current"] = ""
             _state["phase"] = "finished"
@@ -720,14 +906,8 @@ def _wait_between_tasks() -> bool:
 
 
 def _all_missing_jd(keys: set) -> set:
-    if not keys:
-        return set()
-    rows = get_db().execute(
-        "SELECT j.job_key,j.status,d.jd FROM jobs j LEFT JOIN job_details d "
-        "ON d.job_key=j.job_key").fetchall()
-    return {row["job_key"] for row in rows
-            if row["job_key"] in keys and row["status"] != "excluded"
-            and not str(row["jd"] or "").strip()}
+    eligible, complete = _job_completeness(keys)
+    return eligible - complete
 
 
 def _merge_list_files(files: list[Path], output: Path,
@@ -757,22 +937,35 @@ def _merge_list_files(files: list[Path], output: Path,
 
 
 def _run_detail_phase(run_id: int, files: list[Path], task_ids: list[int],
-                      cdp_port: int, report: dict) -> tuple[str, str]:
-    all_keys = set()
-    for path in files:
-        data = _read_list(path)
-        for raw in data.get("jobs", []):
-            key = importer.job_key_from(
-                raw.get("job_link", "") or raw.get("link", ""), raw.get("title", ""),
-                raw.get("boss_name", "") or raw.get("company", ""), raw.get("salary", ""))
-            all_keys.add(key)
-    missing = _all_missing_jd(all_keys)
-    _set_progress(detail_total=len(missing), detail_completed=0)
+                      cdp_port: int, report: dict, job_keys=None,
+                      all_job_keys=None) -> tuple[str, str]:
+    all_keys = {str(key) for key in (job_keys or []) if key}
+    if not all_keys:
+        for path in files:
+            data = _read_list(path)
+            for raw in data.get("jobs", []):
+                key = importer.job_key_from(
+                    raw.get("job_link", "") or raw.get("link", ""),
+                    raw.get("title", ""),
+                    raw.get("boss_name", "") or raw.get("company", ""),
+                    raw.get("salary", ""))
+                all_keys.add(key)
+    eligible, complete_before = _job_completeness(all_keys)
+    missing = eligible - complete_before
+    initial_complete = len(complete_before)
+    display_eligible, display_complete = _job_completeness(
+        all_job_keys if all_job_keys is not None else eligible)
+    _set_progress(
+        jobs_discovered=len(display_eligible), jobs_total=len(display_eligible),
+        jd_total=len(display_eligible), jd_completed=len(display_complete),
+        detail_total=len(missing), detail_completed=0)
     if not missing:
         for task_id in task_ids:
             sync.update_run_task(task_id, "succeeded", stats={"missing_jd": 0},
                                  finished=True)
-        report["details"] = {"requested": 0, "updated": 0}
+        report["details"] = {"requested": 0, "updated": 0,
+                             "jobs_total": len(display_eligible),
+                             "jd_completed": len(display_complete)}
         return "", ""
 
     merged = RESULT_DIR / f"boss_jobs_run{run_id}_merged_missing.json"
@@ -794,10 +987,13 @@ def _run_detail_phase(run_id: int, files: list[Path], task_ids: list[int],
     def import_snapshot(path: Path) -> None:
         nonlocal completed
         importer.import_scraper_details(str(path))
-        current_completed = total - len(_all_missing_jd(missing))
+        _, complete_now = _job_completeness(eligible)
+        _, display_complete_now = _job_completeness(display_eligible)
+        current_completed = max(0, len(complete_now) - initial_complete)
         if current_completed > completed:
             completed = current_completed
-            _set_progress(detail_completed=completed)
+            _set_progress(detail_completed=completed,
+                          jd_completed=len(display_complete_now))
             _log(f"JD 已入库 {completed}/{total}，岗位列表可立即查看")
 
     try:
@@ -808,20 +1004,28 @@ def _run_detail_phase(run_id: int, files: list[Path], task_ids: list[int],
         if out:
             _log(out)
         detail_stats = importer.import_scraper_details(str(detail))
-        completed = total - len(_all_missing_jd(missing))
-        _set_progress(detail_completed=completed)
+        _, complete_now = _job_completeness(eligible)
+        _, display_complete_now = _job_completeness(display_eligible)
+        completed = max(0, len(complete_now) - initial_complete)
+        _set_progress(detail_completed=completed,
+                      jd_completed=len(display_complete_now))
         for task_id in task_ids:
             sync.update_run_task(task_id, "succeeded",
                                  stats={"detail_updated": completed},
                                  detail_file=str(detail), finished=True)
         report["details"] = {"requested": total, **detail_stats,
-                             "updated": completed}
+                             "updated": completed,
+                             "jobs_total": len(display_eligible),
+                             "jd_completed": len(display_complete_now)}
         return source_at, ""
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as error:
         partial = importer.import_scraper_details(str(detail)) if detail.exists() else {
             "updated": 0}
-        completed = total - len(_all_missing_jd(missing))
-        _set_progress(detail_completed=completed)
+        _, complete_now = _job_completeness(eligible)
+        _, display_complete_now = _job_completeness(display_eligible)
+        completed = max(0, len(complete_now) - initial_complete)
+        _set_progress(detail_completed=completed,
+                      jd_completed=len(display_complete_now))
         failure = classify_failure(error)
         for task_id in task_ids:
             sync.update_run_task(task_id, "partial",
@@ -829,7 +1033,10 @@ def _run_detail_phase(run_id: int, files: list[Path], task_ids: list[int],
                                  error=failure["message"], detail_file=str(detail),
                                  finished=True)
         report["details"] = {"requested": total, "partial": partial,
-                             "updated": completed, "error": failure["message"]}
+                             "updated": completed,
+                             "jobs_total": len(display_eligible),
+                             "jd_completed": len(display_complete_now),
+                             "error": failure["message"]}
         _log(f"详情阶段失败，已保留部分结果: {failure['message']}")
         return source_at, failure["message"] if failure["risk"] else ""
 
@@ -840,6 +1047,8 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
               "partial": False, "cancelled": False}
     successful_files = []
     successful_task_ids = []
+    discovered_keys = set()
+    detail_job_keys = set()
     source_times = []
     risk_signal = ""
     account = ""
@@ -872,7 +1081,11 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
             def import_list_snapshot(path: Path) -> None:
                 nonlocal live_list_count
                 live_stats = importer.import_scraper_files([path], record_run=False)
-                current_count = len(live_stats.get("job_keys") or [])
+                snapshot_keys = set(live_stats.get("job_keys") or [])
+                discovered_keys.update(snapshot_keys)
+                _attach_run_jobs(run_id, snapshot_keys, "collection_snapshot")
+                _set_progress(jobs_discovered=len(discovered_keys))
+                current_count = len(snapshot_keys)
                 if current_count > live_list_count:
                     live_list_count = current_count
                     _log(f"{label} 已即时入库 {live_list_count} 个岗位")
@@ -886,9 +1099,14 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
                     _log(out)
                 data = _read_list(list_file)
                 stats = importer.import_scraper_files([list_file], record_run=False)
+                current_keys = set(stats.get("job_keys") or [])
+                discovered_keys.update(current_keys)
+                detail_job_keys.update(current_keys)
+                _attach_run_jobs(run_id, current_keys, "collection")
+                _set_progress(jobs_discovered=len(discovered_keys))
                 _mark_account_success(account)
                 relation = sync.record_source_success(
-                    run_id, task_id, task, set(stats["job_keys"]))
+                    run_id, task_id, task, current_keys)
                 stats["source"] = relation
                 report["items"].append({"task_key": task["task_key"], **stats})
                 report["touched"] += len(stats["job_keys"])
@@ -904,6 +1122,10 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
             except (RuntimeError, subprocess.TimeoutExpired, OSError) as error:
                 failure = classify_failure(error)
                 partial_stats = _import_partial(list_file)
+                partial_keys = set(partial_stats.get("job_keys") or [])
+                discovered_keys.update(partial_keys)
+                _attach_run_jobs(run_id, partial_keys, "collection_partial")
+                _set_progress(jobs_discovered=len(discovered_keys))
                 report["partial"] = bool(partial_stats) or report["partial"]
                 report["items"].append({"task_key": task["task_key"],
                                         "partial": partial_stats,
@@ -926,6 +1148,10 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
                 if not _wait_between_tasks():
                     report["cancelled"] = True
 
+        eligible_jobs, complete_jobs = _job_completeness(discovered_keys)
+        _set_progress(
+            jobs_discovered=len(eligible_jobs), jobs_total=len(eligible_jobs),
+            jd_total=len(eligible_jobs), jd_completed=len(complete_jobs))
         _wait_for_resume()
         if risk_signal or _is_cancelled():
             report["cancelled"] = report["cancelled"] or _is_cancelled()
@@ -949,7 +1175,8 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
                         finished=True)
             else:
                 detail_source, detail_risk = _run_detail_phase(
-                    run_id, successful_files, successful_task_ids, cdp_port, report)
+                    run_id, successful_files, successful_task_ids, cdp_port, report,
+                    job_keys=detail_job_keys, all_job_keys=discovered_keys)
                 if detail_source:
                     source_times.append(detail_source)
                 if detail_risk:
@@ -1012,7 +1239,10 @@ def start(kind: str, tasks: list, sync_mode: bool = False,
         _state.update({"running": True, "current": "启动中", "phase": "starting",
                        "run_id": None, "cancel": False, "paused": False,
                        "process": None, "pause_started_at": None,
-                       "paused_seconds": 0.0, "worker_ident": None})
+                       "paused_seconds": 0.0, "worker_ident": None,
+                       "fetch_details": bool(fetch_details),
+                       "phase_started_at": None, "phase_pause_baseline": 0.0,
+                       "progress": _new_progress()})
     try:
         run_id = _begin_run(kind, {"tasks": normalized, "sync": sync_mode,
                                    "fetch_details": fetch_details,
@@ -1022,7 +1252,8 @@ def start(kind: str, tasks: list, sync_mode: bool = False,
             _state.update({"running": False, "current": "", "phase": "",
                            "run_id": None, "paused": False, "process": None,
                            "pause_started_at": None, "paused_seconds": 0.0,
-                           "worker_ident": None})
+                           "worker_ident": None, "phase_started_at": None,
+                           "phase_pause_baseline": 0.0})
             _state_condition.notify_all()
         raise
     thread = threading.Thread(
@@ -1033,7 +1264,11 @@ def start(kind: str, tasks: list, sync_mode: bool = False,
     except Exception as error:
         _finish_run(run_id, {"error": f"后台线程启动失败: {error}"}, "failed")
         raise
-    return {"ok": True, "run_id": run_id}
+    result = {"ok": True, "run_id": run_id}
+    name = _saved_run_name(run_id)
+    if name:
+        result["name"] = name
+    return result
 
 
 def start_config(body: dict, resume_id=None, sync_mode: bool = False) -> dict:
@@ -1182,7 +1417,9 @@ def retry_missing(source_run_id: int = None) -> dict:
         _state.update({"running": True, "current": "启动中", "phase": "starting",
                        "run_id": None, "cancel": False, "paused": False,
                        "process": None, "pause_started_at": None,
-                       "paused_seconds": 0.0, "worker_ident": None})
+                       "paused_seconds": 0.0, "worker_ident": None,
+                       "phase_started_at": None, "phase_pause_baseline": 0.0,
+                       "progress": _new_progress()})
     if source_run_id is None:
         row = get_db().execute(
             "SELECT run_id FROM collect_run_tasks WHERE list_file<>'' "
@@ -1193,7 +1430,8 @@ def retry_missing(source_run_id: int = None) -> dict:
             _state.update({"running": False, "current": "", "phase": "",
                            "run_id": None, "paused": False, "process": None,
                            "pause_started_at": None, "paused_seconds": 0.0,
-                           "worker_ident": None})
+                           "worker_ident": None, "phase_started_at": None,
+                           "phase_pause_baseline": 0.0})
             _state_condition.notify_all()
         return {"ok": False, "error": "没有可重试的采集记录"}
     try:
@@ -1207,7 +1445,8 @@ def retry_missing(source_run_id: int = None) -> dict:
             _state.update({"running": False, "current": "", "phase": "",
                            "run_id": None, "paused": False, "process": None,
                            "pause_started_at": None, "paused_seconds": 0.0,
-                           "worker_ident": None})
+                           "worker_ident": None, "phase_started_at": None,
+                           "phase_pause_baseline": 0.0})
             _state_condition.notify_all()
         raise
     thread = threading.Thread(target=_retry_worker,

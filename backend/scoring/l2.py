@@ -113,23 +113,40 @@ def finalize(result: dict, cap: float) -> dict:
 
 
 def score_job_llm(job_key: str, client=None, resume_id: int = None,
-                  force: bool = False, on_delta=None, cancelled=None) -> dict:
-    """同一岗位×简历在单进程内只允许一个 L2 调用，避免并发随机覆盖。"""
-    claim = (job_key, int(resume_id) if resume_id is not None else None)
+                  force: bool = False, on_delta=None, cancelled=None,
+                  resume_revision: int = None) -> dict:
+    """同一岗位×简历修订在单进程内只允许一个 L2 调用。"""
+    _, _, current_revision = _resume_digest(resume_id)
+    if resume_id is None:
+        expected_revision = None
+    else:
+        try:
+            expected_revision = (int(current_revision) if resume_revision is None
+                                 else int(resume_revision))
+        except (TypeError, ValueError) as error:
+            raise llm.LLMError("简历修订号无效") from error
+        if int(current_revision) != expected_revision:
+            raise llm.LLMCancelledError("简历已更新，旧修订评分已取消")
+
+    claim = (job_key, int(resume_id) if resume_id is not None else None,
+             expected_revision)
     with _INFLIGHT_LOCK:
         if claim in _INFLIGHT:
             raise llm.LLMError("该岗位与简历正在进行 L2 评分，请勿重复提交")
         _INFLIGHT.add(claim)
     try:
-        return _score_job_llm(job_key, client=client, resume_id=resume_id, force=force,
-                              on_delta=on_delta, cancelled=cancelled)
+        return _score_job_llm(
+            job_key, client=client, resume_id=resume_id,
+            resume_revision=expected_revision, force=force,
+            on_delta=on_delta, cancelled=cancelled)
     finally:
         with _INFLIGHT_LOCK:
             _INFLIGHT.discard(claim)
 
 
 def _score_job_llm(job_key: str, client=None, resume_id: int = None,
-                   force: bool = False, on_delta=None, cancelled=None) -> dict:
+                   force: bool = False, on_delta=None, cancelled=None,
+                   resume_revision: int = None) -> dict:
     conn = get_db()
     row = conn.execute(
         "SELECT j.*, d.jd FROM jobs j LEFT JOIN job_details d ON d.job_key=j.job_key "
@@ -140,12 +157,17 @@ def _score_job_llm(job_key: str, client=None, resume_id: int = None,
     profile_score = None
     if resume_id is not None:
         from .. import resumes
+        if resume_revision is not None and int(revision) != int(resume_revision):
+            raise llm.LLMCancelledError("简历已更新，旧修订评分已取消")
         profile_score = resumes.get_job_score(job_key, resume_id, revision)
         if profile_score and profile_score.get("composite") is not None and not force:
             raise llm.LLMError("该简历修订已有 L2 评分，未覆盖（需 force 重评）")
     l1_detail = (profile_score or {}).get("l1_detail") or \
         json.loads(row["l1_detail"] or "{}")
     expect = {"salary_max": 30, **expect}
+    if resume_id is not None and resume_revision is not None:
+        if resumes.current_revision(resume_id) != int(resume_revision):
+            raise llm.LLMCancelledError("简历已更新，旧修订评分已取消")
     result = llm.chat_json(
         build_messages(dict(row), row["jd"] or "", resume, l1_detail, expect),
         client=client, on_delta=on_delta, cancelled=cancelled)

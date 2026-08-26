@@ -28,6 +28,17 @@ SleepFunc = Callable[[float], None]
 DelayFunc = Callable[[int], float]
 
 
+def _active_key(page: str, job_key: str, resume_id: Optional[int],
+                kind: str, payload: Optional[dict]) -> tuple:
+    """活动任务按简历修订去重，升版后的新任务不能复用旧修订任务。"""
+    revision = (payload or {}).get("resume_revision")
+    try:
+        revision = int(revision) if revision is not None else None
+    except (TypeError, ValueError):
+        revision = str(revision)
+    return page, job_key, resume_id, kind, revision
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
 
@@ -145,7 +156,8 @@ class _Task:
         default_factory=threading.Event, repr=False, compare=False)
 
     def active_key(self) -> tuple:
-        return self.page, self.job_key, self.resume_id, self.kind
+        return _active_key(
+            self.page, self.job_key, self.resume_id, self.kind, self.payload)
 
 
 @dataclass
@@ -257,7 +269,8 @@ class AITaskScheduler:
         if payload is not None and not isinstance(payload, dict):
             raise ValueError("payload 必须是对象")
         normalized_resume_id = int(resume_id) if resume_id is not None else None
-        active_key = (page, job_key, normalized_resume_id, kind)
+        active_key = _active_key(
+            page, job_key, normalized_resume_id, kind, payload)
 
         with self._condition:
             if self._closed:

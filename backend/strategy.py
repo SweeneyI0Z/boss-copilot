@@ -39,14 +39,16 @@ SYSTEM_PROMPT = """你是求职采集策略师。根据用户简历与期望，�
 只输出 JSON。"""
 
 
-def generate_plan(resume_text: str, expectations: dict, client=None) -> dict:
+def generate_plan(resume_text: str, expectations: dict, client=None,
+                  on_delta=None, cancelled=None) -> dict:
     if not resume_text or len(resume_text.strip()) < 50:
         raise llm.LLMError("简历内容过短，请先在「简历档案」粘贴完整简历")
     user = (f"# 简历\n{resume_text[:6000]}\n\n# 期望\n{json.dumps(expectations, ensure_ascii=False)}\n\n"
             f"按以下结构输出：\n{PLAN_SCHEMA_HINT}")
     plan = llm.chat_json(
         [{"role": "system", "content": SYSTEM_PROMPT},
-         {"role": "user", "content": user}], client=client)
+         {"role": "user", "content": user}], client=client,
+        on_delta=on_delta, cancelled=cancelled)
     _validate(plan)
     return plan
 

@@ -8,7 +8,7 @@
 
 ```bash
 cd ~/project/boss-copilot
-.venv/bin/python -m unittest discover tests -v   # 回归（259 例，必须全绿）
+.venv/bin/python -m unittest discover tests -v   # 回归（289 例，必须全绿）
 .venv/bin/uvicorn backend.main:app --port 8787
 # 浏览器打开 http://127.0.0.1:8787
 ```
@@ -71,6 +71,7 @@ cd ~/project/boss-copilot
 | M15 | 全模拟前端体验重构/向导/采集工作台/响应式布局 | 7fc0e4a |
 | M16 | 前后端真实接入/采集暂停恢复与来源启停/岗位求职阶段 | 本次改动 |
 | M17 | 采集数据确认删除/页面级 AI 任务队列/流式进度/OFFER 工作流 | 本次改动 |
+| M18 | 双账号向导/流式采集策略/岗位级进度/标签增强/工作台深链 | 本次改动 |
 
 ## 发送护栏（不可关闭）
 
@@ -96,6 +97,7 @@ backend/
   collector.py   在线采集执行器（后台线程，调 scraper，任务间隔 120s）
   favorites.py   双账号BOSS收藏同步（推荐页感兴趣Tab只读 + 增量合并）
   collection_runs.py 采集来源归属、启停、删除与 xlsx 导出
+  job_tags.py    福利/工时/大小周/外包标签统一识别
   workflow.py    岗位待开始/已打招呼/已投递/已面试/OFFER 阶段聚合
   ai_tasks.py    岗位页与工作台独立 AI 队列（单页并发 5、取消、SSE、429 退避）
   sync.py        同步刷新：同词下架 diff / HR 活跃度剔除 / P 级漂移报告
@@ -110,7 +112,7 @@ backend/
   interview.py   模拟面试 agent
   boss/cdp.py    账号 CDP 管理（单/双账号切换 + 代理绕过）
 frontend/        无构建 Vue3（app.js 单文件 + vendored vue.esm）
-tests/           259 个单测 + 真实登录态只读 spike 脚本
+tests/           289 个单测 + 真实登录态只读 spike 脚本
 ```
 
 ## 已知边界
@@ -119,7 +121,10 @@ tests/           259 个单测 + 真实登录态只读 spike 脚本
 - 平台投递探测只认明确完成态，失败保持 unknown；不会读取或同步聊天历史
 - 公司页采集的岗位缺 industry/JD 字段时 L1 命中率记 0，补详情后重算即恢复
 - 列表文件每次增量落盘、详情文件每新增一条都会立即导入 SQLite；`/api/collect/status` 与 `/api/favorites/sync/status` 的 `progress.detail_completed/detail_total` 提供单条进度。详情重试只提交数据库中仍缺 JD 的岗位，已完成项不会重复访问
+- 配置采集名称统一为 `YYYYMMDD-简历名-流水号`；采集中心按岗位数量展示仅岗位描述/完整 JD、当前阶段百分比和暂停感知 ETA，不混算任务数与岗位数
 - LLM 未配置时：L1/导入/采集/人工流程可用，L2/策略/招呼语(LLM)/面试降级并提示
 - 岗位列表与收藏工作台的生成任务互相独立，均可在运行时继续追加；单页最大并发为 5，遇到 429 会降低该页并发并按 `Retry-After` 或指数退避重试，连续成功后逐步恢复
+- 岗位评分与工作台分析只为当前简历修订的缺失项创建任务，已有导入/模型评分不会重复生成；取消只停止活动任务，已完成结果保留
+- 总览优先岗位和岗位列表「岗位分析」使用 `#/jobcard?job=...` 深链定位；只有收藏岗位在无后续流程事实时显示「待开始」
 - 数据分析默认覆盖全部当前岗位；旧导入和收藏岗位也会进入属性分布，但关键词、城市、日期筛选与采集趋势只使用 M12 可靠来源关系
 - 收藏同步依赖推荐页「感兴趣」Tab 的列表组件（实测为专用 `li.item-boss` 卡片，岗位链接自带 encryptJobId；搜索系 `job-card-box` 作为兼容家族一并支持）；若 BOSS 改版解析为空，可跑 `tests/spike_m13_favorites.py`（只读）核对 DOM 后调整解析启发式。每页翻页用独立后台标签（Chrome 会回收闲置后台标签），列表不足一页时第 2 页返回空态自动停止。同步入库的新岗位默认无 JD，状态条会提示缺失数量并可一键补齐（采集号只读执行）

@@ -61,6 +61,50 @@ async function apiRequest(path, { method = 'GET', body, headers = {} } = {}) {
   return payload
 }
 
+async function streamNdjson(path, body, onEvent, signal) {
+  const response = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+    signal,
+  })
+  if (!response.ok) {
+    let message = `请求失败（HTTP ${response.status}）`
+    try {
+      const payload = await response.json()
+      message = payload.detail || payload.error || payload.message || message
+    } catch (_) { /* 保留 HTTP 状态提示。 */ }
+    throw new ApiError(String(message), response.status)
+  }
+  if (!response.body) throw new ApiError('浏览器不支持流式响应')
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
+      const lines = buffer.split('\n')
+      buffer = done ? '' : lines.pop()
+      for (const raw of lines) {
+        const line = raw.trim()
+        if (!line) continue
+        let event
+        try { event = JSON.parse(line) }
+        catch (_) { throw new ApiError('流式响应格式无效') }
+        onEvent(event)
+      }
+      if (done) break
+    }
+    if (buffer.trim()) onEvent(JSON.parse(buffer.trim()))
+  } catch (error) {
+    try { await reader.cancel() } catch (_) { /* 连接可能已经关闭。 */ }
+    throw error
+  } finally {
+    reader.releaseLock()
+  }
+}
+
 function withQuery(path, params = {}) {
   const query = new URLSearchParams()
   Object.entries(params).forEach(([key, value]) => {
@@ -117,6 +161,8 @@ const apiClient = {
   },
   strategy: {
     generate: resumeId => apiRequest('/api/strategy/generate', { method: 'POST', body: { resume_id: resumeId } }),
+    generateStream: (resumeId, onEvent, signal) => streamNdjson(
+      '/api/strategy/generate/stream', { resume_id: resumeId }, onEvent, signal),
   },
   greetings: {
     list: () => apiRequest('/api/greetings'),
@@ -194,7 +240,7 @@ function normalizeResume(row = {}) {
 }
 function runName(row) {
   const names = { favorite_sync: 'BOSS 收藏同步', config: '配置采集', search: '关键词采集', company: '公司定向采集', plan: 'AI 采集计划', sync: '同步刷新', detail_retry: 'JD 补采', xlsx_import: 'Excel 导入', json_import: '采集文件导入' }
-  return row.name || (row.params && row.params.name) || `${names[row.kind] || '采集任务'} #${row.id}`
+  return row.plan_name || row.name || (row.params && row.params.name) || `${names[row.kind] || '采集任务'} #${row.id}`
 }
 function normalizeRun(row = {}) {
   const runtime = row.runtime || {}
@@ -203,22 +249,51 @@ function normalizeRun(row = {}) {
   const running = Boolean(runtime.running || (!row.finished_at && row.status === 'running'))
   const paused = Boolean(runtime.paused || row.paused)
   const status = paused ? 'paused' : running ? 'running' : finalStatus || 'interrupted'
+  const phase = runtime.phase || row.phase || ''
   const listTotal = Number(progress.list_total || 0)
-  const detailTotal = Number(progress.detail_total || 0)
-  const completed = Number(progress.list_completed || 0) + Number(progress.detail_completed || 0)
-  const total = listTotal + detailTotal
+  const listCompleted = Number(progress.list_completed || 0)
+  const detailTotal = Number(progress.jd_total || progress.detail_total || 0)
+  const detailCompleted = Number(progress.jd_completed || progress.detail_completed || 0)
+  const completed = phase === 'details' ? detailCompleted : listCompleted
+  const total = phase === 'details' ? detailTotal : listTotal
   const succeeded = status === 'completed'
-  const progressPercent = succeeded ? 100 : total ? Math.min(99, Math.round(completed / total * 100)) : 0
+  const backendPercent = Number(progress.percent)
+  const progressPercent = succeeded ? 100 : Number.isFinite(backendPercent)
+    ? Math.max(0, Math.min(99, Math.round(backendPercent)))
+    : total ? Math.min(99, Math.round(completed / total * 100)) : 0
   const itemCount = Number(row.item_count ?? (row.stats && (row.stats.total || row.stats.touched)) ?? 0)
+  const jobsDiscovered = Number(progress.jobs_discovered ?? itemCount)
+  const withJdCount = Math.max(Number(row.with_jd_count || 0), detailCompleted)
+  const completenessKnown = row.completeness_known !== false
   return {
     ...row, name: runName(row), startedAt: row.started_at || '', finishedAt: row.finished_at || '',
     status, enabled: row.enabled !== false, collected: itemCount, target: itemCount,
     itemCount, ownedItemCount: Number(row.owned_item_count || 0),
     hasSourceOwnership: Boolean(row.has_source_ownership), canExport: Boolean(row.can_export),
+    phase, listTotal, listCompleted, detailTotal, detailCompleted,
+    jobsDiscovered, jobsTotal: Number(progress.jobs_total || itemCount),
+    withJdCount, listOnlyCount: completenessKnown ? Math.max(0, itemCount - withJdCount) : null,
+    completenessKnown, etaSeconds: progress.eta_seconds == null ? null : Number(progress.eta_seconds),
     progressCompleted: completed, progressTotal: total, progressPercent,
     fetchDetails: Boolean(row.params && row.params.fetch_details),
     source: row.kind === 'favorite_sync' ? 'BOSS 收藏同步' : '本地后端',
   }
+}
+function formatEta(seconds) {
+  const value = Number(seconds)
+  if (!Number.isFinite(value) || value < 0) return '预计时间计算中'
+  if (value < 60) return `预计剩余 ${Math.max(1, Math.ceil(value))} 秒`
+  if (value < 3600) return `预计剩余 ${Math.ceil(value / 60)} 分钟`
+  return `预计剩余 ${Math.floor(value / 3600)} 小时 ${Math.ceil(value % 3600 / 60)} 分钟`
+}
+function runProgressSummary(run) {
+  if (run.phase === 'details') {
+    return `完整 JD ${run.detailCompleted} / ${run.detailTotal || run.jobsTotal} · 共 ${run.jobsTotal || run.jobsDiscovered} 个岗位`
+  }
+  if (run.status === 'running' || run.status === 'paused') {
+    return `已发现 ${run.jobsDiscovered} 个岗位 · 列表 ${run.listCompleted} / ${run.listTotal}`
+  }
+  return `共 ${run.itemCount} 个岗位`
 }
 function adviceFromDetail(detail = {}) {
   if (!detail || !Object.keys(detail).length) return ''
@@ -385,7 +460,7 @@ function applyAiSnapshot(page, snapshot, notify = true) {
   let shouldRefresh = false
   for (const task of snapshot.tasks) {
     const changedToTerminal = AI_TERMINAL.has(task.status) && previous.get(task.id) !== task.status
-    if (changedToTerminal && task.status === 'succeeded') {
+    if (changedToTerminal && (task.status === 'succeeded' || task.status === 'cancelled')) {
       shouldRefresh = true
       const job = store.jobs.find(item => item.job_key === task.job_key)
       if (job && (!job.actionErrorType || job.actionErrorType === task.kind)) {
@@ -428,10 +503,12 @@ function aiSummary(page) {
   const active = tasks.filter(task => AI_ACTIVE.has(task.status))
   const completed = tasks.filter(task => AI_TERMINAL.has(task.status)).length
   const failures = tasks.filter(task => task.status === 'failed').length
+  const cancelling = active.length > 0 && active.every(task => task.cancel_requested)
   const kinds = [...new Set(active.map(task => task.kind))]
   const labels = kinds.map(kind => kind === 'greeting' ? '正在生成招呼语' : kind === 'analysis' ? '正在生成分析' : '正在生成岗位与匹配度评分')
   return {
-    visible: tasks.length > 0, running: active.length > 0, total: tasks.length, completed,
+    visible: tasks.length > 0, running: active.length > 0, cancelling,
+    total: tasks.length, completed,
     failures, percent: tasks.length ? Math.round(completed / tasks.length * 100) : 0,
     label: labels.join(' / ') || (failures ? '生成完成，部分任务失败' : '最近生成任务已完成'),
     effective: Number(store.ai[page].effective_concurrency || 1),
@@ -439,13 +516,38 @@ function aiSummary(page) {
   }
 }
 
-async function enqueueAi(page, kind, jobKeys, force = true) {
+async function enqueueAi(page, kind, jobKeys, force = false) {
   const result = await apiClient.ai.enqueue(page, {
     kind, job_keys: jobKeys, resume_id: store.selectedResumeId, force,
   })
   trackAiTasks(page, result.tasks || [])
   applyAiSnapshot(page, result.snapshot || store.ai[page], false)
   return result
+}
+
+async function cancelAiTasks(page) {
+  try {
+    const result = await apiClient.ai.cancel(page, { resume_id: store.selectedResumeId })
+    applyAiSnapshot(page, result.snapshot || store.ai[page], false)
+    showToast(result.cancelled
+      ? `已请求取消 ${result.cancelled} 个生成任务，已完成结果会保留`
+      : '当前没有可取消的生成任务', 'info')
+  } catch (error) {
+    showToast(`取消生成任务失败：${error.message}`, 'bad')
+  }
+}
+
+async function cancelAiTask(page, task) {
+  if (!task) return
+  try {
+    const result = await apiClient.ai.cancel(page, { task_id: task.id })
+    applyAiSnapshot(page, result.snapshot || store.ai[page], false)
+    showToast(result.cancelled
+      ? '已请求取消当前任务，已完成结果会保留'
+      : '任务已结束，无需取消', 'info')
+  } catch (error) {
+    showToast(`取消任务失败：${error.message}`, 'bad')
+  }
 }
 
 async function runLoaders(loaders) {
@@ -526,17 +628,15 @@ function settleConfirm(result) {
 }
 
 // -- 岗位标签、排序与文案生成 -------------------------------------------
-const WELFARE_KEYWORDS = [
-  '五险一金', '年终奖', '带薪年假', '补充医疗', '餐补', '房补', '住房补贴',
-  '交通补贴', '股票期权', '定期体检', '节日福利', '员工旅游', '弹性工作',
-]
 function deriveJobTags(job) {
   const company = String(job.company || '').trim()
-  const text = `${job.title || ''}\n${job.jd || ''}`
   const tags = []
   if (job.effective_headhunter || !company || company.includes('某')) tags.push({ key: 'headhunter', label: '猎头', tone: 'warn' })
-  if (job.has_weekend || /周末双休|双休/.test(text)) tags.push({ key: 'weekend', label: '双休', tone: 'ok' })
-  if (job.has_benefits || WELFARE_KEYWORDS.some(keyword => text.includes(keyword))) tags.push({ key: 'benefits', label: '福利', tone: 'blue' })
+  if (job.is_outsourcing) tags.push({ key: 'outsourcing', label: '外包', tone: 'bad' })
+  if (job.has_alternating_weekend) tags.push({ key: 'alternating_weekend', label: '大小周', tone: 'warn' })
+  else if (job.has_eight_hour_weekend) tags.push({ key: 'eight_hour_weekend', label: '八小时双休', tone: 'ok' })
+  else if (job.has_weekend) tags.push({ key: 'weekend', label: '双休', tone: 'ok' })
+  if (job.has_benefits) tags.push({ key: 'benefits', label: '福利', tone: 'blue' })
   return tags
 }
 function workflowLabel(job) {
@@ -544,7 +644,7 @@ function workflowLabel(job) {
   if (job.interviewed) return '已面试'
   if (job.applied) return '已投递'
   if (job.contacted) return '已打招呼'
-  return '待开始'
+  return job.favorite ? '待开始' : ''
 }
 
 // -- Hash 路由 -----------------------------------------------------------
@@ -560,14 +660,26 @@ const nav = [
 ]
 const ROUTE_ALIASES = { '/greetings': '/jobcard', '/interview': '/jobcard' }
 const VALID_ROUTES = new Set(nav.map(([path]) => path))
-function normalizedRoute() {
+function parseHashRoute() {
   const raw = location.hash.slice(1) || '/dashboard'
-  const path = ROUTE_ALIASES[raw] || (VALID_ROUTES.has(raw) ? raw : '/dashboard')
-  if (path !== raw) history.replaceState(null, '', `#${path}`)
-  return path
+  const [rawPath, rawQuery = ''] = raw.split('?', 2)
+  const path = ROUTE_ALIASES[rawPath] || (VALID_ROUTES.has(rawPath) ? rawPath : '/dashboard')
+  const params = new URLSearchParams(rawQuery)
+  if (path !== rawPath) history.replaceState(
+    null, '', `#${path}${rawQuery ? `?${rawQuery}` : ''}`)
+  return { path, jobKey: params.get('job') || '' }
 }
-const route = ref(normalizedRoute())
-window.addEventListener('hashchange', () => { route.value = normalizedRoute() })
+const initialRoute = parseHashRoute()
+const route = ref(initialRoute.path)
+const routeJobKey = ref(initialRoute.jobKey)
+window.addEventListener('hashchange', () => {
+  const next = parseHashRoute()
+  route.value = next.path
+  routeJobKey.value = next.jobKey
+})
+function jobCardHref(job) {
+  return `#/jobcard?job=${encodeURIComponent(job && job.job_key || '')}`
+}
 
 // -- 通用图表 -----------------------------------------------------------
 const SvgBars = {
@@ -619,7 +731,9 @@ const DashboardView = {
       resumeName: '新的求职简历', resumeBody: '# 我的简历\n\n在这里填写 Markdown 简历正文。', synced: false,
       llmBaseUrl: store.settings.llmBaseUrl, llmApiKey: store.settings.llmApiKey,
       llmModel: store.settings.llmModel, llmTested: false, llmAvailable: isLlmConfigured(),
+      dualAccount: store.settings.dualAccount,
     })
+    let guidePlanController = null
     const guidePlan = reactive(createPlan())
     const guideCityQuery = ref('')
     const guideCitySuggestions = computed(() => matchingCities(guideCityQuery.value, guidePlan.cities))
@@ -629,18 +743,28 @@ const DashboardView = {
     const llmReady = computed(() => isLlmConfigured())
     const communicationAccount = computed(() => store.accounts.find(account => account.key === 'account_a')
       || { key: 'account_a', label: '沟通号', running: false, loggedIn: false, hint: '账号状态尚未加载' })
+    const guideAccounts = computed(() => store.accounts.filter(account =>
+      account.key === 'account_a' || guide.dualAccount).sort((a, b) =>
+      (a.key === 'collect' ? 0 : 1) - (b.key === 'collect' ? 0 : 1)))
     function openGuide() {
+      if (guidePlanController) guidePlanController.abort()
       Object.assign(guide, {
         open: true, step: 1, busy: '', resumeMode: store.resumes.length ? 'existing' : 'new',
         resumeId: store.selectedResumeId, resumeName: '新的求职简历',
         resumeBody: '# 我的简历\n\n在这里填写 Markdown 简历正文。', synced: false,
         llmBaseUrl: store.settings.llmBaseUrl, llmApiKey: store.settings.llmApiKey,
         llmModel: store.settings.llmModel, llmTested: false, llmAvailable: isLlmConfigured(),
+        dualAccount: store.settings.dualAccount,
       })
-      Object.assign(guidePlan, createPlan(), { name: '向导创建的采集计划' })
+      Object.assign(guidePlan, createPlan())
       guideCityQuery.value = ''
     }
-    function closeGuide() { guide.open = false }
+    function closeGuide() {
+      if (guidePlanController) guidePlanController.abort()
+      guidePlanController = null
+      guide.busy = ''
+      guide.open = false
+    }
     async function finishResumeStep() {
       if (guide.resumeMode === 'new') {
         if (!guide.resumeName.trim() || !guide.resumeBody.trim()) {
@@ -663,6 +787,7 @@ const DashboardView = {
       if (!guide.resumeId) { showToast('请选择一份简历', 'warn'); return }
       store.selectedResumeId = Number(guide.resumeId)
       guidePlan.resumeId = store.selectedResumeId
+      guidePlan.name = planNamePreview(guidePlan.resumeId)
       guide.step = 2
     }
     async function testGuideLlm() {
@@ -702,15 +827,38 @@ const DashboardView = {
         showToast(`LLM 配置保存失败：${error.message}`, 'bad')
       } finally { guide.busy = '' }
     }
-    async function guideLogin() {
-      guide.busy = 'login'
+    async function setGuideDualAccount(event) {
+      const enabled = event.target.checked
+      guide.busy = 'account-mode'
       try {
-        await apiClient.accounts.login(communicationAccount.value.key)
-        const state = await apiClient.accounts.check(communicationAccount.value.key)
-        await refreshAccounts()
-        showToast(state.logged_in === true ? 'BOSS 登录状态已确认' : (state.hint || '登录页已打开，请登录后重新检测'), state.logged_in === true ? 'ok' : 'warn')
+        await apiClient.settings.save({ dual_account_enabled: enabled })
+        guide.dualAccount = enabled
+        store.settings.dualAccount = enabled
+        await Promise.all([refreshSettings(), refreshAccounts()])
+        showToast(enabled ? '已开启双账号隔离模式' : '已切换为单账号模式', 'info')
       } catch (error) {
-        showToast(`BOSS 登录操作失败：${error.message}`, 'bad')
+        event.target.checked = guide.dualAccount
+        showToast(`账号模式切换失败：${error.message}`, 'bad')
+      } finally { guide.busy = '' }
+    }
+    async function guideAccountAction(account, action) {
+      guide.busy = `${account.key}-${action}`
+      try {
+        let result
+        if (action === 'launch') result = await apiClient.accounts.launch(account.key)
+        else if (action === 'login') result = await apiClient.accounts.login(account.key)
+        else if (action === 'check') result = await apiClient.accounts.check(account.key)
+        else result = await apiClient.accounts.stop(account.key)
+        await refreshAccounts()
+        if (action === 'check') {
+          showToast(result.logged_in === true ? `${account.label}登录状态已确认`
+            : (result.hint || `${account.label}登录状态尚未确认`), result.logged_in === true ? 'ok' : 'warn')
+        } else {
+          const labels = { launch: '已启动', login: '已打开登录页', stop: '已停止' }
+          showToast(`${account.label}${labels[action]}`, action === 'stop' ? 'info' : 'ok')
+        }
+      } catch (error) {
+        showToast(`${account.label}操作失败：${error.message}`, 'bad')
       } finally { guide.busy = '' }
     }
     async function guideSyncFavorites() {
@@ -739,19 +887,32 @@ const DashboardView = {
         showToast('LLM 未配置，AI 生成采集计划不可用', 'warn')
         return
       }
+      if (guidePlanController) guidePlanController.abort()
+      guidePlanController = new AbortController()
+      const controller = guidePlanController
       guide.busy = 'plan'
       try {
-        const generated = await apiClient.strategy.generate(store.selectedResumeId)
-        applyGeneratedStrategy(guidePlan, generated)
+        await generateStrategyStreaming(guidePlan, guidePlan.resumeId, controller.signal)
         showToast('AI 采集计划已生成，可继续修改')
       } catch (error) {
-        showToast(`AI 采集计划生成失败：${error.message}`, 'bad')
-      } finally { guide.busy = '' }
+        if (error.name !== 'AbortError') showToast(`AI 采集计划生成失败：${error.message}`, 'bad')
+      } finally {
+        if (guidePlanController === controller) {
+          guidePlanController = null
+          guide.busy = ''
+        }
+      }
+    }
+    function chooseGuidePlanMode(mode) {
+      if (mode === 'manual' && guidePlanController) guidePlanController.abort()
+      guidePlan.mode = mode
+      guidePlan.generated = mode === 'manual'
+      if (mode === 'manual') guidePlan.streamText = ''
     }
     function reviewGuidePlan() {
       const keywords = guidePlan.keywords.split(/[\n,，]+/).map(value => value.trim()).filter(Boolean)
-      if (!guidePlan.name.trim() || !keywords.length || !guidePlan.cities.length) {
-        showToast('请填写计划名称、关键词并至少选择一个城市', 'warn')
+      if (!keywords.length || !guidePlan.cities.length) {
+        showToast('请填写关键词并至少选择一个城市', 'warn')
         return
       }
       guide.step = 5
@@ -769,10 +930,11 @@ const DashboardView = {
     }
     return {
       store, metrics, latestRun, priorityJobs, runningCount, staleJobs, guide, guidePlan,
-      communicationAccount, guideCityQuery, guideCitySuggestions, guideLlmConfigured, llmReady,
-      percentOf, shortTime, deriveJobTags, runStatusLabel,
-      openGuide, closeGuide, finishResumeStep, testGuideLlm, saveGuideLlm, guideLogin, guideSyncFavorites,
-      addGuideCity, removeGuideCity, guideGeneratePlan, reviewGuidePlan, finishGuide,
+      communicationAccount, guideAccounts, guideCityQuery, guideCitySuggestions, guideLlmConfigured, llmReady,
+      percentOf, shortTime, formatEta, runProgressSummary, deriveJobTags, jobCardHref, runStatusLabel,
+      openGuide, closeGuide, finishResumeStep, testGuideLlm, saveGuideLlm,
+      setGuideDualAccount, guideAccountAction, guideSyncFavorites,
+      addGuideCity, removeGuideCity, guideGeneratePlan, chooseGuidePlanMode, reviewGuidePlan, finishGuide,
     }
   },
   template: `
@@ -792,8 +954,9 @@ const DashboardView = {
         <div class="section-title"><div><h2>最近采集</h2><p>{{runningCount ? runningCount + ' 个计划处理中' : '当前没有运行中的计划'}}</p></div><a href="#/collect">查看全部</a></div>
         <template v-if="latestRun">
           <div class="run-title"><div><b>{{latestRun.name}}</b><span>{{latestRun.source}} · {{shortTime(latestRun.startedAt)}}</span></div><span class="status-badge" :class="latestRun.status">{{runStatusLabel(latestRun.status)}}</span></div>
-          <div class="progress-copy"><span>{{latestRun.itemCount}} 条岗位</span><b>{{percentOf(latestRun)}}%</b></div>
+          <div class="progress-copy"><span>{{runProgressSummary(latestRun)}}</span><b>{{percentOf(latestRun)}}%</b></div>
           <div class="progress"><i :style="{width:percentOf(latestRun)+'%'}"></i></div>
+          <small v-if="latestRun.status==='running'" class="run-eta">{{formatEta(latestRun.etaSeconds)}}</small>
         </template>
       </section>
       <section class="surface-panel account-overview">
@@ -808,7 +971,7 @@ const DashboardView = {
     <section class="section-block">
       <div class="section-title"><div><h2>优先处理</h2><p>按当前简历匹配度排序的收藏岗位</p></div><a href="#/jobcard">进入收藏工作台</a></div>
       <div class="priority-list">
-        <a v-for="job in priorityJobs" :key="job.job_key" href="#/jobcard" class="priority-row">
+        <a v-for="job in priorityJobs" :key="job.job_key" :href="jobCardHref(job)" class="priority-row">
           <div><b>{{job.title}}</b><span>{{job.company || '公司信息保密'}} · {{job.salary}}</span></div>
           <div class="tag-line"><span v-for="tag in deriveJobTags(job)" :key="tag.key" class="tag" :class="tag.tone">{{tag.label}}</span></div>
           <strong>{{job.match_score ?? '—'}}</strong><small>匹配度</small>
@@ -840,17 +1003,19 @@ const DashboardView = {
         </section>
 
         <section v-if="guide.step===3" class="guide-content">
-          <div><h3>登录 BOSS 并同步收藏岗位</h3><p>同步结果会作为一条独立采集记录，可在采集中心启用或禁用。</p></div>
-          <div class="guide-account"><span class="account-icon">沟</span><div><b>{{communicationAccount.loggedIn?'BOSS 已登录':'等待登录 BOSS'}}</b><small>{{communicationAccount.running?'沟通号运行中':'沟通号尚未启动'}}</small></div><button :disabled="!!guide.busy" @click="guideLogin">{{guide.busy==='login'?'检测中…':communicationAccount.loggedIn?'重新检测':'登录 BOSS'}}</button></div>
+          <div><h3>配置账号模式并完成登录</h3><p>双账号模式下采集号负责只读采集，沟通号负责受护栏保护的沟通操作。</p></div>
+          <div class="guide-account-mode"><div><b>双账号隔离模式</b><span>{{guide.dualAccount?'采集号与沟通号分别登录':'采集与沟通统一使用沟通号'}}</span></div><label class="switch"><input type="checkbox" :checked="guide.dualAccount" :disabled="!!guide.busy" @change="setGuideDualAccount"><span class="switch-track"><span class="switch-thumb"></span></span><span>{{guide.dualAccount?'已开启':'已关闭'}}</span></label></div>
+          <div class="guide-account-grid"><article v-for="account in guideAccounts" :key="account.key" class="guide-account-card"><header><span class="account-icon">{{account.label.slice(0,1)}}</span><div><b>{{account.label}}</b><small>{{account.roles.join(' / ') || account.description}}</small></div><span class="status-badge" :class="account.loggedIn===true?'completed':account.running?'running':'paused'">{{account.loggedIn===true?'已登录':account.running?'待检测':'未启动'}}</span></header><footer><button :disabled="!!guide.busy" @click="guideAccountAction(account,'launch')">启动</button><button :disabled="!!guide.busy" @click="guideAccountAction(account,'login')">打开登录页</button><button :disabled="!!guide.busy" @click="guideAccountAction(account,'check')">{{guide.busy===account.key+'-check'?'检测中…':'检测登录态'}}</button><button :disabled="!!guide.busy || !account.running" @click="guideAccountAction(account,'stop')">停止</button></footer></article></div>
           <div class="guide-sync"><div><b>同步 BOSS 收藏岗位 <span class="optional-mark">可选</span></b><span>{{guide.synced?'本次同步已加入采集历史':'读取“感兴趣”岗位并加入本地岗位池，也可稍后处理'}}</span></div><button class="primary" :disabled="!!guide.busy || guide.synced" @click="guideSyncFavorites">{{guide.busy==='sync'?'同步中…':guide.synced?'同步完成':'开始同步'}}</button></div>
           <div class="guide-actions"><button @click="guide.step=2">上一步</button><button class="primary" @click="guide.step=4">{{guide.synced?'下一步':'跳过，下一步'}}</button></div>
         </section>
 
         <section v-if="guide.step===4" class="guide-content">
           <div><h3>设置新的采集计划</h3><p>配置主动搜索范围，稍后可在采集中心继续调整。</p></div>
-          <div class="segmented"><button :class="{active:guidePlan.mode==='manual'}" @click="guidePlan.mode='manual';guidePlan.generated=true">手动配置</button><button :class="{active:guidePlan.mode==='auto'}" @click="guidePlan.mode='auto';guidePlan.generated=false">AI 生成</button></div>
+          <div class="segmented"><button :class="{active:guidePlan.mode==='manual'}" @click="chooseGuidePlanMode('manual')">手动配置</button><button :class="{active:guidePlan.mode==='auto'}" @click="chooseGuidePlanMode('auto')">AI 生成</button></div>
           <div v-if="guidePlan.mode==='auto'" class="guide-ai-plan"><div><b>{{llmReady?'根据当前简历生成采集配置':'LLM 未配置，AI 生成不可用'}}</b><span>{{llmReady?'AI 只生成关键词与城市，不附加额外筛选条件':'返回上一步配置 LLM，或切换为手动配置'}}</span></div><button class="primary" :disabled="!!guide.busy || !llmReady" @click="guideGeneratePlan">{{guide.busy==='plan'?'生成中…':guidePlan.generated?'重新生成':'AI 生成采集计划'}}</button></div>
-          <div class="form-grid two"><label>计划名称<input v-model="guidePlan.name"></label><label>每组页数<input type="number" min="1" max="10" v-model.number="guidePlan.pages"></label></div>
+          <pre v-if="guidePlan.mode==='auto' && guidePlan.streamText" class="strategy-stream" :class="{done:guidePlan.generated}">{{guidePlan.streamText}}</pre>
+          <div class="form-grid two"><div class="plan-name-preview"><span>计划名称</span><b>{{guidePlan.name}}</b><small>启动后自动替换为实际流水号</small></div><label>每组页数<input type="number" min="1" max="10" v-model.number="guidePlan.pages"></label></div>
           <label>搜索关键词<textarea class="short" v-model="guidePlan.keywords" placeholder="每行一个关键词"></textarea></label>
           <div class="field-group"><span class="field-label">城市范围</span><div class="city-picker"><div class="city-input-row"><input v-model="guideCityQuery" placeholder="输入城市关键词" @keyup.enter="addGuideCity()"><button @click="addGuideCity()">添加</button></div><div v-if="guideCitySuggestions.length" class="city-suggestions"><button v-for="city in guideCitySuggestions" :key="city" @click="addGuideCity(city)">{{city}}</button></div><div class="city-tags"><span v-for="city in guidePlan.cities" :key="city" class="city-tag">{{city}}<button :aria-label="'移除城市 ' + city" @click="removeGuideCity(city)">×</button></span></div></div></div>
           <div class="field-group"><span class="field-label">采集详细程度</span><div class="segmented"><button :class="{active:!guidePlan.fetchDetails}" @click="guidePlan.fetchDetails=false">仅岗位列表</button><button :class="{active:guidePlan.fetchDetails}" @click="guidePlan.fetchDetails=true">采集完整JD（推荐）</button></div></div>
@@ -975,10 +1140,19 @@ function syncFilterOptions() {
     FILTER_OPTIONS[key] = ['不限', ...Object.keys(values[key] || {}).filter(value => value !== '不限')]
   }
 }
+function planNamePreview(resumeId, serial = '####') {
+  const now = new Date()
+  const date = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`
+  const resume = store.resumes.find(item => Number(item.id) === Number(resumeId))
+  const name = String(resume && resume.name || '简历')
+    .replace(/[\\/:*?"<>|\s]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 20) || '简历'
+  return `${date}-${name}-${serial}`
+}
 const createPlan = () => ({
-  name: '新的采集计划', mode: 'auto', fetchDetails: true, resumeId: store.selectedResumeId,
+  name: planNamePreview(store.selectedResumeId), mode: 'auto', fetchDetails: true, resumeId: store.selectedResumeId,
   keywords: '', cities: [], pages: 3, salary: '不限', experience: '不限',
   degree: '不限', scale: '不限', stage: '不限', industry: '不限', companies: '', generated: false,
+  streamText: '',
 })
 function filterLabel(key, raw) {
   const code = String(raw || '').split(',')[0]
@@ -998,20 +1172,38 @@ function applySavedConfig(plan, config) {
     degree: filterLabel('degree', filters.degree), scale: filterLabel('scale', filters.scale),
     stage: filterLabel('stage', filters.stage), industry: filterLabel('industry', filters.industry),
     companies: (config.companies || []).map(company => [company.name, company.url || company.brand_id].filter(Boolean).join(' | ')).join('\n'),
-    mode: 'manual', generated: true,
+    name: planNamePreview(config.resume_id || store.selectedResumeId),
+    mode: 'manual', generated: true, streamText: '',
   })
 }
 function applyGeneratedStrategy(plan, generated = {}) {
   const searches = Array.isArray(generated.searches) ? generated.searches : []
-  const directions = Array.isArray(generated.directions) ? generated.directions.filter(Boolean) : []
   Object.assign(plan, {
     mode: 'auto', generated: true,
-    name: directions.length ? `${directions.slice(0, 2).join(' / ')}采集计划` : 'AI 生成采集计划',
+    name: planNamePreview(plan.resumeId),
     keywords: [...new Set(searches.map(item => String(item.keyword || '').trim()).filter(Boolean))].join('\n'),
     cities: [...new Set(searches.map(item => String(item.city || '').trim()).filter(Boolean))],
     pages: Number(searches[0] && searches[0].pages || 3),
     salary: '不限', experience: '不限', degree: '不限', scale: '不限', stage: '不限', industry: '不限', companies: '',
   })
+}
+async function generateStrategyStreaming(plan, resumeId, signal) {
+  let generated = null
+  plan.streamText = ''
+  await apiClient.strategy.generateStream(resumeId, event => {
+    if (event.type === 'delta') {
+      plan.streamText = (plan.streamText + String(event.delta || '')).slice(-12000)
+    } else if (event.type === 'done') {
+      generated = event.plan
+    } else if (event.type === 'failed') {
+      throw new ApiError(event.message || 'AI 采集计划生成失败')
+    } else if (event.type === 'cancelled') {
+      throw new DOMException('生成已取消', 'AbortError')
+    }
+  }, signal)
+  if (!generated) throw new ApiError('AI 未返回完整采集计划')
+  applyGeneratedStrategy(plan, generated)
+  return generated
 }
 function planToCollectConfig(plan) {
   const filters = {}
@@ -1035,6 +1227,7 @@ async function saveAndStartPlan(plan) {
   await apiClient.collect.saveConfig(config, config.resume_id)
   store.collect.config = config
   const result = await apiClient.collect.start({ kind: 'config', resume_id: config.resume_id, config })
+  if (result && result.name) plan.name = result.name
   await Promise.allSettled([refreshCollectStatus(), refreshRuns(), refreshDashboard()])
   return result
 }
@@ -1050,19 +1243,26 @@ const CollectView = {
     const syncingFavorites = ref(false)
     const cityQuery = ref('')
     const plan = reactive(createPlan())
+    let planController = null
     const keywords = computed(() => plan.keywords.split(/[\n,，]+/).map(value => value.trim()).filter(Boolean))
     const companyList = computed(() => plan.companies.split(/\n/).map(value => value.trim()).filter(Boolean))
     const citySuggestions = computed(() => matchingCities(cityQuery.value, plan.cities))
     const llmReady = computed(() => isLlmConfigured())
     const resume = computed(() => store.resumes.find(item => item.id === Number(plan.resumeId)) || store.resumes[0])
     function startWizard() {
+      if (planController) planController.abort()
       Object.assign(plan, createPlan())
       applySavedConfig(plan, store.collect.config)
       step.value = 1
       screen.value = 'wizard'
       cityQuery.value = ''
     }
-    function closeWizard() { screen.value = 'history' }
+    function closeWizard() {
+      if (planController) planController.abort()
+      planController = null
+      generating.value = false
+      screen.value = 'history'
+    }
     async function syncFavoriteJobs() {
       syncingFavorites.value = true
       try {
@@ -1084,31 +1284,44 @@ const CollectView = {
         showToast('LLM 未配置，AI 生成采集计划不可用', 'warn')
         return
       }
+      if (planController) planController.abort()
+      planController = new AbortController()
+      const controller = planController
       generating.value = true
       try {
-        const generated = await apiClient.strategy.generate(plan.resumeId)
-        applyGeneratedStrategy(plan, generated)
+        await generateStrategyStreaming(plan, plan.resumeId, controller.signal)
         showToast('AI 采集计划已生成，可继续修改')
       } catch (error) {
-        showToast(`AI 采集计划生成失败：${error.message}`, 'bad')
-      } finally { generating.value = false }
+        if (error.name !== 'AbortError') showToast(`AI 采集计划生成失败：${error.message}`, 'bad')
+      } finally {
+        if (planController === controller) {
+          planController = null
+          generating.value = false
+        }
+      }
+    }
+    function setPlanMode(mode) {
+      if (mode === 'manual' && planController) planController.abort()
+      plan.mode = mode
+      plan.generated = mode === 'manual'
+      if (mode === 'manual') plan.streamText = ''
     }
     function nextToConfig() {
       step.value = 2
       if (plan.mode === 'manual') plan.generated = true
     }
     function toReview() {
-      if (!plan.name.trim() || !keywords.value.length || !plan.cities.length) {
-        showToast('请填写计划名称、关键词并至少选择一个城市', 'warn')
+      if (!keywords.value.length || !plan.cities.length) {
+        showToast('请填写关键词并至少选择一个城市', 'warn')
         return
       }
       step.value = 3
     }
     async function launchPlan() {
       try {
-        await saveAndStartPlan(plan)
+        const result = await saveAndStartPlan(plan)
         screen.value = 'history'
-        showToast(`采集计划「${plan.name.trim()}」已开始`)
+        showToast(`采集计划「${result.name || plan.name}」已开始`)
       } catch (error) {
         showToast(`采集计划启动失败：${error.message}`, 'bad')
       }
@@ -1182,9 +1395,12 @@ const CollectView = {
         showToast(`采集数据删除失败：${error.message}`, 'bad')
       }
     }
+    watch(() => plan.resumeId, resumeId => { plan.name = planNamePreview(resumeId) })
+    onBeforeUnmount(() => { if (planController) planController.abort() })
     return { store, screen, step, plan, generating, syncingFavorites, cityQuery, keywords, companyList, citySuggestions, llmReady, resume, FILTER_OPTIONS,
-      percentOf, fmtTime, runStatusLabel, startWizard, closeWizard, addCity, removeCity, generatePlan,
-      nextToConfig, toReview, launchPlan, syncFavoriteJobs, toggleRun, toggleRunData, cancelRun, deleteRunData, apiClient }
+      percentOf, fmtTime, formatEta, runProgressSummary, runStatusLabel,
+      startWizard, closeWizard, addCity, removeCity, generatePlan,
+      setPlanMode, nextToConfig, toReview, launchPlan, syncFavoriteJobs, toggleRun, toggleRunData, cancelRun, deleteRunData, apiClient }
   },
   template: `
   <div>
@@ -1201,8 +1417,8 @@ const CollectView = {
           <tbody>
             <tr v-for="run in store.runs" :key="run.id">
               <td><b>{{run.name}}</b><p>{{fmtTime(run.startedAt)}} · {{run.source}} · {{run.fetchDetails?'含完整 JD':'仅岗位列表'}}</p><span v-if="run.kind==='favorite_sync'" class="tag blue">收藏同步采集</span></td>
-              <td><strong class="table-number">{{run.itemCount}}</strong><span class="muted"> 条</span></td>
-              <td><div class="run-progress-cell"><div class="progress-copy"><span class="status-badge" :class="run.status">{{runStatusLabel(run.status)}}</span><b>{{percentOf(run)}}%</b><small v-if="run.progressTotal">{{run.progressCompleted}} / {{run.progressTotal}} 个步骤</small><small v-else>{{run.itemCount}} 条岗位</small></div><div class="progress"><i :style="{width:percentOf(run)+'%'}"></i></div></div></td>
+              <td><strong class="table-number">{{run.itemCount}}</strong><span class="muted"> 个岗位</span><div v-if="run.completenessKnown" class="collect-counts"><span>仅岗位描述 {{run.listOnlyCount}}</span><span>完整 JD {{run.withJdCount}}</span></div><small v-else class="muted">完整度无法追溯</small></td>
+              <td><div class="run-progress-cell"><div class="progress-copy"><span class="status-badge" :class="run.status">{{runStatusLabel(run.status)}}</span><b>{{percentOf(run)}}%</b><small>{{runProgressSummary(run)}}</small></div><div class="progress"><i :style="{width:percentOf(run)+'%'}"></i></div><small v-if="run.status==='running'" class="run-eta">{{formatEta(run.etaSeconds)}}</small><small v-else-if="run.status==='paused'" class="run-eta">已暂停，预计时间停止计算</small></div></td>
               <td><label class="switch compact" :title="run.hasSourceOwnership?'控制该次采集数据是否参与岗位展示':'旧记录缺少精确岗位归属'"><input type="checkbox" :checked="run.enabled" :disabled="!run.hasSourceOwnership" @change="toggleRunData(run,$event)"><span class="switch-track"><span class="switch-thumb"></span></span><span>{{run.hasSourceOwnership?(run.enabled?'已应用':'已禁用'):'仅统计'}}</span></label></td>
               <td><div class="row end"><button v-if="(run.status==='running' || run.status==='paused') && run.kind!=='favorite_sync'" @click="toggleRun(run)">{{run.status==='running'?'暂停':'继续'}}</button><button v-if="run.status==='running' || run.status==='paused'" class="danger-quiet" @click="cancelRun(run)">取消</button><button v-else class="danger-quiet" title="永久删除本次采集及独占岗位" @click="deleteRunData(run)">删除数据</button><a class="icon-button" :href="apiClient.runs.exportUrl(run.id)" download :aria-disabled="!run.canExport" :title="run.canExport?'导出 Excel':'旧记录缺少可导出的岗位归属'" :aria-label="'导出 ' + run.name" @click="!run.canExport && $event.preventDefault()">↓</a></div></td>
             </tr>
@@ -1221,19 +1437,20 @@ const CollectView = {
 
       <section v-if="step===1" class="wizard-panel">
         <div v-if="!llmReady" class="llm-warning"><b>LLM 未配置</b><span>AI 自动生成不可用，请改用手动选择或先到设置页配置 LLM。</span></div>
-        <div class="field-group"><span class="field-label">计划生成方式</span><div class="segmented wide"><button :class="{active:plan.mode==='auto'}" :disabled="!llmReady" @click="plan.mode='auto'"><b>AI 自动生成</b><small>根据选定简历生成关键词与范围</small></button><button :class="{active:plan.mode==='manual'}" @click="plan.mode='manual'"><b>手动选择</b><small>逐项配置关键词、城市和筛选</small></button></div></div>
+        <div class="field-group"><span class="field-label">计划生成方式</span><div class="segmented wide"><button :class="{active:plan.mode==='auto'}" :disabled="!llmReady" @click="setPlanMode('auto')"><b>AI 自动生成</b><small>根据选定简历生成关键词与范围</small></button><button :class="{active:plan.mode==='manual'}" @click="setPlanMode('manual')"><b>手动选择</b><small>逐项配置关键词、城市和筛选</small></button></div></div>
         <div class="field-group"><span class="field-label">采集详细程度</span><div class="segmented"><button :class="{active:!plan.fetchDetails}" @click="plan.fetchDetails=false">采集岗位列表</button><button :class="{active:plan.fetchDetails}" @click="plan.fetchDetails=true">采集完整JD（推荐）</button></div></div>
         <div class="wizard-actions"><span></span><button class="primary" @click="nextToConfig">下一步</button></div>
       </section>
 
       <section v-if="step===2" class="wizard-panel">
+        <pre v-if="plan.mode==='auto' && plan.streamText" class="strategy-stream" :class="{done:plan.generated}">{{plan.streamText}}</pre>
         <div v-if="plan.mode==='auto' && !plan.generated" class="ai-generate">
           <div><span class="ai-mark">AI</span><h2>根据简历生成采集计划</h2><p>{{llmReady?'选择本次采集使用的简历档案':'LLM 未配置，AI 生成功能不可用'}}</p></div>
           <label>简历档案<select v-model.number="plan.resumeId"><option v-for="item in store.resumes" :key="item.id" :value="item.id">{{item.name}}</option></select></label>
-          <button class="primary" :disabled="generating || !llmReady" @click="generatePlan"><span v-if="generating" class="spinner"></span>{{generating?'正在分析简历…':'生成采集计划'}}</button>
+          <button class="primary" :disabled="generating || !llmReady" @click="generatePlan"><span v-if="generating" class="spinner"></span>{{generating?'正在流式生成…':'生成采集计划'}}</button>
         </div>
         <template v-else>
-          <div class="form-grid two"><label>计划名称<input v-model="plan.name" maxlength="40"></label><label>每个关键词页数<input type="number" v-model.number="plan.pages" min="1" max="10"></label></div>
+          <div class="form-grid two"><div class="plan-name-preview"><span>计划名称</span><b>{{plan.name}}</b><small>启动后自动替换为实际流水号</small></div><label>每个关键词页数<input type="number" v-model.number="plan.pages" min="1" max="10"></label></div>
           <label class="block-label">搜索关键词<textarea class="short" v-model="plan.keywords" placeholder="每行一个关键词"></textarea></label>
           <div class="field-group"><span class="field-label">城市范围</span><div class="city-picker"><div class="city-input-row"><input v-model="cityQuery" placeholder="输入城市关键词" @keyup.enter="addCity()"><button @click="addCity()">添加</button></div><div v-if="citySuggestions.length" class="city-suggestions"><button v-for="city in citySuggestions" :key="city" @click="addCity(city)">{{city}}</button></div><div class="city-tags"><span v-for="city in plan.cities" :key="city" class="city-tag">{{city}}<button :aria-label="'移除城市 ' + city" @click="removeCity(city)">×</button></span></div></div></div>
           <div class="form-grid three"><label>薪资范围<select v-model="plan.salary"><option v-for="value in FILTER_OPTIONS.salary" :key="value">{{value}}</option></select></label><label>经验<select v-model="plan.experience"><option v-for="value in FILTER_OPTIONS.experience" :key="value">{{value}}</option></select></label><label>学历<select v-model="plan.degree"><option v-for="value in FILTER_OPTIONS.degree" :key="value">{{value}}</option></select></label><label>公司规模<select v-model="plan.scale"><option v-for="value in FILTER_OPTIONS.scale" :key="value">{{value}}</option></select></label><label>融资阶段<select v-model="plan.stage"><option v-for="value in FILTER_OPTIONS.stage" :key="value">{{value}}</option></select></label><label>行业<select v-model="plan.industry"><option v-for="value in FILTER_OPTIONS.industry" :key="value">{{value}}</option></select></label></div>
@@ -1389,28 +1606,32 @@ const JobsView = {
       const jobKeys = sortedJobs.value.map(job => job.job_key)
       if (!jobKeys.length) { showToast('当前没有可评分岗位', 'warn'); return }
       try {
-        const result = await enqueueAi('jobs', kind === '岗位评分' ? 'job_score' : 'match_score', jobKeys, true)
-        const note = result.added ? `已将 ${result.added} 个岗位加入评分队列` : '所选岗位已在评分队列中'
+        const result = await enqueueAi('jobs', kind === '岗位评分' ? 'job_score' : 'match_score', jobKeys)
+        const skipped = Number(result.skipped_existing_count || 0)
+        const note = result.added
+          ? `已将 ${result.added} 个岗位加入评分队列${skipped ? `，跳过 ${skipped} 个已有评分` : ''}`
+          : skipped ? `所选 ${skipped} 个岗位均已有评分，无需重复生成` : '所选岗位已在评分队列中'
         showToast(note, 'info')
       } catch (error) {
         showToast(`${kind}任务创建失败：${error.message}`, 'bad')
       }
     }
     return { store, q, favoriteFilter, tagFilter, expanded, sortState, columns, sortedJobs, taskSummary,
-      deriveJobTags, workflowLabel, scoreLabel, setSort, ariaSort, toggleExpanded, toggleFavorite, excludeJob, runScore }
+      deriveJobTags, workflowLabel, scoreLabel, jobCardHref, cancelAiTasks,
+      setSort, ariaSort, toggleExpanded, toggleFavorite, excludeJob, runScore }
   },
   template: `
   <div>
     <header class="page-head"><div><div class="eyebrow">岗位池</div><h1>岗位列表</h1><p>共 {{sortedJobs.length}} 个符合条件的岗位</p></div><div class="row scoring-controls"><label class="inline-select"><span>当前简历</span><select v-model.number="store.selectedResumeId"><option v-for="resume in store.resumes" :key="resume.id" :value="resume.id">{{resume.name}}</option></select></label><button @click="runScore('匹配度评分')">匹配度评分</button><button class="primary" @click="runScore('岗位评分')">岗位评分</button></div></header>
-    <div v-if="taskSummary.visible" class="ai-task-progress" :class="{done:!taskSummary.running}"><div><b>{{taskSummary.label}}</b><span>动态并发 {{taskSummary.effective}} / {{taskSummary.max}}</span></div><div class="progress"><i :style="{width:taskSummary.percent+'%'}"></i></div><strong>{{taskSummary.completed}} / {{taskSummary.total}}</strong><small v-if="taskSummary.failures">{{taskSummary.failures}} 个失败，可重新评分</small></div>
-    <div class="filterbar"><input v-model="q" aria-label="搜索岗位或公司" placeholder="搜索岗位、公司或地点"><select v-model="tagFilter" aria-label="岗位标签"><option value="all">全部标签</option><option value="headhunter">猎头</option><option value="weekend">双休</option><option value="benefits">福利</option></select><select v-model="favoriteFilter" aria-label="收藏状态"><option value="all">全部岗位</option><option value="only">仅收藏</option><option value="exclude">未收藏</option></select><span class="filter-result">{{sortedJobs.length}} 条结果</span></div>
+    <div v-if="taskSummary.visible" class="ai-task-progress" :class="{done:!taskSummary.running}"><div><b>{{taskSummary.label}}</b><span>动态并发 {{taskSummary.effective}} / {{taskSummary.max}}</span></div><div class="progress"><i :style="{width:taskSummary.percent+'%'}"></i></div><strong>{{taskSummary.completed}} / {{taskSummary.total}}</strong><small v-if="taskSummary.failures">{{taskSummary.failures}} 个失败，可重新评分</small><button v-if="taskSummary.running" class="danger-quiet" :disabled="taskSummary.cancelling" @click="cancelAiTasks('jobs')">{{taskSummary.cancelling?'取消中…':'取消评分'}}</button></div>
+    <div class="filterbar"><input v-model="q" aria-label="搜索岗位或公司" placeholder="搜索岗位、公司或地点"><select v-model="tagFilter" aria-label="岗位标签"><option value="all">全部标签</option><option value="headhunter">猎头</option><option value="benefits">福利</option><option value="weekend">双休</option><option value="eight_hour_weekend">八小时双休</option><option value="alternating_weekend">大小周</option><option value="outsourcing">外包</option></select><select v-model="favoriteFilter" aria-label="收藏状态"><option value="all">全部岗位</option><option value="only">仅收藏</option><option value="exclude">未收藏</option></select><span class="filter-result">{{sortedJobs.length}} 条结果</span></div>
     <div class="table-wrap">
       <table class="jobs-table">
         <thead><tr><th v-for="column in columns" :key="column.key" :aria-sort="ariaSort(column.key)"><button class="sort-button" @click="setSort(column.key)"><span>{{column.label}}</span><i :class="{active:sortState.key===column.key,desc:sortState.key===column.key&&sortState.direction==='desc'}"></i></button></th></tr></thead>
         <tbody>
           <template v-for="job in sortedJobs" :key="job.job_key">
             <tr class="job-row" :class="{open:expanded===job.job_key}" tabindex="0" @click="toggleExpanded(job)" @keyup.enter="toggleExpanded(job)">
-              <td data-label="岗位"><div class="job-title"><span class="chevron"></span><div><b>{{job.title}}</b><p>{{job.location}}</p><div class="tag-line"><span v-for="tag in deriveJobTags(job)" :key="tag.key" class="tag" :class="tag.tone">{{tag.label}}</span><span v-if="job.favorite" class="tag neutral">已收藏</span><span class="tag blue">{{workflowLabel(job)}}</span></div></div></div></td>
+              <td data-label="岗位"><div class="job-title"><span class="chevron"></span><div><b>{{job.title}}</b><p>{{job.location}}</p><div class="tag-line"><span v-for="tag in deriveJobTags(job)" :key="tag.key" class="tag" :class="tag.tone">{{tag.label}}</span><span v-if="job.favorite" class="tag neutral">已收藏</span><span v-if="workflowLabel(job)" class="tag blue">{{workflowLabel(job)}}</span></div></div></div></td>
               <td data-label="公司"><b>{{job.company || '公司信息保密'}}</b><p>{{job.industry}} · {{job.scale || '规模未知'}}</p></td>
               <td data-label="薪资" class="nowrap"><b>{{job.salary}}</b></td>
               <td data-label="经验 / 学历"><b>{{job.experience}}</b><p>{{job.degree}}</p></td>
@@ -1419,7 +1640,7 @@ const JobsView = {
               <td data-label="P级"><span class="priority" :class="String(job.priority||'').toLowerCase()">{{job.priority}}</span></td>
               <td data-label="活跃时间"><b>{{job.active}}</b><p>{{(job.active_ts||'').slice(0,10) || '—'}}</p></td>
             </tr>
-            <tr v-if="expanded===job.job_key" class="detail-row"><td colspan="8"><div class="job-detail"><div class="detail-toolbar"><button :class="{primary:job.favorite}" @click.stop="toggleFavorite(job)">{{job.favorite?'取消收藏':'添加收藏'}}</button><button @click.stop="excludeJob(job)">不再显示</button></div><div class="detail-meta"><div><span>岗位评分</span><b>{{scoreLabel(job,'job_score','jobs')}}</b></div><div><span>匹配度</span><b>{{scoreLabel(job,'match_score','jobs')}}</b></div><div><span>优先级</span><b>{{job.priority || '—'}}</b></div><div><span>来源关键词</span><b>{{job.source_keyword}}</b></div></div><h3>职位描述（JD）</h3><p class="jd-copy">{{job.jd}}</p></div></td></tr>
+            <tr v-if="expanded===job.job_key" class="detail-row"><td colspan="8"><div class="job-detail"><div class="detail-toolbar"><button :class="{primary:job.favorite}" @click.stop="toggleFavorite(job)">{{job.favorite?'取消收藏':'添加收藏'}}</button><a v-if="job.favorite" class="button" :href="jobCardHref(job)" @click.stop>岗位分析</a><button @click.stop="excludeJob(job)">不再显示</button></div><div class="detail-meta"><div><span>岗位评分</span><b>{{scoreLabel(job,'job_score','jobs')}}</b></div><div><span>匹配度</span><b>{{scoreLabel(job,'match_score','jobs')}}</b></div><div><span>优先级</span><b>{{job.priority || '—'}}</b></div><div><span>来源关键词</span><b>{{job.source_keyword}}</b></div></div><h3>职位描述（JD）</h3><p class="jd-copy">{{job.jd}}</p></div></td></tr>
           </template>
         </tbody>
       </table>
@@ -1435,14 +1656,14 @@ const JobCardView = {
     const statusFilter = ref('all')
     const selectedKeys = ref([])
     const initial = store.jobs.find(job => job.favorite && !job.excluded)
-    const activeKey = ref(initial ? initial.job_key : '')
+    const activeKey = ref(routeJobKey.value || (initial ? initial.job_key : ''))
     const taskSummary = computed(() => aiSummary('workbench'))
     const interview = reactive({
       open: false, busy: false, sessionId: null, jobKey: '', totalQuestions: 0,
       questionIndex: 0, currentQuestion: '', answers: [], input: '', report: null, canFinish: false,
     })
-    const jobs = computed(() => store.jobs.filter(job => {
-      if (!job.favorite || job.excluded) return false
+    const favoriteJobs = computed(() => store.jobs.filter(job => job.favorite && !job.excluded))
+    const jobs = computed(() => favoriteJobs.value.filter(job => {
       if (query.value && !`${job.title}${job.company}`.toLowerCase().includes(query.value.toLowerCase())) return false
       if (statusFilter.value === 'generated' && !job.greeting) return false
       const latestStage = job.offered ? 'offered' : job.interviewed ? 'interviewed'
@@ -1452,7 +1673,8 @@ const JobCardView = {
       if (statusFilter.value === 'failed' && !job.actionError) return false
       return true
     }))
-    const activeJob = computed(() => store.jobs.find(job => job.job_key === activeKey.value) || jobs.value[0] || null)
+    const activeJob = computed(() => favoriteJobs.value.find(job => job.job_key === activeKey.value)
+      || jobs.value[0] || favoriteJobs.value[0] || null)
     const allSelected = computed(() => jobs.value.length > 0 && jobs.value.every(job => selectedKeys.value.includes(job.job_key)))
     watch(() => activeJob.value && activeJob.value.job_key, async jobKey => {
       if (!jobKey) return
@@ -1464,6 +1686,8 @@ const JobCardView = {
     }, { immediate: true })
     async function selectJob(job) {
       activeKey.value = job.job_key
+      routeJobKey.value = job.job_key
+      history.replaceState(null, '', jobCardHref(job))
       try { await refreshJobDetail(job.job_key) }
       catch (error) { showToast(`岗位详情加载失败：${error.message}`, 'bad') }
     }
@@ -1492,7 +1716,7 @@ const JobCardView = {
     }
     async function generateAnalysis(job, silent = false) {
       try {
-        const result = await enqueueAi('workbench', 'analysis', [job.job_key], true)
+        const result = await enqueueAi('workbench', 'analysis', [job.job_key])
         job.actionError = ''
         job.actionErrorType = ''
         if (!silent) showToast(result.added ? '岗位分析已加入生成队列' : '该岗位正在生成分析', 'info')
@@ -1506,7 +1730,7 @@ const JobCardView = {
     }
     async function generateGreeting(job, silent = false) {
       try {
-        const result = await enqueueAi('workbench', 'greeting', [job.job_key], true)
+        const result = await enqueueAi('workbench', 'greeting', [job.job_key])
         job.actionError = ''
         job.actionErrorType = ''
         if (!silent) showToast(result.added ? '招呼语已加入生成队列' : '该岗位正在生成招呼语', 'info')
@@ -1564,8 +1788,11 @@ const JobCardView = {
       if (!accepted) return
       if (type === 'analysis' || type === 'greeting') {
         try {
-          const result = await enqueueAi('workbench', type, targets.map(job => job.job_key), true)
-          showToast(result.added ? `${result.added} 个岗位已加入${labels[type]}队列` : '所选岗位已在生成队列中', 'info')
+          const result = await enqueueAi('workbench', type, targets.map(job => job.job_key))
+          const skipped = Number(result.skipped_existing_count || 0)
+          showToast(result.added
+            ? `${result.added} 个岗位已加入${labels[type]}队列${skipped ? `，跳过 ${skipped} 个已有结果` : ''}`
+            : skipped ? `所选 ${skipped} 个岗位已有结果，无需重复生成` : '所选岗位已在生成队列中', 'info')
           if (!explicitKeys) selectedKeys.value = []
         } catch (error) { showToast(`${labels[type]}任务创建失败：${error.message}`, 'bad') }
         return
@@ -1575,7 +1802,7 @@ const JobCardView = {
       try {
         const missing = targets.filter(job => !job.greetingId || !job.greeting)
         if (missing.length) {
-          const queued = await enqueueAi('workbench', 'greeting', missing.map(job => job.job_key), true)
+          const queued = await enqueueAi('workbench', 'greeting', missing.map(job => job.job_key))
           const taskIds = (queued.tasks || []).map(task => task.id)
           const completed = await waitForTaskIds(taskIds)
           completed.filter(task => task.status !== 'succeeded').forEach(task => store.batch.failures.push(task.job_key))
@@ -1666,13 +1893,19 @@ const JobCardView = {
       finally { interview.busy = false }
     }
     function closeInterview() { interview.open = false }
-    watch(() => jobs.value[0] && jobs.value[0].job_key, key => {
-      if (key && !activeKey.value) selectJob(jobs.value[0])
+    watch([() => routeJobKey.value, () => favoriteJobs.value.map(job => job.job_key).join('|')], ([target]) => {
+      const matched = favoriteJobs.value.find(job => job.job_key === target)
+      if (matched) activeKey.value = matched.job_key
+      else if (!favoriteJobs.value.some(job => job.job_key === activeKey.value)) {
+        const fallback = jobs.value[0] || favoriteJobs.value[0]
+        activeKey.value = fallback ? fallback.job_key : ''
+      }
     }, { immediate: true })
     const activeAnalysisTask = job => job ? aiTaskFor('workbench', job.job_key, ['analysis']) : null
     const activeGreetingTask = job => job ? aiTaskFor('workbench', job.job_key, ['greeting']) : null
-    return { store, query, statusFilter, selectedKeys, activeKey, interview, jobs, activeJob, allSelected, taskSummary,
+    return { store, query, statusFilter, selectedKeys, activeKey, interview, jobs, favoriteJobs, activeJob, allSelected, taskSummary,
       deriveJobTags, workflowLabel, scoreLabel, renderMarkdown, activeAnalysisTask, activeGreetingTask,
+      cancelAiTasks, cancelAiTask,
       selectJob, toggleAll, openBoss, setWorkflowStage, generateAnalysis, generateGreeting, executeBatch,
       saveGreeting, selectGreetingVariant, copyAndOpenBoss, retryFailed, removeFavorite, startInterview, submitAnswer, closeInterview }
   },
@@ -1686,7 +1919,7 @@ const JobCardView = {
       <button :disabled="!selectedKeys.length" @click="executeBatch('greeting')">生成招呼语</button>
       <button class="primary" :disabled="!selectedKeys.length || store.batch.running" @click="executeBatch('auto')">自动打招呼</button>
     </div>
-    <div v-if="taskSummary.visible" class="ai-task-progress" :class="{done:!taskSummary.running}"><div><b>{{taskSummary.label}}</b><span>动态并发 {{taskSummary.effective}} / {{taskSummary.max}}</span></div><div class="progress"><i :style="{width:taskSummary.percent+'%'}"></i></div><strong>{{taskSummary.completed}} / {{taskSummary.total}}</strong><small v-if="taskSummary.failures">{{taskSummary.failures}} 个失败，可在岗位内重新生成</small></div>
+    <div v-if="taskSummary.visible" class="ai-task-progress" :class="{done:!taskSummary.running}"><div><b>{{taskSummary.label}}</b><span>动态并发 {{taskSummary.effective}} / {{taskSummary.max}}</span></div><div class="progress"><i :style="{width:taskSummary.percent+'%'}"></i></div><strong>{{taskSummary.completed}} / {{taskSummary.total}}</strong><small v-if="taskSummary.failures">{{taskSummary.failures}} 个失败，可在岗位内重新生成</small><button v-if="taskSummary.running" class="danger-quiet" :disabled="taskSummary.cancelling" @click="cancelAiTasks('workbench')">{{taskSummary.cancelling?'取消中…':'取消生成'}}</button></div>
     <div v-if="store.batch.running" class="batch-progress"><span>{{store.batch.label}}处理中</span><div class="progress"><i :style="{width:(store.batch.total?store.batch.done/store.batch.total*100:0)+'%'}"></i></div><b>{{store.batch.done}} / {{store.batch.total}}</b><small v-if="store.batch.failures.length">{{store.batch.failures.length}} 个待重试</small></div>
     <div class="workbench-layout">
       <aside class="workbench-list">
@@ -1706,7 +1939,7 @@ const JobCardView = {
         <div class="score-overview"><div><span>岗位评分</span><strong :class="{'score-pending':scoreLabel(activeJob,'job_score','workbench')==='评分中'}">{{scoreLabel(activeJob,'job_score','workbench')}}</strong><small>岗位本身质量</small></div><div><span>匹配度评分</span><strong :class="{'score-pending':scoreLabel(activeJob,'match_score','workbench')==='评分中'}">{{scoreLabel(activeJob,'match_score','workbench')}}</strong><small>当前简历匹配</small></div><div><span>优先级</span><strong>{{activeJob.priority || '未评分'}}</strong><small>{{activeJob.active}}</small></div></div>
         <section class="detail-section"><div class="section-title"><div><h3>职位描述（JD）</h3><p>{{activeJob.industry}} · {{activeJob.scale || '规模未知'}}</p></div></div><p class="jd-copy">{{activeJob.jd}}</p></section>
         <section class="detail-section"><div class="section-title"><div><h3>招呼语</h3><p>按当前简历生成，可在三版之间切换并继续编辑</p></div><button v-if="!activeJob.greeting && !activeGreetingTask(activeJob)" @click="generateGreeting(activeJob)">生成招呼语</button></div><div v-if="activeGreetingTask(activeJob)" class="generation-stream"><span class="spinner"></span><div><b>正在生成招呼语</b><p>{{activeGreetingTask(activeJob).message || '任务已进入队列，生成内容将实时返回'}}</p></div></div><template v-else-if="activeJob.greeting"><div class="variant-tabs" role="tablist"><button v-for="(variant,index) in activeJob.greetingVariants" :key="index" :class="{active:Number(activeJob.greetingSelectedIndex)===index}" role="tab" @click="selectGreetingVariant(activeJob,index)">{{activeJob.greetingLabels[index] || ('版本 ' + (index+1))}}</button></div><textarea v-model="activeJob.greeting" class="greeting-editor"></textarea></template><div v-else class="inline-empty">尚未生成招呼语</div><div v-if="activeJob.greeting && !activeGreetingTask(activeJob)" class="section-actions"><span>{{activeJob.greeting.length}} 字 · {{activeJob.greetingStatus==='approved'?'已批准':'草稿'}}</span><div class="row"><button @click="saveGreeting(activeJob)">保存并批准</button><button @click="copyAndOpenBoss(activeJob)">复制并打开 BOSS</button><button class="primary" @click="executeBatch('auto',[activeJob.job_key])">自动打招呼</button></div></div></section>
-        <section class="detail-section"><div class="section-title"><div><h3>应聘建议</h3><p>结合岗位要求与当前简历，按重点分段呈现</p></div><button v-if="!activeJob.analysisReady && !activeAnalysisTask(activeJob)" @click="generateAnalysis(activeJob)">生成分析</button></div><div v-if="activeAnalysisTask(activeJob)" class="generation-stream"><span class="spinner"></span><div><b>正在生成分析</b><p>{{activeAnalysisTask(activeJob).message || '正在读取 JD 与当前简历'}}</p></div></div><div v-else-if="activeJob.advice" class="advice-copy markdown-body" v-html="renderMarkdown(activeJob.advice)"></div><div v-else class="inline-empty">等待生成岗位分析与应聘建议</div></section>
+        <section class="detail-section"><div class="section-title"><div><h3>应聘建议</h3><p>结合岗位要求与当前简历，按重点分段呈现</p></div><button v-if="!activeJob.analysisReady && !activeAnalysisTask(activeJob)" @click="generateAnalysis(activeJob)">生成分析</button></div><div v-if="activeAnalysisTask(activeJob)" class="generation-stream"><span class="spinner"></span><div><b>正在生成分析</b><p>{{activeAnalysisTask(activeJob).message || '正在读取 JD 与当前简历'}}</p></div><button class="danger-quiet" :disabled="activeAnalysisTask(activeJob).cancel_requested" @click="cancelAiTask('workbench',activeAnalysisTask(activeJob))">{{activeAnalysisTask(activeJob).cancel_requested?'取消中…':'取消分析'}}</button></div><div v-else-if="activeJob.advice" class="advice-copy markdown-body" v-html="renderMarkdown(activeJob.advice)"></div><div v-else class="inline-empty">等待生成岗位分析与应聘建议</div></section>
         <div v-if="activeJob.actionError" class="notice bad"><b>上次处理失败</b><span>{{activeJob.actionError}}</span><button @click="retryFailed(activeJob)">重新生成</button></div>
       </section>
       <section v-else class="workbench-detail empty large"><b>选择一个收藏岗位查看详情</b></section>
@@ -1804,7 +2037,7 @@ const SettingsView = {
   template: `
   <div>
     <header class="page-head"><div><div class="eyebrow">系统偏好</div><h1>设置</h1><p>模型服务、发送护栏与评分参数</p></div><button class="primary" @click="save">保存设置</button></header>
-    <section class="settings-section"><div class="section-title"><div><h2>LLM 服务</h2><p>用于采集计划、匹配度评分、招呼语和模拟面试</p></div><span class="status-badge" :class="isLlmConfigured(draft)?'completed':'paused'">{{isLlmConfigured(draft)?'已配置':'未配置'}}</span></div><div class="form-grid three"><label>Base URL<input v-model="draft.llmBaseUrl" placeholder="https://api.example.com/v1"></label><label>API Key<input v-model="draft.llmApiKey" type="password" placeholder="由本地后端保存"></label><label>模型<input v-model="draft.llmModel" placeholder="model-name"></label></div><div class="setting-actions"><button :disabled="testing" @click="testConnection">{{testing?'测试中…':'测试连通性'}}</button><span v-if="testResult" :class="testResult.ok?'ok':'bad'">{{testResult.text}}</span></div></section>
+    <section class="settings-section"><div class="section-title"><div><h2>LLM 服务</h2><p>用于采集计划、匹配度评分、招呼语和模拟面试</p></div><span class="status-badge" :class="isLlmConfigured(draft)?'completed':'paused'">{{isLlmConfigured(draft)?'已配置':'未配置'}}</span></div><div class="llm-token-warning"><b>请注意 Token 消耗</b><span>批量岗位评分、应聘分析和招呼语会按岗位分别调用模型；建议先筛选目标岗位，再按需加入生成队列。</span></div><div class="form-grid three"><label>Base URL<input v-model="draft.llmBaseUrl" placeholder="https://api.example.com/v1"></label><label>API Key<input v-model="draft.llmApiKey" type="password" placeholder="由本地后端保存"></label><label>模型<input v-model="draft.llmModel" placeholder="model-name"></label></div><div class="setting-actions"><button :disabled="testing" @click="testConnection">{{testing?'测试中…':'测试连通性'}}</button><span v-if="testResult" :class="testResult.ok?'ok':'bad'">{{testResult.text}}</span></div></section>
     <section class="settings-section"><div class="section-title"><div><h2>发送护栏</h2><p>自动打招呼始终遵守以下边界</p></div><span class="status-badge paused">不可关闭</span></div><div class="form-grid four"><label>每日上限<input type="number" v-model.number="draft.sendDailyLimit" min="1" max="110"></label><label>硬顶<input type="number" v-model.number="draft.sendDailyHardCap" min="1" max="110"></label><label>最小间隔（秒）<input type="number" v-model.number="draft.sendGapMin" min="30" max="90"></label><label>最大间隔（秒）<input type="number" v-model.number="draft.sendGapMax" min="30" max="90"></label></div><div class="guardrail-list"><span>每日上限 {{draft.sendDailyLimit}}</span><span>硬顶 {{draft.sendDailyHardCap}}</span><span>{{draft.sendGapMin}}-{{draft.sendGapMax}} 秒随机间隔</span><span>同公司 30 天去重</span><span>风控信号当日熔断</span></div></section>
     <section class="settings-section"><div class="section-title"><div><h2>评分与活跃度</h2><p>控制匹配度评分数量和岗位有效性判断</p></div></div><div class="form-grid two"><label>匹配度评分默认岗位数<input type="number" v-model.number="draft.matchScoreTopN" min="1" max="100"></label><label>HR 不活跃阈值（天）<input type="number" v-model.number="draft.inactiveDays" min="1" max="90"></label></div></section>
   </div>`,
@@ -1820,14 +2053,13 @@ const App = {
     })[route.value] || DashboardView)
     const collectionSummary = computed(() => {
       const runs = store.runs.filter(run => run.status === 'running' || run.status === 'paused')
-      const collected = runs.reduce((sum, run) => sum + run.itemCount, 0)
-      const completed = runs.reduce((sum, run) => sum + run.progressCompleted, 0)
-      const target = runs.reduce((sum, run) => sum + run.progressTotal, 0)
-      const fallback = runs.length ? Math.round(runs.reduce((sum, run) => sum + percentOf(run), 0) / runs.length) : 0
+      const primary = runs.find(run => run.status === 'running') || runs[0]
+      const percent = runs.length
+        ? Math.round(runs.reduce((sum, run) => sum + percentOf(run), 0) / runs.length) : 0
       return {
         visible: runs.length > 0,
         label: runs.some(run => run.status === 'running') ? '采集中' : '采集已暂停',
-        collected, completed, target, percent: target ? Math.round(completed / target * 100) : fallback,
+        percent, summary: primary ? runProgressSummary(primary) : '',
       }
     })
     const theme = ref(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark')
@@ -1875,7 +2107,7 @@ const App = {
       <div class="brand-row"><div class="logo">boss<span>-copilot</span></div><span class="demo-badge">本地数据</span></div>
       <nav aria-label="主导航"><a v-for="[href,label] in nav" :key="href" :class="{on:route===href}" :href="'#'+href">{{label}}</a></nav>
       <div class="side-bottom">
-        <a v-if="collectionSummary.visible" class="side-progress" href="#/collect"><div><span>{{collectionSummary.label}}</span><b>{{collectionSummary.percent}}%</b></div><div class="progress"><i :style="{width:collectionSummary.percent+'%'}"></i></div><small>{{collectionSummary.collected}} 条岗位 · {{collectionSummary.completed}} / {{collectionSummary.target}} 步</small></a>
+        <a v-if="collectionSummary.visible" class="side-progress" href="#/collect"><div><span>{{collectionSummary.label}}</span><b>{{collectionSummary.percent}}%</b></div><div class="progress"><i :style="{width:collectionSummary.percent+'%'}"></i></div><small>{{collectionSummary.summary}}</small></a>
         <button class="theme-toggle" type="button" :aria-label="theme==='dark'?'切换浅色主题':'切换深色主题'" @click="toggleTheme"><span>{{theme==='dark'?'☀':'☾'}}</span>{{theme==='dark'?'切换浅色':'切换深色'}}</button>
         <div class="side-foot"><span class="status-dot" :class="store.ui.bootstrapError?'warn':'ok'"></span>{{store.ui.bootstrapError?'后端连接异常':'本地后端已连接'}}</div>
       </div>

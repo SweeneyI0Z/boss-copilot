@@ -59,7 +59,9 @@ class FrontendUxTests(unittest.TestCase):
         self.assertNotIn("run.collected = Math.min", self.app)
         self.assertNotIn("await wait(", self.app)
         self.assertIn("const succeeded = status === 'completed'", self.app)
-        self.assertIn("succeeded ? 100 : total ? Math.min(99", self.app)
+        self.assertIn("const backendPercent = Number(progress.percent)", self.app)
+        self.assertIn("runProgressSummary(run)", self.app)
+        self.assertNotIn("个步骤", self.app)
 
     def test_collection_sources_can_be_enabled_and_include_favorites_sync(self):
         self.assertIn("async function toggleRunData", self.app)
@@ -136,12 +138,12 @@ class FrontendUxTests(unittest.TestCase):
     def test_job_tags_follow_shared_keyword_rules(self):
         self.assertIn("function deriveJobTags(job)", self.app)
         self.assertIn("!company || company.includes('某')", self.app)
-        self.assertIn("job.has_weekend ||", self.app)
-        self.assertIn("job.has_benefits ||", self.app)
-        self.assertIn("/周末双休|双休/", self.app)
-        for keyword in ("五险一金", "年终奖", "带薪年假", "补充医疗", "股票期权",
-                        "定期体检", "节日福利", "弹性工作"):
-            self.assertIn(keyword, self.app)
+        for field in ("job.has_benefits", "job.has_weekend",
+                      "job.has_eight_hour_weekend", "job.has_alternating_weekend",
+                      "job.is_outsourcing"):
+            self.assertIn(field, self.app)
+        for label in ("福利", "双休", "八小时双休", "大小周", "外包"):
+            self.assertIn(label, self.app)
         self.assertGreaterEqual(self.app.count("deriveJobTags("), 6)
 
     def test_workbench_and_full_screen_interview_are_responsive(self):

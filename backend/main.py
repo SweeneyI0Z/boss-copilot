@@ -1,5 +1,6 @@
 """boss-copilot FastAPI 入口：数据 API + 前端静态托管。"""
 import json
+import queue
 import threading
 from pathlib import Path
 from typing import Optional
@@ -142,6 +143,26 @@ def _stream_progress(task: dict):
     return on_delta
 
 
+def _is_completed_l2(score: dict = None) -> bool:
+    """完整 L2 以当前简历修订的综合分为准，导入与引擎结果一视同仁。"""
+    return bool(score and score.get("composite") is not None
+                and not bool(score.get("l2_stale")))
+
+
+def _completed_l2_keys(job_keys: list, resume_id: int, revision: int) -> set:
+    keys = list(dict.fromkeys(str(key) for key in job_keys if key))
+    if not keys:
+        return set()
+    marks = ",".join("?" for _ in keys)
+    rows = get_db().execute(
+        "SELECT job_key FROM job_resume_scores WHERE resume_id=? "
+        "AND resume_revision=? AND composite IS NOT NULL "
+        "AND COALESCE(l2_stale,0)=0 AND job_key IN (" + marks + ")",
+        [int(resume_id), int(revision), *keys],
+    ).fetchall()
+    return {row["job_key"] for row in rows}
+
+
 def _run_score_artifact(task: dict, cancelled) -> dict:
     """跨页面共用同一岗位评分调用；等待者复用结果，取消的所有者不会拖垮另一页。"""
     from . import llm as llm_mod, resumes
@@ -154,6 +175,10 @@ def _run_score_artifact(task: dict, cancelled) -> dict:
         raise llm_mod.LLMCancelledError("简历已更新，旧修订评分已取消")
     if cancelled():
         raise llm_mod.LLMCancelledError("评分任务已取消")
+    force = bool(task["payload"].get("force", False))
+    existing = resumes.get_job_score(task["job_key"], resume_id, revision)
+    if not force and _is_completed_l2(existing):
+        return {**existing, "reused_existing": True}
 
     scoring_l1.run_l1(
         force=False, resume_id=resume_id, job_keys=[task["job_key"]])
@@ -166,20 +191,29 @@ def _run_score_artifact(task: dict, cancelled) -> dict:
                 flight = {"event": threading.Event(), "result": None, "error": None}
                 _score_flights[claim] = flight
         if owner:
+            result = None
+            error = None
             try:
-                result = scoring_l2.score_job_llm(
-                    task["job_key"], resume_id=resume_id,
-                    force=bool(task["payload"].get("force", True)),
-                    on_delta=_stream_progress(task), cancelled=cancelled)
+                existing = resumes.get_job_score(
+                    task["job_key"], resume_id, revision)
+                if not force and _is_completed_l2(existing):
+                    result = {**existing, "reused_existing": True}
+                else:
+                    result = scoring_l2.score_job_llm(
+                        task["job_key"], resume_id=resume_id,
+                        resume_revision=revision, force=force,
+                        on_delta=_stream_progress(task), cancelled=cancelled)
+            except BaseException as caught:
+                error = caught
+            with _score_flights_lock:
                 flight["result"] = result
-                return result
-            except Exception as error:
                 flight["error"] = error
-                raise
-            finally:
-                with _score_flights_lock:
-                    _score_flights.pop(claim, None)
                 flight["event"].set()
+                if _score_flights.get(claim) is flight:
+                    _score_flights.pop(claim, None)
+            if error is not None:
+                raise error
+            return result
 
         while not flight["event"].wait(0.1):
             if cancelled():
@@ -218,7 +252,7 @@ def _get_ai_scheduler():
 
 
 def _enqueue_ai(page: str, kind: str, job_keys: list, resume: dict,
-                force: bool = True) -> dict:
+                force: bool = False) -> dict:
     items = [{"job_key": key, "payload": {
         "resume_revision": int(resume["revision"]), "force": bool(force),
     }} for key in dict.fromkeys(str(key) for key in job_keys if key)]
@@ -498,7 +532,7 @@ def list_jobs(status: Optional[str] = "active", q: str = "", source: str = "",
               keyword: str = "", favorite: str = "all", headhunter: str = "all",
               resume_id: Optional[int] = None, sort: str = "composite",
               limit: int = 50, offset: int = 0):
-    from . import collection_runs, resumes, workflow
+    from . import collection_runs, job_tags, resumes, workflow
     try:
         resume = resumes.get_default_resume() if resume_id is None else \
             resumes.get_resume(resume_id)
@@ -551,7 +585,7 @@ def list_jobs(status: Optional[str] = "active", q: str = "", source: str = "",
         f"SELECT COUNT(*) c FROM jobs j WHERE {cond}", args).fetchone()["c"]
     rows = conn.execute(
         f"SELECT j.job_key, j.title, j.company, j.salary, j.salary_max, j.experience, "
-        f"j.degree, j.location, j.industry, j.scale, j.stage, j.hr_active, j.source, "
+        f"j.degree, j.location, j.industry, j.scale, j.stage, j.skills, j.hr_active, j.source, "
         f"j.status, j.last_seen_at, j.job_link, j.favorite_at, j.is_headhunter, "
         f"j.headhunter_reason, j.headhunter_override, {hunter_expr} effective_headhunter, "
         f"(SELECT group_concat(DISTINCT f.account) FROM job_favorite_hits f "
@@ -585,16 +619,13 @@ def list_jobs(status: Optional[str] = "active", q: str = "", source: str = "",
     details = {}
     if keys:
         marks = ",".join("?" for _ in keys)
-        details = {row["job_key"]: str(row["jd"] or "") for row in conn.execute(
-            f"SELECT job_key,jd FROM job_details WHERE job_key IN ({marks})", keys)}
-    welfare_words = ("五险一金", "年终奖", "带薪年假", "补充医疗", "餐补", "房补",
-                     "住房补贴", "交通补贴", "股票期权", "定期体检", "节日福利",
-                     "员工旅游", "弹性工作")
+        details = {row["job_key"]: dict(row) for row in conn.execute(
+            f"SELECT job_key,jd,skill_tags FROM job_details "
+            f"WHERE job_key IN ({marks})", keys)}
     for item in items:
-        jd = details.get(item["job_key"], "")
-        text = f"{item.get('title', '')}\n{jd}"
-        item["has_weekend"] = "双休" in text
-        item["has_benefits"] = any(word in text for word in welfare_words)
+        detail = details.get(item["job_key"], {})
+        item.update(job_tags.classify_job_tags(
+            item, detail.get("jd", ""), detail.get("skill_tags", "")))
         item["workflow"] = states.get(item["job_key"], {})
         item.update(states.get(item["job_key"], {}))
     counts = conn.execute(
@@ -607,7 +638,7 @@ def list_jobs(status: Optional[str] = "active", q: str = "", source: str = "",
 
 @app.get("/api/jobs/{job_key}")
 def job_detail(job_key: str, resume_id: Optional[int] = None):
-    from . import applications, resumes, workflow
+    from . import applications, job_tags, resumes, workflow
     conn = get_db()
     job = conn.execute("SELECT * FROM jobs WHERE job_key=?", (job_key,)).fetchone()
     if job is None:
@@ -653,11 +684,8 @@ def job_detail(job_key: str, resume_id: Optional[int] = None):
     out["workflow"] = workflow.get_state(job_key, resume["id"])
     out.update({key: out["workflow"][key]
                 for key in ("greeted", "applied", "interviewed", "offered")})
-    text = f"{out.get('title', '')}\n{out.get('jd', '')}"
-    out["has_weekend"] = "双休" in text
-    out["has_benefits"] = any(word in text for word in (
-        "五险一金", "年终奖", "带薪年假", "补充医疗", "餐补", "房补", "住房补贴",
-        "交通补贴", "股票期权", "定期体检", "节日福利", "员工旅游", "弹性工作"))
+    out.update(job_tags.classify_job_tags(
+        out, out.get("jd", ""), out.get("skill_tags", "")))
     return out
 
 
@@ -840,9 +868,6 @@ def ai_tasks_enqueue(page: str, body: dict):
         raise HTTPException(400, str(e))
     if resume.get("archived"):
         raise HTTPException(400, "已归档简历不能创建生成任务")
-    if kind in ("score", "analysis") and not llm_mod.configured():
-        raise HTTPException(400, "LLM 未配置：请在「设置」页填写 BYOK 信息")
-
     rows = get_db().execute(
         "SELECT job_key FROM jobs WHERE status='active' AND job_key IN (%s)" %
         ",".join("?" for _ in job_keys), job_keys).fetchall()
@@ -851,9 +876,21 @@ def ai_tasks_enqueue(page: str, body: dict):
     accepted = [key for key in job_keys if key in existing]
     if not accepted:
         raise HTTPException(400, "所选岗位不存在或已不在当前列表")
+    force = bool(body.get("force", False))
+    skipped_existing = []
+    queued_keys = accepted
+    if kind in ("score", "analysis") and not force:
+        completed = _completed_l2_keys(
+            accepted, resume["id"], resume["revision"])
+        skipped_existing = [key for key in accepted if key in completed]
+        queued_keys = [key for key in accepted if key not in completed]
+    if queued_keys and kind in ("score", "analysis") and not llm_mod.configured():
+        raise HTTPException(400, "LLM 未配置：请在「设置」页填写 BYOK 信息")
     result = _enqueue_ai(
-        page, kind, accepted, resume, force=bool(body.get("force", True)))
+        page, kind, queued_keys, resume, force=force)
     return {**result, "page": page, "kind": kind, "missing": missing,
+            "skipped_existing": skipped_existing,
+            "skipped_existing_count": len(skipped_existing),
             "resume_id": resume["id"], "resume_revision": resume["revision"],
             "snapshot": _get_ai_scheduler().snapshot(page)}
 
@@ -875,7 +912,8 @@ def ai_tasks_cancel(page: str, body: dict = None):
         _validate_ai_page_kind(page, str(kind))
     try:
         count = _get_ai_scheduler().cancel(
-            page=page, job_key=body.get("job_key"),
+            task_id=body.get("task_id"), page=page,
+            job_key=body.get("job_key"),
             resume_id=int(body["resume_id"]) if body.get("resume_id") else None,
             kind=str(kind) if kind else None)
     except ValueError as e:
@@ -919,6 +957,64 @@ def gen_strategy(body: dict = None):
         raise HTTPException(400, str(e))
     strategy.save_plan(plan, prof["id"])
     return plan
+
+
+@app.post("/api/strategy/generate/stream")
+def gen_strategy_stream(body: dict = None):
+    """以 NDJSON 实时返回采集策略原始增量，成功校验后再保存最终计划。"""
+    from . import llm as llm_mod
+    from . import resumes
+    if not llm_mod.configured():
+        raise HTTPException(400, "LLM 未配置：请在「设置」页填写 BYOK 信息")
+    resume_id = (body or {}).get("resume_id")
+    try:
+        prof = resumes.get_default_resume() if not resume_id else resumes.get_resume(resume_id)
+        if prof.get("archived"):
+            raise ValueError("已归档简历不能生成采集策略")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    events = queue.Queue()
+    cancelled = threading.Event()
+
+    def publish(event: dict) -> None:
+        events.put(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def worker() -> None:
+        try:
+            plan = strategy.generate_plan(
+                prof["resume_text"], prof["expectations"],
+                on_delta=lambda delta: publish({"type": "delta", "delta": delta}),
+                cancelled=cancelled.is_set)
+            if cancelled.is_set():
+                raise llm_mod.LLMCancelledError("采集计划生成已取消")
+            strategy.save_plan(plan, prof["id"])
+            publish({"type": "done", "plan": plan})
+        except llm_mod.LLMCancelledError:
+            publish({"type": "cancelled"})
+        except Exception as error:
+            publish({"type": "failed", "message": str(error)[:300]})
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def stream():
+        try:
+            while True:
+                try:
+                    line = events.get(timeout=0.5)
+                except queue.Empty:
+                    yield json.dumps({"type": "heartbeat"}) + "\n"
+                    continue
+                yield line
+                event = json.loads(line)
+                if event.get("type") in ("done", "failed", "cancelled"):
+                    return
+        finally:
+            cancelled.set()
+
+    return StreamingResponse(
+        stream(), media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.put("/api/strategy")
