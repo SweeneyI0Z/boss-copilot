@@ -1,926 +1,1368 @@
 import {
-  createApp, ref, reactive, computed, onMounted, onBeforeUnmount,
+  createApp, ref, reactive, computed,
 } from '/static/vue.esm-browser.prod.js'
+import { marked } from '/static/vendor/marked.esm.js'
+import DOMPurify from '/static/vendor/purify.es.mjs'
 
-// ── API 与通用格式化 ──────────────────────────────────────────────
-const api = {
-  async request(method, url, body) {
-    const options = { method, headers: {} }
-    if (body !== undefined) {
-      options.headers['Content-Type'] = 'application/json'
-      options.body = JSON.stringify(body)
-    }
-    const response = await fetch(url, options)
-    const contentType = response.headers.get('content-type') || ''
-    const data = contentType.includes('application/json')
-      ? await response.json()
-      : await response.text()
-    if (!response.ok) {
-      throw new Error((data && (data.detail || data.error)) || data || `请求失败（${response.status}）`)
-    }
-    return data
-  },
-  get(url) { return this.request('GET', url) },
-  post(url, body = {}) { return this.request('POST', url, body) },
-  put(url, body = {}) { return this.request('PUT', url, body) },
-  delete(url, body) { return this.request('DELETE', url, body) },
-}
-
+// -- 通用格式化与安全渲染 -----------------------------------------------
+const clone = value => JSON.parse(JSON.stringify(value))
+const wait = (ms = 500) => new Promise(resolve => setTimeout(resolve, ms))
 const fmtTime = value => {
   if (!value) return '暂无记录'
   const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return String(value).slice(0, 19)
+  if (Number.isNaN(date.getTime())) return String(value)
   return date.toLocaleString('zh-CN', { hour12: false })
 }
-const arrayOf = value => Array.isArray(value) ? value : (value && Array.isArray(value.items) ? value.items : [])
-const first = (...values) => values.find(value => value !== undefined && value !== null && value !== '')
-const score = (job, kind) => {
-  if (kind === 'job') return first(job.job_score, job.l1_score, '—')
-  if (kind === 'match') return first(job.match_score, job.match_rough, '—')
-  return first(job.composite, job.composite_rough, '—')
+const shortTime = value => {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return String(value || '')
+  return `${date.getMonth() + 1}月${date.getDate()}日 ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
 }
-const splitLines = value => String(value || '').split(/[\n,，]+/).map(x => x.trim()).filter(Boolean)
-const joinText = value => typeof value === 'string' ? value : JSON.stringify(value || {}, null, 2)
-const parseProfileField = (value, fallbackKey) => {
-  const text = String(value || '').trim()
-  if (!text) return {}
-  try { return JSON.parse(text) } catch (_) {
-    return fallbackKey === 'skills' ? { skills: splitLines(text) } : { [fallbackKey]: text }
-  }
+const percentOf = run => run.target ? Math.min(100, Math.round(run.collected / run.target * 100)) : 0
+
+marked.setOptions({ gfm: true, breaks: true })
+function renderMarkdown(value) {
+  const html = marked.parse(String(value || ''))
+  return DOMPurify.sanitize(html, {
+    USE_PROFILES: { html: true },
+    FORBID_TAGS: ['style', 'script', 'iframe', 'object', 'embed', 'form'],
+    FORBID_ATTR: ['style'],
+  })
 }
 
-// ── Hash 路由 ────────────────────────────────────────────────────
-const route = ref(location.hash.slice(1) || '/dashboard')
+// -- 演示数据：所有业务状态仅存在于当前页面会话 ----------------------------
+const INITIAL_RESUMES = [
+  {
+    id: 1,
+    name: '嵌入式软件主简历',
+    updatedAt: '2026-08-26T09:20:00+08:00',
+    body: `# 林知远
+
+**嵌入式软件工程师 · 4 年经验 · 深圳**
+
+## 核心能力
+
+- 熟练使用 C、C++、Python，具备 STM32、GD32 与 FreeRTOS 量产经验
+- 掌握 SPI、I2C、UART、CAN、BLE、4G 等通信链路
+- 负责过医疗设备与智能硬件从原型、注册到量产的完整交付
+- 使用 AI Agent 完成驱动开发、自动化测试和日志分析
+
+## 工作经历
+
+| 时间 | 公司 | 职位 |
+| --- | --- | --- |
+| 2023 - 至今 | 澄川医疗 | 嵌入式软件工程师 |
+| 2021 - 2023 | 云栖电子 | 硬件工程师 |
+
+## 代表项目
+
+### 多通道生理信号采集设备
+
+基于 STM32H7 与 FreeRTOS 完成 16 通道信号采集、USB 高速传输和设备状态管理，建立自动化压测工具并支持产品注册验证。
+
+### 低功耗物联网终端
+
+完成 BLE 与 4G 双链路通信、A/B 分区 OTA、异常恢复和远程日志系统。`,
+  },
+  {
+    id: 2,
+    name: 'AI 应用方向简历',
+    updatedAt: '2026-08-25T18:10:00+08:00',
+    body: `# 林知远
+
+**AI 应用工程师 · 嵌入式背景**
+
+## 技术栈
+
+- Python、FastAPI、TypeScript、Vue、Electron
+- LLM Agent、工具调用、RAG、自动化评测
+- 嵌入式研发流程与软硬件联合调试
+
+## 项目经验
+
+1. 参与桌面 AI IDE 开发，负责工具调用、历史回放与质量验收。
+2. 建立自动化测试体系，为复杂工程新增 200 余个场景。
+3. 将大型工程目录扫描从 16 秒优化至 0.3 秒。`,
+  },
+]
+
+const INITIAL_JOBS = [
+  {
+    job_key: 'demo-anker-fw', title: '嵌入式软件工程师', company: '安澜智能',
+    salary: '30-50K·16薪', salary_min: 30, salary_max: 50, experience: '3-5年', degree: '本科',
+    location: '深圳·宝安区', industry: '智能硬件', scale: '1000-9999人', source_keyword: '嵌入式软件工程师',
+    job_score: 86, match_score: 94, priority: 'P0', active: '刚刚活跃', active_ts: '2026-08-26T14:18:00+08:00',
+    favorite: true, excluded: false, contacted: false, analysisReady: true, actionError: '',
+    jd: '负责智能硬件嵌入式软件架构与驱动开发，要求熟悉 STM32、FreeRTOS、BLE 与低功耗设计。团队实行周末双休，提供五险一金、年终奖、带薪年假和定期体检。',
+    greeting: '您好，我有 4 年嵌入式产品开发经验，长期使用 STM32、FreeRTOS 和 BLE，完整参与过产品量产交付。贵司岗位与我的技术背景高度匹配，期待进一步沟通。',
+    advice: '匹配度高。沟通时优先强调量产经验、低功耗优化和复杂问题定位能力，并准备一个 FreeRTOS 任务调度或 BLE 功耗优化案例。',
+  },
+  {
+    job_key: 'demo-agent', title: 'AI Agent 应用工程师', company: '灵犀科技',
+    salary: '25-40K·15薪', salary_min: 25, salary_max: 40, experience: '3-5年', degree: '本科',
+    location: '深圳·南山区', industry: '人工智能', scale: '100-499人', source_keyword: 'AI Agent',
+    job_score: 82, match_score: 91, priority: 'P0', active: '今日活跃', active_ts: '2026-08-26T10:26:00+08:00',
+    favorite: true, excluded: false, contacted: false, analysisReady: true, actionError: '',
+    jd: '负责企业级 Agent 产品研发，使用 Python、FastAPI 与大模型工具调用。要求具备工程质量意识和自动化测试经验。提供弹性工作、股票期权、餐补与节日福利。',
+    greeting: '',
+    advice: '可重点展示 AI IDE 项目中的工具调用和测试体系建设，避免只谈模型效果，突出工程可靠性、可观测性与交付速度。',
+  },
+  {
+    job_key: 'demo-hunter', title: '机器人嵌入式软件工程师', company: '某大型机器人公司',
+    salary: '28-45K·14薪', salary_min: 28, salary_max: 45, experience: '3-5年', degree: '本科',
+    location: '深圳', industry: '机器人', scale: '1000-9999人', source_keyword: '机器人嵌入式',
+    job_score: 79, match_score: 89, priority: 'P0', active: '3日内活跃', active_ts: '2026-08-24T16:30:00+08:00',
+    favorite: true, excluded: false, contacted: false, analysisReady: false, actionError: '',
+    jd: '猎头代招机器人嵌入式软件岗位，负责电机控制、CAN 通信和 RTOS 平台维护。要求有量产项目经验。',
+    greeting: '', advice: '',
+  },
+  {
+    job_key: 'demo-medical', title: '高级嵌入式工程师（医疗器械）', company: '澄海医疗',
+    salary: '24-38K·13薪', salary_min: 24, salary_max: 38, experience: '5-10年', degree: '本科',
+    location: '深圳·光明区', industry: '医疗健康', scale: '500-999人', source_keyword: '医疗嵌入式',
+    job_score: 91, match_score: 96, priority: 'P0', active: '今日活跃', active_ts: '2026-08-26T09:12:00+08:00',
+    favorite: true, excluded: false, contacted: true, applied: true, interviewed: false, analysisReady: true, actionError: '',
+    jd: '负责二类医疗设备固件架构、风险控制与注册验证，要求熟悉 GB 9706、EMC 整改和量产流程。双休，提供补充医疗、住房补贴、年终奖。',
+    greeting: '您好，我有医疗器械嵌入式开发与注册验证经验，熟悉 GB 9706、EMC 整改和量产问题闭环，希望有机会进一步了解岗位。',
+    advice: '这是最匹配的岗位之一。面试应准备注册检验、风险控制与 EMC 整改的完整闭环案例，并量化自己主导的型号数量。',
+  },
+  {
+    job_key: 'demo-secret', title: '资深 MCU 开发工程师', company: '',
+    salary: '22-35K', salary_min: 22, salary_max: 35, experience: '3-5年', degree: '大专',
+    location: '东莞·松山湖', industry: '电子制造', scale: '', source_keyword: 'MCU开发',
+    job_score: 67, match_score: 84, priority: 'P1', active: '本周活跃', active_ts: '2026-08-22T11:00:00+08:00',
+    favorite: false, excluded: false, contacted: false, analysisReady: false, actionError: '',
+    jd: '负责消费电子 MCU 固件开发，熟悉 GD32、USB、UART 和生产测试工具。',
+    greeting: '', advice: '',
+  },
+  {
+    job_key: 'demo-rtos', title: 'RTOS 平台软件工程师', company: '远景智造',
+    salary: '26-42K·14薪', salary_min: 26, salary_max: 42, experience: '3-5年', degree: '本科',
+    location: '广州·黄埔区', industry: '工业自动化', scale: '500-999人', source_keyword: 'RTOS',
+    job_score: 80, match_score: 90, priority: 'P0', active: '刚刚活跃', active_ts: '2026-08-26T14:05:00+08:00',
+    favorite: true, excluded: false, contacted: false, analysisReady: false, actionError: '',
+    jd: '负责 RTOS 内核适配、BSP、驱动框架和性能分析。周末双休，五险一金，提供交通补贴和员工旅游。',
+    greeting: '', advice: '',
+  },
+  {
+    job_key: 'demo-iot', title: '物联网终端软件工程师', company: '星途物联',
+    salary: '20-32K·13薪', salary_min: 20, salary_max: 32, experience: '1-3年', degree: '本科',
+    location: '杭州·滨江区', industry: '物联网', scale: '100-499人', source_keyword: '物联网终端',
+    job_score: 75, match_score: 88, priority: 'P1', active: '今日活跃', active_ts: '2026-08-26T08:50:00+08:00',
+    favorite: false, excluded: false, contacted: false, analysisReady: false, actionError: '',
+    jd: '负责 4G、BLE 终端软件开发与 OTA 平台建设，要求熟悉 MQTT、TLS 和异常恢复。提供五险一金、餐补、带薪年假。',
+    greeting: '', advice: '',
+  },
+  {
+    job_key: 'demo-edge-ai', title: '边缘 AI 嵌入式工程师', company: '见微智能',
+    salary: '30-55K·15薪', salary_min: 30, salary_max: 55, experience: '5-10年', degree: '硕士',
+    location: '上海·浦东新区', industry: '人工智能', scale: '100-499人', source_keyword: '边缘AI',
+    job_score: 73, match_score: 78, priority: 'P1', active: '3日内活跃', active_ts: '2026-08-24T13:20:00+08:00',
+    favorite: false, excluded: false, contacted: false, analysisReady: false, actionError: '',
+    jd: '负责端侧模型部署、算子优化和嵌入式 Linux 系统开发，要求熟悉 C++、ARM NEON 与模型量化。',
+    greeting: '', advice: '',
+  },
+  {
+    job_key: 'demo-bsp', title: '嵌入式 Linux BSP 工程师', company: '凌光科技',
+    salary: '25-45K', salary_min: 25, salary_max: 45, experience: '3-5年', degree: '本科',
+    location: '深圳·龙岗区', industry: '计算机硬件', scale: '500-999人', source_keyword: 'BSP',
+    job_score: 61, match_score: 69, priority: 'P2', active: '本周活跃', active_ts: '2026-08-21T15:00:00+08:00',
+    favorite: false, excluded: false, contacted: false, analysisReady: false, actionError: '',
+    jd: '负责 Linux 内核、设备树、驱动与启动性能优化，要求有 Yocto 和 PCIe 经验。',
+    greeting: '', advice: '',
+  },
+  {
+    job_key: 'demo-test', title: '嵌入式自动化测试工程师', company: '知行电子',
+    salary: '18-28K·14薪', salary_min: 18, salary_max: 28, experience: '1-3年', degree: '本科',
+    location: '苏州·工业园区', industry: '智能硬件', scale: '100-499人', source_keyword: '嵌入式测试',
+    job_score: 76, match_score: 92, priority: 'P1', active: '今日活跃', active_ts: '2026-08-26T07:45:00+08:00',
+    favorite: true, excluded: false, contacted: false, analysisReady: true, actionError: '',
+    jd: '负责固件自动化测试平台、串口日志分析和硬件在环测试，要求熟悉 Python。双休，提供年终奖、节日福利和定期体检。',
+    greeting: '',
+    advice: '技术匹配度很高，但岗位更偏测试。需要确认职业路径是否接受，并突出自动化平台对研发效率和质量的提升。',
+  },
+  {
+    job_key: 'demo-control', title: '运动控制软件工程师', company: '极点机器人',
+    salary: '24-40K', salary_min: 24, salary_max: 40, experience: '3-5年', degree: '本科',
+    location: '深圳·南山区', industry: '机器人', scale: '100-499人', source_keyword: '运动控制',
+    job_score: 68, match_score: 74, priority: 'P2', active: '3日内活跃', active_ts: '2026-08-24T10:00:00+08:00',
+    favorite: false, excluded: false, contacted: false, analysisReady: false, actionError: '',
+    jd: '负责电机控制、轨迹规划和实时通信，要求掌握 C++、EtherCAT 和控制理论。',
+    greeting: '', advice: '',
+  },
+  {
+    job_key: 'demo-firmware', title: '固件开发工程师', company: '青禾能源',
+    salary: '20-30K·13薪', salary_min: 20, salary_max: 30, experience: '3-5年', degree: '本科',
+    location: '深圳·坪山区', industry: '新能源', scale: '1000-9999人', source_keyword: '固件工程师',
+    job_score: 72, match_score: 86, priority: 'P1', active: '本周活跃', active_ts: '2026-08-20T09:30:00+08:00',
+    favorite: false, excluded: false, contacted: false, analysisReady: false, actionError: '',
+    jd: '负责储能设备固件、Bootloader、CAN 通信和现场问题定位。提供五险一金、年终奖和交通补贴。',
+    greeting: '', advice: '',
+  },
+]
+
+const INITIAL_RUNS = [
+  { id: 105, name: '嵌入式核心岗位补采', startedAt: '2026-08-26T13:42:00+08:00', finishedAt: '', status: 'running', enabled: true, collected: 6, target: 12, fetchDetails: true, source: 'AI 自动生成', kind: 'plan', jobKeys: [] },
+  { id: 104, name: 'BOSS 收藏同步', startedAt: '2026-08-26T12:10:00+08:00', finishedAt: '2026-08-26T12:12:00+08:00', status: 'completed', enabled: true, collected: 6, target: 6, fetchDetails: true, source: 'BOSS 收藏同步', kind: 'favorite_sync', jobKeys: [] },
+  { id: 103, name: '深圳 AI Agent 岗位', startedAt: '2026-08-25T19:10:00+08:00', finishedAt: '2026-08-25T19:36:00+08:00', status: 'completed', enabled: true, collected: 8, target: 8, fetchDetails: true, source: '手动配置', kind: 'plan', jobKeys: [] },
+  { id: 102, name: '医疗器械定向采集', startedAt: '2026-08-24T10:05:00+08:00', finishedAt: '2026-08-24T10:24:00+08:00', status: 'completed', enabled: true, collected: 7, target: 7, fetchDetails: false, source: 'AI 自动生成', kind: 'plan', jobKeys: [] },
+  { id: 101, name: '边缘 AI 机会探索', startedAt: '2026-08-23T16:20:00+08:00', finishedAt: '2026-08-23T16:31:00+08:00', status: 'failed', enabled: false, collected: 3, target: 9, fetchDetails: true, source: '手动配置', kind: 'plan', jobKeys: [] },
+]
+
+const INITIAL_RUN_JOB_KEYS = {
+  105: ['demo-anker-fw', 'demo-agent', 'demo-hunter', 'demo-medical', 'demo-secret', 'demo-rtos'],
+  104: ['demo-anker-fw', 'demo-agent', 'demo-hunter', 'demo-medical', 'demo-rtos', 'demo-test'],
+  103: ['demo-agent', 'demo-edge-ai', 'demo-bsp', 'demo-test', 'demo-control', 'demo-firmware', 'demo-iot', 'demo-rtos'],
+  102: ['demo-medical', 'demo-anker-fw', 'demo-secret', 'demo-iot', 'demo-test', 'demo-firmware', 'demo-rtos'],
+  101: ['demo-edge-ai', 'demo-bsp', 'demo-control'],
+}
+
+const store = reactive({
+  resumes: clone(INITIAL_RESUMES),
+  selectedResumeId: 1,
+  jobs: clone(INITIAL_JOBS),
+  runs: clone(INITIAL_RUNS),
+  accounts: [
+    { key: 'collect', label: '采集号', description: '只读采集与详情补齐', port: 9222, running: true, loggedIn: true, checkedAt: '2026-08-26T11:38:56+08:00', roles: ['岗位采集', '详情读取'] },
+    { key: 'communication', label: '沟通号', description: '受护栏保护的沟通操作', port: 9223, running: false, loggedIn: true, checkedAt: '2026-08-26T11:39:45+08:00', roles: ['打开 BOSS', '自动招呼'] },
+  ],
+  settings: {
+    dualAccount: true,
+    llmBaseUrl: 'https://api.example.com/v1',
+    llmApiKey: 'demo-key',
+    llmModel: 'demo-chat',
+    sendDailyLimit: 40,
+    sendDailyHardCap: 110,
+    sendGapMin: 30,
+    sendGapMax: 90,
+    matchScoreTopN: 20,
+    inactiveDays: 14,
+  },
+  ui: { toast: null, confirm: null },
+  batch: { running: false, type: '', label: '', done: 0, total: 0, failures: [] },
+})
+
+function isLlmConfigured(settings = store.settings) {
+  return Boolean(String(settings.llmBaseUrl || '').trim()
+    && String(settings.llmApiKey || '').trim()
+    && String(settings.llmModel || '').trim())
+}
+
+store.runs.forEach(run => { run.jobKeys = clone(INITIAL_RUN_JOB_KEYS[run.id] || []) })
+store.jobs.forEach(job => {
+  job.applied = Boolean(job.applied)
+  job.interviewed = Boolean(job.interviewed)
+})
+
+function nextRunId() {
+  return Math.max(0, ...store.runs.map(run => Number(run.id))) + 1
+}
+
+function jobsFromEnabledRuns() {
+  const enabledKeys = new Set(store.runs.filter(run => run.enabled).flatMap(run => run.jobKeys))
+  return store.jobs.filter(job => enabledKeys.has(job.job_key) && !job.excluded)
+}
+
+function addFavoriteSyncRun() {
+  const jobKeys = store.jobs.filter(job => job.favorite && !job.excluded).map(job => job.job_key)
+  const now = new Date().toISOString()
+  const run = {
+    id: nextRunId(), name: 'BOSS 收藏同步', startedAt: now, finishedAt: now,
+    status: 'completed', enabled: true, collected: jobKeys.length, target: jobKeys.length,
+    fetchDetails: true, source: 'BOSS 收藏同步', kind: 'favorite_sync', jobKeys,
+  }
+  store.runs.unshift(run)
+  return run
+}
+
+let toastTimer = null
+function showToast(message, tone = 'ok') {
+  store.ui.toast = { message, tone }
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => { store.ui.toast = null }, 3200)
+}
+function requestConfirm({ title, message, confirmText = '确认', tone = 'primary' }) {
+  return new Promise(resolve => {
+    store.ui.confirm = { title, message, confirmText, tone, resolve }
+  })
+}
+function settleConfirm(result) {
+  const dialog = store.ui.confirm
+  store.ui.confirm = null
+  if (dialog) dialog.resolve(result)
+}
+
+// 模拟采集任务在页面会话内持续推进，切换路由不会中断。
+setInterval(() => {
+  for (const run of store.runs) {
+    if (run.status !== 'running') continue
+    run.collected = Math.min(run.target, run.collected + 1)
+    const nextJob = store.jobs[run.collected - 1]
+    if (nextJob && !run.jobKeys.includes(nextJob.job_key)) run.jobKeys.push(nextJob.job_key)
+    if (run.collected >= run.target) {
+      run.status = 'completed'
+      run.finishedAt = new Date().toISOString()
+      showToast(`采集计划「${run.name}」已完成`)
+    }
+  }
+}, 2600)
+
+// -- 岗位标签、排序与文案生成 -------------------------------------------
+const WELFARE_KEYWORDS = [
+  '五险一金', '年终奖', '带薪年假', '补充医疗', '餐补', '房补', '住房补贴',
+  '交通补贴', '股票期权', '定期体检', '节日福利', '员工旅游', '弹性工作',
+]
+function deriveJobTags(job) {
+  const company = String(job.company || '').trim()
+  const text = `${job.title || ''}\n${job.jd || ''}`
+  const tags = []
+  if (!company || company.includes('某')) tags.push({ key: 'headhunter', label: '猎头', tone: 'warn' })
+  if (/周末双休|双休/.test(text)) tags.push({ key: 'weekend', label: '双休', tone: 'ok' })
+  if (WELFARE_KEYWORDS.some(keyword => text.includes(keyword))) tags.push({ key: 'benefits', label: '福利', tone: 'blue' })
+  return tags
+}
+function workflowLabel(job) {
+  if (job.interviewed) return '已面试'
+  if (job.applied) return '已投递'
+  if (job.contacted) return '已打招呼'
+  if (job.greeting) return '已生成'
+  return '待准备'
+}
+function greetingFor(job) {
+  const resume = store.resumes.find(item => item.id === store.selectedResumeId) || store.resumes[0]
+  return `您好，我正在使用「${resume.name}」关注贵司的${job.title}岗位。我有嵌入式产品交付、自动化测试与复杂问题定位经验，岗位要求与我的经历较为匹配，期待进一步沟通。`
+}
+function adviceFor(job) {
+  const tags = deriveJobTags(job).map(tag => tag.label)
+  const focus = job.industry === '医疗健康'
+    ? '重点准备法规验证、风险控制和量产闭环案例'
+    : job.industry === '人工智能'
+      ? '重点说明工程可靠性、工具调用与自动化评测方法'
+      : '重点准备架构取舍、驱动调试与量产问题定位案例'
+  return `综合匹配度 ${job.match_score} 分，建议优先沟通。${focus}。${tags.includes('猎头') ? '当前岗位可能由猎头代招，沟通前先确认真实公司、汇报关系与岗位编制。' : '首轮沟通可直接确认团队规模、核心职责与招聘优先级。'}`
+}
+
+// -- Hash 路由 -----------------------------------------------------------
 const nav = [
   ['/dashboard', '总览看板'],
-  ['/jobs', '岗位列表'],
-  ['/jobcard', '收藏工作台'],
+  ['/profile', '简历档案'],
   ['/collect', '采集中心'],
   ['/analytics', '数据分析'],
-  ['/greetings', '招呼语'],
-  ['/profile', '简历档案'],
-  ['/interview', '模拟面试'],
+  ['/jobs', '岗位列表'],
+  ['/jobcard', '收藏工作台'],
   ['/accounts', '账号管理'],
   ['/settings', '设置'],
 ]
-const ACCOUNT_LABELS = { collect: '采集号', account_a: '沟通号' }
-const accountLabel = value => String(value || '').split(',')
-  .map(name => ACCOUNT_LABELS[name] || name).join('·')
-window.addEventListener('hashchange', () => {
-  route.value = location.hash.slice(1) || '/dashboard'
-})
+const ROUTE_ALIASES = { '/greetings': '/jobcard', '/interview': '/jobcard' }
+const VALID_ROUTES = new Set(nav.map(([path]) => path))
+function normalizedRoute() {
+  const raw = location.hash.slice(1) || '/dashboard'
+  const path = ROUTE_ALIASES[raw] || (VALID_ROUTES.has(raw) ? raw : '/dashboard')
+  if (path !== raw) history.replaceState(null, '', `#${path}`)
+  return path
+}
+const route = ref(normalizedRoute())
+window.addEventListener('hashchange', () => { route.value = normalizedRoute() })
 
-// ── 页面：总览看板 ───────────────────────────────────────────────
+// -- 通用图表 -----------------------------------------------------------
+const SvgBars = {
+  props: ['items', 'color'],
+  setup(props) {
+    const rows = computed(() => (props.items || []).slice(0, 10))
+    const max = computed(() => Math.max(1, ...rows.value.map(item => Number(item.value || 0))))
+    return { rows, max }
+  },
+  template: `
+    <div class="bar-chart">
+      <div v-for="item in rows" :key="item.label" class="bar-row">
+        <span :title="item.label">{{item.label}}</span>
+        <svg viewBox="0 0 100 12" preserveAspectRatio="none" role="img" :aria-label="item.label + ' ' + item.value">
+          <rect class="bar-bg" width="100" height="12" rx="2"></rect>
+          <rect :width="item.value > 0 ? Math.max(1,item.value/max*100) : 0" height="12" rx="2" :style="{fill:color || 'var(--accent)'}"></rect>
+        </svg>
+        <b>{{item.value}}</b>
+      </div>
+      <div v-if="!rows.length" class="empty compact">暂无可用数据</div>
+    </div>`,
+}
+
+// -- 页面：总览看板 -----------------------------------------------------
 const DashboardView = {
   setup() {
-    const dashboard = ref({}), loading = ref(true), error = ref('')
-    async function load() {
-      loading.value = true; error.value = ''
-      try { dashboard.value = await api.get('/api/dashboard') }
-      catch (e) { error.value = e.message }
-      finally { loading.value = false }
+    const activeJobs = computed(() => jobsFromEnabledRuns())
+    const favorites = computed(() => activeJobs.value.filter(job => job.favorite))
+    const contacted = computed(() => activeJobs.value.filter(job => job.contacted))
+    const generated = computed(() => activeJobs.value.filter(job => job.greeting))
+    const staleJobs = computed(() => {
+      const cutoff = Date.now() - 3 * 24 * 60 * 60 * 1000
+      return activeJobs.value.filter(job => new Date(job.active_ts).getTime() < cutoff)
+    })
+    const metrics = computed(() => [
+      { label: '当前岗位', value: activeJobs.value.length, sub: `${activeJobs.value.filter(job => job.priority === 'P0').length} 个 P0 优先岗位`, href: '#/jobs', tone: 'blue' },
+      { label: '收藏岗位', value: favorites.value.length, sub: `${favorites.value.filter(job => job.match_score >= 90).length} 个匹配度 90+`, href: '#/jobcard', tone: 'green' },
+      { label: '已生成招呼语', value: generated.value.length, sub: `${favorites.value.length - generated.value.length} 个待生成`, href: '#/jobcard', tone: 'amber' },
+      { label: '已模拟招呼', value: contacted.value.length, sub: '全部为演示状态', href: '#/jobcard', tone: 'red' },
+    ])
+    const latestRun = computed(() => store.runs[0])
+    const priorityJobs = computed(() => [...favorites.value].sort((a, b) => b.match_score - a.match_score).slice(0, 5))
+    const runningCount = computed(() => store.runs.filter(run => run.status === 'running' || run.status === 'paused').length)
+    const guide = reactive({
+      open: false, step: 1, busy: '', resumeMode: 'existing', resumeId: store.selectedResumeId,
+      resumeName: '新的求职简历', resumeBody: '# 我的简历\n\n在这里填写 Markdown 简历正文。', synced: false,
+      llmBaseUrl: store.settings.llmBaseUrl, llmApiKey: store.settings.llmApiKey,
+      llmModel: store.settings.llmModel, llmTested: false, llmAvailable: isLlmConfigured(),
+    })
+    const guidePlan = reactive(createPlan())
+    const guideCityQuery = ref('')
+    const guideCitySuggestions = computed(() => matchingCities(guideCityQuery.value, guidePlan.cities))
+    const guideLlmConfigured = computed(() => isLlmConfigured({
+      llmBaseUrl: guide.llmBaseUrl, llmApiKey: guide.llmApiKey, llmModel: guide.llmModel,
+    }))
+    const llmReady = computed(() => isLlmConfigured())
+    const communicationAccount = computed(() => store.accounts.find(account => account.key === 'communication'))
+    function openGuide() {
+      Object.assign(guide, {
+        open: true, step: 1, busy: '', resumeMode: store.resumes.length ? 'existing' : 'new',
+        resumeId: store.selectedResumeId, resumeName: '新的求职简历',
+        resumeBody: '# 我的简历\n\n在这里填写 Markdown 简历正文。', synced: false,
+        llmBaseUrl: store.settings.llmBaseUrl, llmApiKey: store.settings.llmApiKey,
+        llmModel: store.settings.llmModel, llmTested: false, llmAvailable: isLlmConfigured(),
+      })
+      Object.assign(guidePlan, createPlan(), { name: '向导创建的采集计划' })
+      guideCityQuery.value = ''
     }
-    onMounted(load)
-    const metrics = computed(() => {
-      const d = dashboard.value.metrics || dashboard.value.counts || {}
-      const jobs = d.jobs || {}
-      const favorites = d.favorites || {}
-      const applications = d.applications || {}
-      const greetings = d.greetings || {}
-      return [
-        { label: '岗位总量', value: first(jobs.total, d.total_jobs, d.total, 0), sub: `当前有效 ${first(jobs.active, d.active_jobs, d.active, 0)} 个`, href: '#/jobs' },
-        { label: '当前收藏', value: first(favorites.total, d.favorite_jobs, 0), sub: `今日 +${first(favorites.today, 0)} · 近 7 天 +${first(favorites.last_7_days, 0)}`, href: '#/jobcard' },
-        { label: '已确认投递', value: first(applications.total, d.applied_jobs, 0), sub: `平台 ${first(applications.platform_confirmed, d.platform_confirmed, 0)} · 人工 ${first(applications.manual_confirmed, d.manual_confirmed, 0)}`, href: '#/jobcard' },
-        { label: '已确认招呼', value: first(greetings.total, d.greeted_jobs, 0), sub: `今日 ${first(greetings.today, 0)} · 近 7 天 ${first(greetings.last_7_days, 0)}`, href: '#/greetings' },
-      ]
-    })
-    const system = computed(() => dashboard.value.system || {})
-    const accountStatus = computed(() => system.value.accounts || {})
-    const risk = computed(() => system.value.risk || {})
-    const accounts = computed(() => {
-      const source = Array.isArray(accountStatus.value.accounts)
-        ? accountStatus.value.accounts
-        : Object.entries(accountStatus.value).filter(([, item]) => item && typeof item === 'object').map(([account, item]) => ({ account, ...item }))
-      return source.map(item => ({
-        key: item.account,
-        label: item.label || (item.account === 'collector' || item.account === 'collect' ? '采集号' : '沟通号'),
-        loggedIn: item.logged_in,
-        checkedAt: item.checked_at,
-        hint: item.hint || '',
-      }))
-    })
-    const collect = computed(() => system.value.collection || system.value.collect || {})
-    const sender = computed(() => system.value.sender || {
-      halted_today: risk.value.send_halted_today,
-      halt_reason: (risk.value.reasons || []).join('；'),
-      sending: false,
-      sent_today: first(dashboard.value.metrics?.greetings?.today, 0),
-    })
-    const effectiveCollectTime = computed(() => first(
-      collect.value.latest_data_at, collect.value.last_effective_at,
-      collect.value.online_collected_at, collect.value.file_data_at,
-    ))
-    const accountTone = item => item.loggedIn === true ? 'ok' : (item.loggedIn === false ? 'warn' : 'neutral')
-    const collectTone = computed(() => collect.value.risk || risk.value.active ? 'bad' : (collect.value.stale ? 'warn' : 'ok'))
-    return { dashboard, loading, error, metrics, system, accountStatus, accounts, collect, sender,
-      effectiveCollectTime, accountTone, collectTone, fmtTime, load }
+    function closeGuide() { guide.open = false }
+    function finishResumeStep() {
+      if (guide.resumeMode === 'new') {
+        if (!guide.resumeName.trim() || !guide.resumeBody.trim()) {
+          showToast('请填写简历名称和正文', 'warn')
+          return
+        }
+        const id = Math.max(0, ...store.resumes.map(item => item.id)) + 1
+        store.resumes.push({ id, name: guide.resumeName.trim(), body: guide.resumeBody, updatedAt: new Date().toISOString() })
+        guide.resumeId = id
+      }
+      store.selectedResumeId = Number(guide.resumeId)
+      guidePlan.resumeId = store.selectedResumeId
+      guide.step = 2
+    }
+    async function testGuideLlm() {
+      if (!guideLlmConfigured.value) {
+        guide.llmTested = false
+        guide.llmAvailable = false
+        showToast('请完整填写 Base URL、API Key 和模型', 'warn')
+        return
+      }
+      guide.busy = 'llm'
+      await wait(750)
+      guide.busy = ''
+      guide.llmTested = true
+      guide.llmAvailable = true
+      showToast(`LLM 连接成功 · ${guide.llmModel}`)
+    }
+    function saveGuideLlm() {
+      Object.assign(store.settings, {
+        llmBaseUrl: guide.llmBaseUrl.trim(), llmApiKey: guide.llmApiKey.trim(), llmModel: guide.llmModel.trim(),
+      })
+      guide.llmAvailable = isLlmConfigured()
+      if (!guide.llmAvailable) guidePlan.mode = 'manual'
+      guide.step = 3
+    }
+    async function guideLogin() {
+      guide.busy = 'login'
+      await wait(650)
+      communicationAccount.value.running = true
+      communicationAccount.value.loggedIn = true
+      communicationAccount.value.checkedAt = new Date().toISOString()
+      guide.busy = ''
+      showToast('BOSS 登录状态已确认')
+    }
+    async function guideSyncFavorites() {
+      if (!communicationAccount.value.loggedIn) {
+        showToast('请先完成 BOSS 登录', 'warn')
+        return
+      }
+      guide.busy = 'sync'
+      await wait(850)
+      const run = addFavoriteSyncRun()
+      guide.synced = true
+      guide.busy = ''
+      showToast(`已同步 ${run.collected} 个收藏岗位，并记为一次采集`)
+    }
+    function addGuideCity(city = guideCityQuery.value) {
+      if (appendCity(guidePlan.cities, city)) guideCityQuery.value = ''
+    }
+    function removeGuideCity(city) {
+      guidePlan.cities.splice(guidePlan.cities.indexOf(city), 1)
+    }
+    async function guideGeneratePlan() {
+      if (!llmReady.value) {
+        showToast('LLM 未配置，AI 生成采集计划不可用', 'warn')
+        return
+      }
+      guide.busy = 'plan'
+      await wait(900)
+      const resume = store.resumes.find(item => item.id === store.selectedResumeId)
+      const aiDirection = resume && resume.name.includes('AI')
+      Object.assign(guidePlan, {
+        mode: 'auto', generated: true,
+        name: aiDirection ? 'AI 应用岗位采集' : '嵌入式岗位采集',
+        keywords: aiDirection ? 'AI Agent 应用工程师\nLLM 应用工程师\n边缘 AI 工程师' : '嵌入式软件工程师\n固件开发工程师\nRTOS 平台工程师',
+        cities: ['深圳'], salary: '不限', experience: '不限', degree: '不限',
+        scale: '不限', stage: '不限', industry: '不限', companies: '',
+      })
+      guide.busy = ''
+      showToast('AI 采集计划已生成，可继续修改')
+    }
+    function reviewGuidePlan() {
+      const keywords = guidePlan.keywords.split(/[\n,，]+/).map(value => value.trim()).filter(Boolean)
+      if (!guidePlan.name.trim() || !keywords.length || !guidePlan.cities.length) {
+        showToast('请填写计划名称、关键词并至少选择一个城市', 'warn')
+        return
+      }
+      guide.step = 5
+    }
+    function finishGuide() {
+      createCollectionRun(guidePlan, '向导配置')
+      guide.open = false
+      location.hash = '#/dashboard'
+      showToast('向导已完成，采集计划开始执行')
+    }
+    return {
+      store, metrics, latestRun, priorityJobs, runningCount, staleJobs, guide, guidePlan,
+      communicationAccount, guideCityQuery, guideCitySuggestions, guideLlmConfigured, llmReady,
+      percentOf, shortTime, deriveJobTags, runStatusLabel,
+      openGuide, closeGuide, finishResumeStep, testGuideLlm, saveGuideLlm, guideLogin, guideSyncFavorites,
+      addGuideCity, removeGuideCity, guideGeneratePlan, reviewGuidePlan, finishGuide,
+    }
   },
   template: `
   <div>
-    <div class="page-head">
-      <div><h1>总览看板</h1><p>岗位进度、账号状态和采集新鲜度</p></div>
-      <button :disabled="loading" @click="load">刷新状态</button>
-    </div>
-    <div v-if="error" class="notice bad">看板加载失败：{{error}}</div>
-    <div class="metric-grid" :class="{loading}">
-      <a v-for="item in metrics" :key="item.label" class="metric" :href="item.href">
+    <header class="page-head">
+      <div><div class="eyebrow">工作概览</div><h1>总览看板</h1><p>求职进度、采集状态与优先岗位</p></div>
+      <div class="row"><button @click="openGuide">向导</button><a class="button primary" href="#/collect">新建采集计划</a></div>
+    </header>
+    <div v-if="staleJobs.length" class="freshness-warning"><div><b>采集数据需要更新</b><span>{{staleJobs.length}} 个岗位已超过 3 天没有更新，建议重新采集以确认岗位状态。</span></div><a class="button" href="#/collect">更新采集数据</a></div>
+    <div class="metric-grid">
+      <a v-for="item in metrics" :key="item.label" class="metric" :class="'tone-' + item.tone" :href="item.href">
         <span>{{item.label}}</span><strong>{{item.value}}</strong><small>{{item.sub}}</small>
       </a>
     </div>
+    <div class="dashboard-grid">
+      <section class="surface-panel run-overview">
+        <div class="section-title"><div><h2>最近采集</h2><p>{{runningCount ? runningCount + ' 个计划处理中' : '当前没有运行中的计划'}}</p></div><a href="#/collect">查看全部</a></div>
+        <template v-if="latestRun">
+          <div class="run-title"><div><b>{{latestRun.name}}</b><span>{{latestRun.source}} · {{shortTime(latestRun.startedAt)}}</span></div><span class="status-badge" :class="latestRun.status">{{runStatusLabel(latestRun.status)}}</span></div>
+          <div class="progress-copy"><span>{{latestRun.collected}} / {{latestRun.target}} 条</span><b>{{percentOf(latestRun)}}%</b></div>
+          <div class="progress"><i :style="{width:percentOf(latestRun)+'%'}"></i></div>
+        </template>
+      </section>
+      <section class="surface-panel account-overview">
+        <div class="section-title"><div><h2>账号状态</h2><p>{{store.settings.dualAccount ? '双账号隔离模式' : '单账号模式'}}</p></div><a href="#/accounts">管理</a></div>
+        <div v-for="account in store.accounts" :key="account.key" class="account-line">
+          <span class="status-dot" :class="account.running?'ok':'neutral'"></span>
+          <div><b>{{account.label}}</b><small>{{account.loggedIn?'已登录':'待登录'}} · {{account.running?'运行中':'未启动'}}</small></div>
+          <span>{{account.port}}</span>
+        </div>
+      </section>
+    </div>
     <section class="section-block">
-      <div class="section-title"><div><h2>系统状态</h2><p>这里只展示最近一次缓存结果，不会主动启动 Chrome。</p></div>
-        <span class="pill">{{accountStatus.label || (accountStatus.mode === 'single' ? '单账号' : '双账号')}}</span>
-      </div>
-      <div class="status-grid">
-        <div v-for="item in accounts" :key="item.key" class="status-item">
-          <span class="status-dot" :class="accountTone(item)"></span>
-          <div><b>{{item.label}} · {{item.loggedIn === true ? '已登录' : (item.loggedIn === false ? '未登录' : '状态未知')}}</b>
-            <p>{{item.hint || ('检测于 ' + fmtTime(item.checkedAt))}}</p></div>
-          <a href="#/accounts">管理</a>
-        </div>
-        <div class="status-item">
-          <span class="status-dot" :class="collectTone"></span>
-          <div><b>{{collect.running ? '采集执行中' : (!collect.collected ? '尚未采集数据' : (collect.stale ? '采集数据需要更新' : '采集数据正常'))}}</b>
-            <p>最近有效数据：{{fmtTime(effectiveCollectTime)}}<template v-if="collect.collected && collect.stale"> · 已超过 3 天</template></p></div>
-          <a href="#/collect">查看</a>
-        </div>
-        <div class="status-item">
-          <span class="status-dot" :class="sender.halted_today ? 'bad' : (sender.sending ? 'warn' : 'ok')"></span>
-          <div><b>{{sender.halted_today ? '发送已熔断' : (sender.sending ? '发送执行中' : '发送护栏正常')}}</b>
-            <p>{{sender.halt_reason || ('今日已确认发送 ' + (sender.sent_today || 0) + ' 条')}}</p></div>
-          <a href="#/greetings">查看</a>
-        </div>
+      <div class="section-title"><div><h2>优先处理</h2><p>按当前简历匹配度排序的收藏岗位</p></div><a href="#/jobcard">进入收藏工作台</a></div>
+      <div class="priority-list">
+        <a v-for="job in priorityJobs" :key="job.job_key" href="#/jobcard" class="priority-row">
+          <div><b>{{job.title}}</b><span>{{job.company || '公司信息保密'}} · {{job.salary}}</span></div>
+          <div class="tag-line"><span v-for="tag in deriveJobTags(job)" :key="tag.key" class="tag" :class="tag.tone">{{tag.label}}</span></div>
+          <strong>{{job.match_score}}</strong><small>匹配度</small>
+        </a>
       </div>
     </section>
-    <section class="section-block">
-      <div class="section-title"><div><h2>快速开始</h2><p>继续当前求职流程</p></div></div>
-      <div class="quick-grid">
-        <a href="#/collect"><b>更新岗位数据</b><span>调整关键词与城市后开始采集</span></a>
-        <a href="#/jobs"><b>筛选岗位</b><span>展开 JD、收藏或排除岗位</span></a>
-        <a href="#/jobcard"><b>处理收藏</b><span>比较评分并准备招呼语</span></a>
-        <a href="#/analytics"><b>查看市场分布</b><span>比较关键词的薪资与门槛</span></a>
+
+    <div v-if="guide.open" class="guide-overlay" role="dialog" aria-modal="true" aria-label="首次使用向导">
+      <header><div><span class="eyebrow">开始使用</span><h2>求职作战向导</h2></div><button aria-label="关闭向导" title="关闭" @click="closeGuide">×</button></header>
+      <div class="guide-shell">
+        <ol class="guide-stepper">
+          <li v-for="item in [{n:1,t:'添加简历'},{n:2,t:'LLM 配置'},{n:3,t:'登录与收藏'},{n:4,t:'采集计划'},{n:5,t:'确认开始'}]" :key="item.n" :class="{active:guide.step===item.n,done:guide.step>item.n}"><span>{{item.n}}</span><b>{{item.t}}</b></li>
+        </ol>
+
+        <section v-if="guide.step===1" class="guide-content">
+          <div><h3>添加本次求职使用的简历</h3><p>后续采集计划、评分和招呼语都以这份简历为准。</p></div>
+          <div class="segmented"><button :class="{active:guide.resumeMode==='existing'}" @click="guide.resumeMode='existing'">使用已有简历</button><button :class="{active:guide.resumeMode==='new'}" @click="guide.resumeMode='new'">新建简历</button></div>
+          <label v-if="guide.resumeMode==='existing'">简历档案<select v-model.number="guide.resumeId"><option v-for="resume in store.resumes" :key="resume.id" :value="resume.id">{{resume.name}}</option></select></label>
+          <template v-else><label>档案名称<input v-model="guide.resumeName"></label><label>简历正文<textarea v-model="guide.resumeBody" class="guide-resume"></textarea></label></template>
+          <div class="guide-actions"><span></span><button class="primary" @click="finishResumeStep">下一步</button></div>
+        </section>
+
+        <section v-if="guide.step===2" class="guide-content">
+          <div><h3>配置并测试 LLM 服务</h3><p>用于 AI 采集计划、岗位评分、匹配度评分、AI 招呼语和模拟面试。</p></div>
+          <div v-if="!guideLlmConfigured" class="llm-warning"><b>LLM 尚未配置</b><span>跳过后，AI 生成采集计划、岗位评分、匹配度评分、AI 招呼语和模拟面试将不可用，手动采集仍可使用。</span></div>
+          <div v-else-if="guide.llmTested" class="llm-success"><b>连接测试通过</b><span>{{guide.llmModel}} 可用</span></div>
+          <div class="form-grid three"><label>Base URL<input v-model="guide.llmBaseUrl" placeholder="https://api.example.com/v1" @input="guide.llmTested=false"></label><label>API Key<input v-model="guide.llmApiKey" type="password" placeholder="sk-…" @input="guide.llmTested=false"></label><label>模型<input v-model="guide.llmModel" placeholder="model-name" @input="guide.llmTested=false"></label></div>
+          <div class="guide-actions"><button @click="guide.step=1">上一步</button><div class="row"><button v-if="!guideLlmConfigured" @click="saveGuideLlm">暂不配置，继续</button><button :disabled="guide.busy || !guideLlmConfigured" @click="testGuideLlm">{{guide.busy==='llm'?'测试中…':'测试连接'}}</button><button v-if="guideLlmConfigured" class="primary" :disabled="!guide.llmTested" @click="saveGuideLlm">保存并下一步</button></div></div>
+        </section>
+
+        <section v-if="guide.step===3" class="guide-content">
+          <div><h3>登录 BOSS 并同步收藏岗位</h3><p>同步结果会作为一条独立采集记录，可在采集中心启用或禁用。</p></div>
+          <div class="guide-account"><span class="account-icon">沟</span><div><b>{{communicationAccount.loggedIn?'BOSS 已登录':'等待登录 BOSS'}}</b><small>{{communicationAccount.running?'沟通号运行中':'沟通号尚未启动'}}</small></div><button :disabled="guide.busy" @click="guideLogin">{{guide.busy==='login'?'检测中…':communicationAccount.loggedIn?'重新检测':'登录 BOSS'}}</button></div>
+          <div class="guide-sync"><div><b>同步 BOSS 收藏岗位 <span class="optional-mark">可选</span></b><span>{{guide.synced?'本次同步已加入采集历史':'读取“感兴趣”岗位并加入本地岗位池，也可稍后处理'}}</span></div><button class="primary" :disabled="guide.busy || guide.synced" @click="guideSyncFavorites">{{guide.busy==='sync'?'同步中…':guide.synced?'同步完成':'开始同步'}}</button></div>
+          <div class="guide-actions"><button @click="guide.step=2">上一步</button><button class="primary" @click="guide.step=4">{{guide.synced?'下一步':'跳过，下一步'}}</button></div>
+        </section>
+
+        <section v-if="guide.step===4" class="guide-content">
+          <div><h3>设置新的采集计划</h3><p>配置主动搜索范围，稍后可在采集中心继续调整。</p></div>
+          <div class="segmented"><button :class="{active:guidePlan.mode==='manual'}" @click="guidePlan.mode='manual';guidePlan.generated=true">手动配置</button><button :class="{active:guidePlan.mode==='auto'}" @click="guidePlan.mode='auto';guidePlan.generated=false">AI 生成</button></div>
+          <div v-if="guidePlan.mode==='auto'" class="guide-ai-plan"><div><b>{{llmReady?'根据当前简历生成采集配置':'LLM 未配置，AI 生成不可用'}}</b><span>{{llmReady?'AI 只生成关键词与城市，不附加额外筛选条件':'返回上一步配置 LLM，或切换为手动配置'}}</span></div><button class="primary" :disabled="guide.busy || !llmReady" @click="guideGeneratePlan">{{guide.busy==='plan'?'生成中…':guidePlan.generated?'重新生成':'AI 生成采集计划'}}</button></div>
+          <div class="form-grid two"><label>计划名称<input v-model="guidePlan.name"></label><label>每组页数<input type="number" min="1" max="10" v-model.number="guidePlan.pages"></label></div>
+          <label>搜索关键词<textarea class="short" v-model="guidePlan.keywords" placeholder="每行一个关键词"></textarea></label>
+          <div class="field-group"><span class="field-label">城市范围</span><div class="city-picker"><div class="city-input-row"><input v-model="guideCityQuery" placeholder="输入城市关键词" @keyup.enter="addGuideCity()"><button @click="addGuideCity()">添加</button></div><div v-if="guideCitySuggestions.length" class="city-suggestions"><button v-for="city in guideCitySuggestions" :key="city" @click="addGuideCity(city)">{{city}}</button></div><div class="city-tags"><span v-for="city in guidePlan.cities" :key="city" class="city-tag">{{city}}<button :aria-label="'移除城市 ' + city" @click="removeGuideCity(city)">×</button></span></div></div></div>
+          <div class="field-group"><span class="field-label">采集详细程度</span><div class="segmented"><button :class="{active:!guidePlan.fetchDetails}" @click="guidePlan.fetchDetails=false">仅岗位列表</button><button :class="{active:guidePlan.fetchDetails}" @click="guidePlan.fetchDetails=true">采集完整JD（推荐）</button></div></div>
+          <div class="guide-actions"><button @click="guide.step=3">上一步</button><button class="primary" :disabled="guidePlan.mode==='auto' && !guidePlan.generated" @click="reviewGuidePlan">检查计划</button></div>
+        </section>
+
+        <section v-if="guide.step===5" class="guide-content guide-finish">
+          <span class="finish-mark">✓</span><h3>准备开始采集</h3><p>基础配置已确认，采集开始后可在左侧查看总进度。</p>
+          <dl><div><dt>当前简历</dt><dd>{{store.resumes.find(item=>item.id===store.selectedResumeId)?.name}}</dd></div><div><dt>LLM</dt><dd>{{llmReady?guide.llmModel+' · 可用':'未配置 · AI 功能不可用'}}</dd></div><div><dt>收藏同步</dt><dd>{{guide.synced?'已作为采集记录应用':'已跳过，可稍后同步'}}</dd></div><div><dt>采集计划</dt><dd>{{guidePlan.name}} · {{guidePlan.cities.join('、')}}</dd></div></dl>
+          <div class="guide-actions"><button @click="guide.step=4">返回修改</button><button class="primary" @click="finishGuide">开始采集并返回总览</button></div>
+        </section>
       </div>
-    </section>
+    </div>
   </div>`,
 }
 
-// ── 页面：岗位列表 ───────────────────────────────────────────────
-const JobsView = {
-  setup() {
-    const items = ref([]), total = ref(0), q = ref(''), keyword = ref('')
-    const headhunter = ref('all'), favorite = ref('all'), sort = ref('composite')
-    const page = ref(0), loading = ref(false), scoring = ref(false), resumes = ref([])
-    const resumeId = ref(''), expanded = ref(''), details = reactive({}), detailLoading = ref(''), excludedMode = ref(false)
-    const PAGE = 40
-    async function loadResumes() {
-      try {
-        const data = await api.get('/api/resumes')
-        resumes.value = arrayOf(data).filter(item => !item.archived_at)
-        resumeId.value = String(first(data.default_id, resumes.value.find(item => item.is_default)?.id, resumes.value[0]?.id, ''))
-      } catch (_) { resumes.value = [] }
-    }
-    async function load() {
-      loading.value = true
-      try {
-        if (excludedMode.value) {
-          const data = await api.get('/api/jobs-excluded?limit=' + PAGE + '&offset=' + page.value * PAGE)
-          items.value = data.items || []; total.value = data.total || 0
-          return
-        }
-        const p = new URLSearchParams({ status: 'active', q: q.value, keyword: keyword.value,
-          headhunter: headhunter.value, favorite: favorite.value, sort: sort.value,
-          resume_id: resumeId.value, limit: PAGE, offset: page.value * PAGE })
-        const data = await api.get('/api/jobs?' + p)
-        items.value = data.items || []; total.value = data.total || 0
-      } catch (e) { alert('岗位加载失败：' + e.message) }
-      finally { loading.value = false }
-    }
-    onMounted(async () => { await loadResumes(); await load() })
-    async function openJob(j) {
-      if (expanded.value === j.job_key) { expanded.value = ''; return }
-      expanded.value = j.job_key
-      detailLoading.value = j.job_key
-      try {
-        details[j.job_key] = await api.get('/api/jobs/' + encodeURIComponent(j.job_key) +
-          (resumeId.value ? '?resume_id=' + encodeURIComponent(resumeId.value) : ''))
-      } catch (e) { details[j.job_key] = { error: e.message } }
-      finally { detailLoading.value = '' }
-    }
-    async function reloadDetail(j) {
-      expanded.value = ''
-      delete details[j.job_key]
-      await openJob(j)
-    }
-    async function toggleFavorite(j) {
-      try {
-        const enabled = !(j.favorite_at || j.is_favorite || j.favorite)
-        await api.post(`/api/jobs/${encodeURIComponent(j.job_key)}/favorite`, { favorite: enabled })
-        j.is_favorite = enabled; j.favorite = enabled; j.favorite_at = enabled ? new Date().toISOString() : null
-        if (details[j.job_key]) details[j.job_key].favorite_at = j.favorite_at
-      } catch (e) { alert('收藏操作失败：' + e.message) }
-    }
-    async function openBoss(j) {
-      try { await api.post(`/api/jobs/${encodeURIComponent(j.job_key)}/open-boss`) }
-      catch (e) { alert('沟通号 Chrome 打开岗位失败：' + e.message) }
-    }
-    async function excludeJob(j) {
-      if (!confirm(`确认不再显示「${j.title} · ${j.company}」？后续采集会跳过该岗位，可在排除管理中恢复。`)) return
-      try {
-        await api.post(`/api/jobs/${encodeURIComponent(j.job_key)}/exclude`)
-        items.value = items.value.filter(item => item.job_key !== j.job_key); total.value--
-      } catch (e) { alert('排除失败：' + e.message) }
-    }
-    async function setHeadhunter(j, value) {
-      try {
-        const data = await api.put(`/api/jobs/${encodeURIComponent(j.job_key)}/headhunter`, { value })
-        j.is_headhunter = data.is_headhunter ?? value
-        j.effective_headhunter = data.effective_headhunter ?? value
-        j.headhunter_override = value
-        if (details[j.job_key]) Object.assign(details[j.job_key], data)
-      } catch (e) { alert('猎头标记保存失败：' + e.message) }
-    }
-    async function probeApplication(j) {
-      try {
-        const data = await api.post(`/api/applications/${encodeURIComponent(j.job_key)}/probe`, { resume_id: Number(resumeId.value) || null })
-        if (details[j.job_key]) details[j.job_key].application = data
-        alert(data.status === 'platform_confirmed' ? 'BOSS 页面已明确显示投递成功。' : '未发现可确认的投递证据，状态保持未知。')
-      } catch (e) { alert('同步失败，投递状态保持未知：' + e.message) }
-    }
-    async function confirmApplication(j) {
-      if (!confirm('请先在 BOSS 原平台核验。确认已使用当前简历完成投递？')) return
-      try {
-        const data = await api.post(`/api/applications/${encodeURIComponent(j.job_key)}/confirm`, { resume_id: Number(resumeId.value) || null })
-        if (details[j.job_key]) details[j.job_key].application = data
-      } catch (e) { alert('确认失败：' + e.message) }
-    }
-    async function restoreJob(j) {
-      try {
-        await api.post(`/api/jobs/${encodeURIComponent(j.job_key)}/restore`)
-        items.value = items.value.filter(item => item.job_key !== j.job_key); total.value--
-      } catch (e) { alert('恢复失败：' + e.message) }
-    }
-    async function runL1() {
-      scoring.value = true
-      try { const result = await api.post('/api/score/l1', { resume_id: Number(resumeId.value) || null }); alert(`L1 评分完成：${result.scored ?? result.count ?? 0} 条`); load() }
-      catch (e) { alert('L1 评分失败：' + e.message) }
-      finally { scoring.value = false }
-    }
-    async function runL2() {
-      const count = prompt('精评当前简历下综合粗分最高且尚无有效 L2 的岗位数量：', '10')
-      if (!count) return
-      scoring.value = true
-      try { await api.post('/api/score/l2', { limit: Number(count), resume_id: Number(resumeId.value) || null }); await load() }
-      catch (e) { alert('L2 精评失败：' + e.message) }
-      finally { scoring.value = false }
-    }
-    const pages = computed(() => Math.max(1, Math.ceil(total.value / PAGE)))
-    const search = () => { page.value = 0; expanded.value = ''; load() }
-    const toggleExcludedMode = () => { excludedMode.value = !excludedMode.value; page.value = 0; expanded.value = ''; load() }
-    return { items, total, q, keyword, headhunter, favorite, sort, page, pages, loading, scoring,
-      resumes, resumeId, expanded, details, detailLoading, excludedMode, fmtTime, score, first, search, load, openJob,
-      reloadDetail, toggleFavorite, openBoss, excludeJob, setHeadhunter, probeApplication,
-      confirmApplication, restoreJob, toggleExcludedMode, runL1, runL2,
-      prev: () => { page.value--; load() }, next: () => { page.value++; load() } }
-  },
-  template: `
-  <div>
-    <div class="page-head"><div><h1>{{excludedMode ? '排除岗位管理' : '岗位列表'}}</h1><p>{{excludedMode ? '仅在此恢复已排除岗位。' : '当前有效岗位 ' + total + ' 个，点击任意岗位在列表内查看完整 JD。'}}</p></div>
-      <div class="row"><button @click="toggleExcludedMode">{{excludedMode ? '返回有效岗位' : '排除管理'}}</button><template v-if="!excludedMode"><button :disabled="scoring" @click="runL2">L2 精评</button><button :disabled="scoring" @click="runL1">运行 L1</button></template></div>
-    </div>
-    <div v-if="!excludedMode" class="filterbar">
-      <input v-model="q" aria-label="搜索岗位或公司" placeholder="搜索岗位或公司" @keyup.enter="search">
-      <input v-model="keyword" aria-label="采集关键词" placeholder="采集关键词" @keyup.enter="search">
-      <select v-model="headhunter" aria-label="猎头筛选" @change="search"><option value="all">全部来源</option><option value="only">仅猎头岗位</option><option value="exclude">排除猎头岗位</option></select>
-      <select v-model="favorite" aria-label="收藏筛选" @change="search"><option value="all">全部岗位</option><option value="only">仅收藏</option></select>
-      <select v-model="resumeId" aria-label="评分简历" @change="search"><option value="">默认评分</option><option v-for="r in resumes" :key="r.id" :value="String(r.id)">{{r.name}}</option></select>
-      <select v-model="sort" aria-label="排序" @change="search"><option value="composite">综合评分</option><option value="job">岗位评分</option><option value="match">匹配度</option><option value="salary">薪资上限</option><option value="recent">最近活跃</option></select>
-      <button class="primary" @click="search">筛选</button>
-    </div>
-    <div class="table-wrap">
-      <table class="jobs-table">
-        <thead><tr><th>岗位</th><th>公司</th><th>薪资</th><th>经验/学历</th><th>岗位评分</th><th>匹配度评分</th><th>P级</th><th>活跃时间</th></tr></thead>
-        <tbody>
-          <template v-for="j in items" :key="j.job_key">
-            <tr class="job-row" :class="{open: expanded===j.job_key}" tabindex="0" @click="openJob(j)" @keyup.enter="openJob(j)" @keyup.space.prevent="openJob(j)">
-              <td><div class="job-title"><span class="chevron" aria-hidden="true"></span><div><b>{{j.title}}</b><p>{{j.location || '地区未知'}}<span v-if="j.effective_headhunter ?? j.is_headhunter" class="tag warn-tag">猎头</span><span v-if="j.favorite_at || j.is_favorite || j.favorite" class="tag ok-tag">已收藏</span></p></div></div></td>
-              <td><b>{{j.company}}</b><p>{{[j.industry,j.scale].filter(Boolean).join(' · ') || '公司信息待补充'}}</p></td>
-              <td class="nowrap">{{j.salary || '面议'}}</td>
-              <td><span>{{j.experience || '不限'}}</span><p>{{j.degree || '不限'}}</p></td>
-              <td class="score">{{score(j,'job')}}</td><td class="score">{{score(j,'match')}}</td>
-              <td><span v-if="j.priority" class="tag" :class="String(j.priority).toLowerCase()">{{j.priority}}</span><span v-else>—</span></td>
-              <td><span>{{j.hr_active || '未知'}}</span><p>{{fmtTime(j.last_seen_at)}}</p></td>
-            </tr>
-            <tr v-if="expanded===j.job_key" class="detail-row"><td colspan="8">
-              <div v-if="detailLoading===j.job_key" class="detail-loading">正在加载职位详情…</div>
-              <div v-else-if="details[j.job_key]?.error" class="notice bad">加载失败：{{details[j.job_key].error}}</div>
-              <div v-else-if="details[j.job_key]" class="job-detail">
-                <div class="detail-toolbar">
-                  <template v-if="excludedMode"><button class="primary" @click.stop="restoreJob(j)">恢复岗位</button></template>
-                  <template v-else><button :class="{primary: details[j.job_key].favorite_at || j.is_favorite || j.favorite}" @click.stop="toggleFavorite(j)">{{details[j.job_key].favorite_at || j.is_favorite || j.favorite ? '取消收藏' : '收藏岗位'}}</button>
-                  <button @click.stop="excludeJob(j)">不再显示</button></template>
-                  <button v-if="details[j.job_key].job_link || j.job_link" @click.stop="openBoss(j)">打开 BOSS</button>
-                  <template v-if="!excludedMode"><span class="separator"></span>
-                  <label>猎头标记 <select :value="details[j.job_key].headhunter_override === null || details[j.job_key].headhunter_override === undefined ? 'auto' : String(Boolean(details[j.job_key].headhunter_override))" @click.stop @change.stop="setHeadhunter(j, $event.target.value==='auto' ? null : $event.target.value==='true')"><option value="auto">自动识别</option><option value="true">是猎头</option><option value="false">非猎头</option></select></label>
-                  <span class="grow"></span>
-                  <button @click.stop="probeApplication(j)">同步投递状态</button><button @click.stop="confirmApplication(j)">人工确认已投递</button></template>
-                </div>
-                <div class="detail-meta">
-                  <div><span>当前岗位评分</span><b>{{score(details[j.job_key],'job')}}</b></div><div><span>当前匹配度</span><b>{{score(details[j.job_key],'match')}}</b></div><div><span>导入基线</span><b>{{first(details[j.job_key].imported_baseline?.composite, details[j.job_key].baseline?.composite, '—')}}</b></div><div><span>投递状态</span><b>{{details[j.job_key].application?.status_label || details[j.job_key].application?.status || '未知'}}</b></div>
-                </div>
-                <div v-if="details[j.job_key].headhunter_reason" class="hint">猎头识别依据：{{details[j.job_key].headhunter_reason}}</div>
-                <h3>职位描述（JD）</h3><pre class="jd">{{details[j.job_key].jd || '暂无完整 JD，可在采集中心重试详情。'}}</pre>
-              </div>
-            </td></tr>
-          </template>
-        </tbody>
-      </table>
-      <div v-if="!items.length && !loading" class="empty">没有符合条件的有效岗位</div>
-    </div>
-    <div class="pagination"><button :disabled="page===0 || loading" @click="prev">上一页</button><span>第 {{page+1}} / {{pages}} 页</span><button :disabled="page>=pages-1 || loading" @click="next">下一页</button></div>
-  </div>`,
-}
-
-// ── 页面：收藏工作台 ─────────────────────────────────────────────
-const JobCardView = {
-  setup() {
-    const jobs = ref([]), resumes = ref([]), resumeId = ref(''), archived = ref(false), loading = ref(false)
-    const selectedKeys = ref([]), greetedKeys = ref([]), generating = ref(false), progressText = ref('')
-    const favSync = ref({}), favBusy = ref(''), favPrevRunning = ref(false)
-    async function loadResumes() {
-      const data = await api.get('/api/resumes')
-      resumes.value = arrayOf(data).filter(item => !item.archived_at)
-      resumeId.value = String(first(data.default_id, resumes.value.find(item => item.is_default)?.id, resumes.value[0]?.id, ''))
-    }
-    async function loadGreetings() {
-      // 已生成 = 当前简历下存在未跳过的招呼语（skipped 视为可重新生成）
-      try {
-        const items = arrayOf(await api.get('/api/greetings'))
-        greetedKeys.value = items
-          .filter(g => g.status !== 'skipped' && g.resume_id === Number(resumeId.value))
-          .map(g => g.job_key)
-      } catch (_) { greetedKeys.value = [] }
-    }
-    async function load() {
-      loading.value = true
-      try {
-        await loadGreetings()
-        const p = new URLSearchParams({ favorite: 'only', status: archived.value ? 'archived' : 'active', resume_id: resumeId.value, limit: 200 })
-        const data = await api.get('/api/jobs?' + p); jobs.value = data.items || []
-      } catch (e) { alert('收藏工作台加载失败：' + e.message) }
-      finally {
-        // 刷新后勾选只保留当前列表里尚未生成的岗位
-        const greeted = greetedKeys.value
-        selectedKeys.value = jobs.value
-          .filter(job => selectedKeys.value.includes(job.job_key) && !greeted.includes(job.job_key))
-          .map(job => job.job_key)
-        loading.value = false
-      }
-    }
-    onMounted(async () => { try { await loadResumes() } catch (_) {} await load(); pollFavSync() })
-    const favTimer = setInterval(pollFavSync, 4000)
-    onBeforeUnmount(() => clearInterval(favTimer))
-    async function pollFavSync() {
-      try { favSync.value = await api.get('/api/favorites/sync/status') } catch (_) { return }
-      // 同步从运行转为结束时自动刷新收藏列表
-      if (favPrevRunning.value && !favSync.value.running) load()
-      favPrevRunning.value = favSync.value.running
-    }
-    async function startFavSync() {
-      try {
-        const result = await api.post('/api/favorites/sync', {})
-        if (result.ok === false) alert(result.error || '启动失败')
-        pollFavSync()
-      } catch (e) { alert('收藏同步启动失败：' + e.message) }
-    }
-    async function cancelFavSync() { try { await api.post('/api/favorites/sync/cancel') } catch (_) {} pollFavSync() }
-    async function retryFavJd() {
-      favBusy.value = 'jd'
-      try {
-        const result = await api.post('/api/favorites/sync/retry-details')
-        alert(`已开始补齐 ${result.missing} 个缺失 JD（采集号只读执行，进度见下方状态）`)
-      } catch (e) { alert('补齐启动失败：' + e.message) }
-      finally { favBusy.value = ''; pollFavSync() }
-    }
-    const lastAccounts = computed(() => favSync.value.last_result?.accounts || [])
-    const hasGreeting = job => greetedKeys.value.includes(job.job_key)
-    const pendingSelection = computed(() => selectedKeys.value.filter(key => !greetedKeys.value.includes(key)))
-    function toggleAllPending() {
-      const pending = jobs.value.filter(job => !hasGreeting(job)).map(job => job.job_key)
-      const allSelected = pending.length > 0 && pending.every(key => selectedKeys.value.includes(key))
-      selectedKeys.value = allSelected ? [] : pending
-    }
-    async function openBoss(job) {
-      try { await api.post(`/api/jobs/${encodeURIComponent(job.job_key)}/open-boss`) }
-      catch (e) { alert('沟通号 Chrome 打开岗位失败：' + e.message) }
-    }
-    async function remove(job) {
-      if (!confirm('从收藏工作台移除此岗位？')) return
-      await api.post(`/api/jobs/${encodeURIComponent(job.job_key)}/favorite`, { favorite: false }); load()
-    }
-    async function generate(job) {
-      if (hasGreeting(job) || generating.value) return
-      try { await api.post('/api/greeting/generate', { job_key: job.job_key, resume_id: Number(resumeId.value) || null }); window.location.hash = '#/greetings' }
-      catch (e) { alert('生成失败：' + e.message) }
-    }
-    async function generateSelected() {
-      const targets = jobs.value.filter(job => pendingSelection.value.includes(job.job_key))
-      if (!targets.length) { alert('请先勾选尚未生成招呼语的岗位'); return }
-      generating.value = true
-      const failures = []
-      for (let index = 0; index < targets.length; index++) {
-        const job = targets[index]
-        progressText.value = `${index + 1}/${targets.length} · ${(job.title || '').slice(0, 12)}`
-        try { await api.post('/api/greeting/generate', { job_key: job.job_key, resume_id: Number(resumeId.value) || null }) }
-        catch (e) { failures.push(`${job.title || job.job_key}：${e.message}`) }
-      }
-      generating.value = false; progressText.value = ''
-      await loadGreetings()
-      selectedKeys.value = selectedKeys.value.filter(key => !greetedKeys.value.includes(key))
-      alert(failures.length
-        ? `批量生成完成：成功 ${targets.length - failures.length} 条，失败 ${failures.length} 条\n${failures.join('\n')}`
-        : `已为 ${targets.length} 个岗位生成招呼语，可到「招呼语」页编辑选用。`)
-    }
-    return { jobs, resumes, resumeId, archived, loading, selectedKeys, generating, progressText,
-      favSync, favBusy, startFavSync, cancelFavSync, retryFavJd, lastAccounts, accountLabel,
-      hasGreeting, pendingSelection, score, fmtTime, load, toggleAllPending, openBoss, remove, generate, generateSelected }
-  },
-  template: `
-  <div>
-    <div class="page-head"><div><h1>收藏工作台</h1><p>收藏一次即可在此切换简历比较评分并准备联系；「同步BOSS收藏」会把两个账号的感兴趣岗位增量合并进来。</p></div>
-      <div class="row"><select v-model="resumeId" @change="load"><option v-for="r in resumes" :key="r.id" :value="String(r.id)">{{r.name}}</option></select><label class="check"><input type="checkbox" v-model="archived" @change="load"> 查看下架归档</label>
-        <button :disabled="favSync.running || generating" @click="startFavSync">{{favSync.running ? 'BOSS收藏同步中…' : '同步BOSS收藏'}}</button>
-        <button :disabled="generating || !jobs.length" @click="toggleAllPending">全选未生成</button>
-        <button class="primary" :disabled="generating || !pendingSelection.length" @click="generateSelected">{{generating ? '生成中 ' + progressText : '一键生成选中招呼语' + (pendingSelection.length ? '（' + pendingSelection.length + '）' : '')}}</button></div>
-    </div>
-    <div v-if="favSync.running || lastAccounts.length" class="status-strip">
-      <span v-if="favSync.running" class="warn">正在同步{{favSync.current ? '：' + favSync.current : ''}}<template v-if="favSync.page"> · 第 {{favSync.page}} 页</template></span>
-      <span v-for="a in lastAccounts" :key="a.account" :class="a.ok ? 'ok' : 'bad'">{{a.label}} {{a.ok ? a.total + ' 个 · 新收藏 ' + a.newly_favorited : '失败：' + a.error}}</span>
-      <span v-if="favSync.last_result && !favSync.running" class="hint">上次同步 {{fmtTime(favSync.last_result.finished_at)}}<template v-if="favSync.missing_jd"> · {{favSync.missing_jd}} 个缺 JD</template></span>
-      <button v-if="favSync.running" @click="cancelFavSync">取消同步</button>
-      <button v-else-if="favSync.missing_jd" :disabled="favBusy==='jd' || favSync.running" @click="retryFavJd">补齐缺失 JD</button>
-    </div>
-    <div v-if="favSync.last_result?.risk_signal" class="notice bad">收藏同步遇风控信号停止：{{favSync.last_result.risk_signal}}</div>
-    <div v-if="!jobs.length && !loading" class="empty large">暂无收藏岗位，先到<a href="#/jobs">岗位列表</a>展开 JD 并收藏，或点「同步BOSS收藏」导入账号的感兴趣岗位。</div>
-    <article v-for="job in jobs" :key="job.job_key" class="work-item">
-      <div class="work-main"><div><h2>{{job.title}}</h2><p>{{job.company}} · {{job.salary}} · {{job.experience || '经验不限'}} · {{job.degree || '学历不限'}}<span v-if="job.favorite_accounts" class="tag ok-tag">BOSS收藏·{{accountLabel(job.favorite_accounts)}}</span></p></div>
-        <div class="score-pair"><span><b>{{score(job,'job')}}</b>岗位分</span><span><b>{{score(job,'match')}}</b>匹配度</span><span><b>{{job.priority || '—'}}</b>P级</span></div></div>
-      <div class="work-actions"><label class="check"><input type="checkbox" :value="job.job_key" v-model="selectedKeys" :disabled="hasGreeting(job) || generating"> 多选</label><span class="hint">最近活跃 {{job.hr_active || fmtTime(job.last_seen_at)}}</span><span class="grow"></span>
-        <button @click="openBoss(job)">打开 BOSS</button><button :disabled="hasGreeting(job) || generating" @click="generate(job)">{{hasGreeting(job) ? '招呼语已生成' : '生成招呼语'}}</button><button @click="remove(job)">取消收藏</button></div>
-    </article>
-  </div>`,
-}
-
-// ── 页面：招呼语 ─────────────────────────────────────────────────
-const GreetingsView = {
-  setup() {
-    const items = ref([]), tab = ref(''), sendStatus = ref({}), busy = ref(''), manualOpened = reactive({})
-    const tabs = [['', '全部'], ['draft', '待编辑'], ['approved', '待发送'], ['sent', '已确认'], ['needs_review', '待核验'], ['failed', '失败']]
-    const normalize = item => ({ ...item,
-      selectedIndex: Math.max(0, (item.variants || []).findIndex(variant => (typeof variant === 'string' ? variant : variant.text || variant.content) === item.chosen)),
-      variants: (item.variants || []).map((variant, index) => typeof variant === 'string'
-      ? { key: ['professional', 'concise', 'technical'][index] || String(index), label: ['专业完整版', '精简版', '技术聚焦版'][index] || `候选 ${index + 1}`, text: variant }
-      : { ...variant, label: variant.label || ['专业完整版', '精简版', '技术聚焦版'][index], text: variant.text || variant.content || '' }) })
-    async function load() {
-      try { items.value = arrayOf(await api.get('/api/greetings' + (tab.value ? '?status=' + tab.value : ''))).map(normalize) }
-      catch (e) { alert('招呼语加载失败：' + e.message) }
-    }
-    async function loadStatus() { try { sendStatus.value = await api.get('/api/greeting/send-status') } catch (_) {} }
-    onMounted(() => { load(); loadStatus() })
-    const timer = setInterval(loadStatus, 15000)
-    onBeforeUnmount(() => clearInterval(timer))
-    async function save(g) {
-      busy.value = `save-${g.id}`
-      try {
-        const index = g.selectedIndex || 0
-        await api.put(`/api/greetings/${g.id}`, { index, chosen_text: g.variants[index]?.text || '' })
-        g.chosen = g.variants[index]?.text || ''
-        alert('当前选用文案已保存')
-      }
-      catch (e) { alert('保存失败：' + e.message) }
-      finally { busy.value = '' }
-    }
-    async function approve(g, index) {
-      busy.value = `approve-${g.id}`
-      try {
-        await api.put(`/api/greetings/${g.id}`, { index, chosen_text: g.variants[index].text })
-        g.selectedIndex = index
-        await load()
-      } catch (e) { alert('选定失败：' + e.message) }
-      finally { busy.value = '' }
-    }
-    const chosenText = g => g.variants[g.selectedIndex || 0]?.text || g.chosen || ''
-    async function openBoss(g) {
-      try { await api.post(`/api/jobs/${encodeURIComponent(g.job_key)}/open-boss`) }
-      catch (e) { alert('沟通号 Chrome 打开岗位失败：' + e.message); return false }
-      return true
-    }
-    async function copyAndOpen(g) {
-      const text = chosenText(g)
-      if (!text) { alert('请先选定一版招呼语'); return }
-      try { await navigator.clipboard.writeText(text) }
-      catch (_) { alert('浏览器未授权复制，请手动复制文案。') }
-      if (await openBoss(g)) manualOpened[g.id] = true
-    }
-    async function confirmManual(g) {
-      if (!confirm('仅在 BOSS 原平台明确发送成功后确认。是否已发送？')) return
-      try { await api.post(`/api/greetings/${g.id}/confirm-manual`, { chosen_text: chosenText(g) }); await load(); await loadStatus() }
-      catch (e) { alert('确认失败：' + e.message) }
-    }
-    async function skip(g) { await api.post(`/api/greetings/${g.id}/skip`); load() }
-    async function sendBatch() {
-      if (!confirm('自动发送为次级方式，将使用沟通号并严格执行全部护栏。确认启动已批准批次？')) return
-      try { const result = await api.post('/api/greeting/send-batch'); if (!result.ok) alert(result.error || '启动失败'); loadStatus() }
-      catch (e) { alert('启动失败：' + e.message) }
-    }
-    return { items, tab, tabs, sendStatus, busy, manualOpened, load, save, approve, copyAndOpen, confirmManual, skip, sendBatch,
-      switchTab: value => { tab.value = value; load() } }
-  },
-  template: `
-  <div>
-    <div class="page-head"><div><h1>招呼语</h1><p>优先复制到 BOSS 原平台人工发送；自动发送继续受全部护栏约束。</p></div>
-      <button :disabled="sendStatus.sending || sendStatus.halted_today" @click="sendBatch">自动发送已批准批次</button>
-    </div>
-    <div class="status-strip"><span>今日已确认 {{sendStatus.sent_today ?? 0}} 条</span><span v-if="sendStatus.sending" class="warn">自动发送执行中</span><span v-if="sendStatus.halted_today" class="bad">已熔断：{{sendStatus.halt_reason}}</span><span v-else class="ok">护栏正常</span></div>
-    <div class="tabs"><button v-for="[value,label] in tabs" :key="value" :class="{active:tab===value}" @click="switchTab(value)">{{label}}</button></div>
-    <article v-for="g in items" :key="g.id" class="greeting-item">
-      <div class="item-head"><div><h2>{{g.title}}</h2><p>{{g.company}} · {{g.salary}} · {{g.resume_name || '默认简历'}}</p></div><span class="pill">{{g.status_label || g.status}}</span></div>
-      <div class="variant-grid">
-        <label v-for="(variant,index) in g.variants" :key="variant.key" class="variant" :class="{selected:g.selectedIndex===index}">
-          <span><input type="radio" :name="'g-'+g.id" :checked="g.selectedIndex===index" @change="approve(g,index)"> {{variant.label}}</span>
-          <textarea v-model="variant.text" :aria-label="variant.label"></textarea><small>{{variant.text.length}} 字</small>
-        </label>
-      </div>
-      <div class="item-actions"><button @click="save(g)">保存修改</button><button class="primary" @click="copyAndOpen(g)">复制并打开 BOSS</button><button v-if="manualOpened[g.id]" @click="confirmManual(g)">确认已发送</button><span class="grow"></span><button v-if="g.status==='draft'" @click="skip(g)">跳过</button></div>
-      <div v-if="g.result_status==='needs_review' || g.status==='needs_review'" class="notice warn">自动发送结果不明确，请到 BOSS 原平台人工核验；系统不会自动重试。</div>
-    </article>
-    <div v-if="!items.length" class="empty large">当前分类暂无招呼语。请先在收藏工作台为岗位生成。</div>
-  </div>`,
-}
-
-// ── 页面：多简历档案 ─────────────────────────────────────────────
+// -- 页面：简历档案 -----------------------------------------------------
 const ProfileView = {
   setup() {
-    const resumes = ref([]), selectedId = ref(null), showArchived = ref(false), saving = ref(false)
-    const form = reactive({ id: null, name: '', boss_resume_label: '', expectations: '', skill_profile: '', resume_text: '', revision: 1, archived_at: null })
-    async function load(keepId) {
-      try {
-        const data = await api.get('/api/resumes?include_archived=' + String(showArchived.value))
-        resumes.value = arrayOf(data)
-        const id = keepId || selectedId.value || first(data.default_id, resumes.value[0]?.id)
-        const current = resumes.value.find(item => item.id === Number(id)) || resumes.value[0]
-        if (current) select(current); else newResume()
-      } catch (e) { alert('简历档案加载失败：' + e.message) }
+    const selectedId = ref(store.selectedResumeId)
+    const editing = ref(false)
+    const draft = reactive({ name: '', body: '' })
+    const selected = computed(() => store.resumes.find(item => item.id === selectedId.value) || null)
+    const rendered = computed(() => renderMarkdown(selected.value ? selected.value.body : ''))
+    function loadDraft() {
+      if (!selected.value) return
+      draft.name = selected.value.name
+      draft.body = selected.value.body
     }
-    function select(item) {
-      selectedId.value = item.id
-      Object.assign(form, item, { expectations: joinText(item.expectations), skill_profile: joinText(item.skill_profile || item.skills_profile) })
+    function selectResume(id) {
+      selectedId.value = id
+      store.selectedResumeId = id
+      editing.value = false
+      loadDraft()
     }
-    function newResume() {
-      selectedId.value = null
-      Object.assign(form, { id: null, name: '', boss_resume_label: '', expectations: '', skill_profile: '', resume_text: '', revision: 1, archived_at: null })
+    function edit() { loadDraft(); editing.value = true }
+    function cancelEdit() { loadDraft(); editing.value = false }
+    function save() {
+      if (!draft.name.trim() || !draft.body.trim()) {
+        showToast('请填写档案名称和简历正文', 'warn')
+        return
+      }
+      const item = selected.value
+      item.name = draft.name.trim()
+      item.body = draft.body
+      item.updatedAt = new Date().toISOString()
+      editing.value = false
+      showToast('简历档案已保存到当前演示会话')
     }
-    onMounted(() => load())
-    async function save() {
-      if (!form.name.trim() || !form.resume_text.trim()) { alert('请填写简历名称和正文'); return }
-      saving.value = true
-      const body = { name: form.name.trim(), boss_resume_label: form.boss_resume_label.trim(),
-        expectations: parseProfileField(form.expectations, 'notes'),
-        skill_profile: parseProfileField(form.skill_profile, 'skills'), resume_text: form.resume_text }
-      try {
-        const data = form.id ? await api.put(`/api/resumes/${form.id}`, body) : await api.post('/api/resumes', body)
-        const wasUpdate = Boolean(form.id)
-        await load(data.id || form.id)
-        alert(wasUpdate ? '已保存并生成新修订；L1 已更新，旧 L2 将按规则失效。' : '简历已创建。')
-      } catch (e) { alert('保存失败：' + e.message) }
-      finally { saving.value = false }
+    function createResume() {
+      const id = Math.max(0, ...store.resumes.map(item => item.id)) + 1
+      store.resumes.push({ id, name: '未命名简历', body: '# 新简历\n\n在这里填写简历正文。', updatedAt: new Date().toISOString() })
+      selectedId.value = id
+      store.selectedResumeId = id
+      loadDraft()
+      editing.value = true
     }
-    async function setDefault() { try { await api.post(`/api/resumes/${form.id}/default`); await load(form.id) } catch (e) { alert('设置失败：' + e.message) } }
-    async function archive() {
-      if (!confirm('归档后不会再用于新评分，但历史记录会保留。确认？')) return
-      try { await api.delete(`/api/resumes/${form.id}`); await load() } catch (e) { alert('归档失败：' + e.message) }
-    }
-    async function restore() { try { await api.post(`/api/resumes/${form.id}/restore`); await load(form.id) } catch (e) { alert('恢复失败：' + e.message) } }
-    return { resumes, selectedId, showArchived, form, saving, fmtTime, load, select, newResume, save, setDefault, archive, restore }
+    loadDraft()
+    return { store, selectedId, selected, editing, draft, rendered, fmtTime, selectResume, edit, cancelEdit, save, createResume }
   },
   template: `
   <div>
-    <div class="page-head"><div><h1>简历档案</h1><p>不同简历拥有独立评分与招呼语记录，更新会生成新修订。</p></div><button class="primary" @click="newResume">新建简历</button></div>
+    <header class="page-head">
+      <div><div class="eyebrow">候选人资料</div><h1>简历档案</h1><p>维护不同求职方向的 Markdown 简历</p></div>
+      <button class="primary" @click="createResume">新建简历</button>
+    </header>
     <div class="profile-layout">
-      <aside class="resume-list"><label class="check"><input type="checkbox" v-model="showArchived" @change="load()"> 显示已归档</label>
-        <button v-for="item in resumes" :key="item.id" :class="{active:selectedId===item.id}" @click="select(item)"><b>{{item.name}}</b><span>{{item.is_default ? '默认 · ' : ''}}修订 {{item.revision || 1}}<template v-if="item.archived_at"> · 已归档</template></span></button>
+      <aside class="resume-list" aria-label="简历列表">
+        <button v-for="item in store.resumes" :key="item.id" :class="{active:selectedId===item.id}" @click="selectResume(item.id)">
+          <b>{{item.name}}</b><span>更新于 {{fmtTime(item.updatedAt)}}</span>
+        </button>
       </aside>
-      <section class="editor" v-if="form">
-        <div class="form-grid two"><label>档案名称<input v-model="form.name" placeholder="如：嵌入式与 AI Agent"></label><label>BOSS 简历标签<input v-model="form.boss_resume_label" placeholder="便于在原平台核对"></label></div>
-        <label>求职期望<textarea class="short" v-model="form.expectations" placeholder="可填写说明，或 JSON：城市、薪资、方向"></textarea></label>
-        <label>个人技能画像<textarea class="short" v-model="form.skill_profile" placeholder="技能用逗号或换行分隔，也可填写分类 JSON"></textarea></label>
-        <label>简历正文<textarea class="resume-text" v-model="form.resume_text" placeholder="粘贴 Markdown 或纯文本简历"></textarea></label>
-        <div class="editor-foot"><span v-if="form.id" class="hint">修订 {{form.revision || 1}} · 更新于 {{fmtTime(form.updated_at)}}</span><span class="grow"></span><button v-if="form.id && !form.is_default && !form.archived_at" @click="setDefault">设为默认</button><button v-if="form.id && !form.archived_at" @click="archive">归档</button><button v-if="form.id && form.archived_at" @click="restore">恢复</button><button class="primary" :disabled="saving || form.archived_at" @click="save">{{saving ? '保存中…' : '保存简历'}}</button></div>
+      <section v-if="selected" class="resume-workspace">
+        <div class="workspace-toolbar">
+          <div><h2>{{editing ? '编辑简历' : selected.name}}</h2><p>{{editing ? '仅保留档案名称与 Markdown 正文' : 'Markdown 预览'}}</p></div>
+          <div class="row" v-if="editing"><button @click="cancelEdit">取消</button><button class="primary" @click="save">保存简历</button></div>
+          <button v-else class="primary" @click="edit">编辑</button>
+        </div>
+        <div v-if="editing" class="resume-editor">
+          <label>档案名称<input v-model="draft.name" maxlength="40" placeholder="例如：嵌入式软件主简历"></label>
+          <label>简历正文<textarea v-model="draft.body" class="resume-text" spellcheck="false" placeholder="使用 Markdown 编写简历正文"></textarea></label>
+        </div>
+        <article v-else class="markdown-body" v-html="rendered"></article>
       </section>
     </div>
   </div>`,
 }
 
-// ── 页面：模块化采集中心 ─────────────────────────────────────────
-const DEFAULT_CITY_GROUPS = [
-  { province: '直辖市', cities: [{ code: '101010100', name: '北京' }, { code: '101020100', name: '上海' }, { code: '101030100', name: '天津' }, { code: '101040100', name: '重庆' }] },
-  { province: '广东', cities: [{ code: '101280600', name: '深圳' }, { code: '101280100', name: '广州' }, { code: '101280800', name: '佛山' }, { code: '101281600', name: '东莞' }, { code: '101280300', name: '惠州' }] },
-  { province: '浙江', cities: [{ code: '101210100', name: '杭州' }, { code: '101210200', name: '湖州' }, { code: '101210300', name: '嘉兴' }, { code: '101210900', name: '金华' }] },
-  { province: '江苏', cities: [{ code: '101190400', name: '苏州' }, { code: '101190100', name: '南京' }, { code: '101190200', name: '无锡' }, { code: '101191100', name: '常州' }] },
-  { province: '湖北', cities: [{ code: '101200100', name: '武汉' }] },
-  { province: '四川', cities: [{ code: '101270100', name: '成都' }] },
-  { province: '陕西', cities: [{ code: '101110100', name: '西安' }] },
-  { province: '福建', cities: [{ code: '101230200', name: '厦门' }, { code: '101230100', name: '福州' }] },
-  { province: '湖南', cities: [{ code: '101250100', name: '长沙' }] },
-  { province: '河南', cities: [{ code: '101180100', name: '郑州' }] },
+// -- 页面：采集中心 -----------------------------------------------------
+const CITY_OPTIONS = [
+  '北京', '上海', '天津', '重庆', '深圳', '广州', '东莞', '佛山', '珠海', '惠州',
+  '杭州', '宁波', '温州', '嘉兴', '绍兴', '金华', '南京', '苏州', '无锡', '常州',
+  '南通', '扬州', '武汉', '长沙', '郑州', '成都', '绵阳', '西安', '厦门', '福州',
+  '泉州', '合肥', '南昌', '济南', '青岛', '烟台', '沈阳', '大连', '长春', '哈尔滨',
+  '石家庄', '太原', '呼和浩特', '兰州', '西宁', '银川', '乌鲁木齐', '昆明', '贵阳', '南宁',
+  '海口', '三亚', '拉萨', '香港', '澳门',
 ]
-const FILTER_LABEL_BY_CODE = {
-  salary: { 402: '3K以下', 403: '3-5K', 404: '5-10K', 405: '10-20K', 406: '20-50K', 407: '50K以上' },
-  experience: { 108: '在校生', 102: '应届生', 101: '经验不限', 103: '1年以内', 104: '1-3年', 105: '3-5年', 106: '5-10年', 107: '10年以上' },
-  degree: { 209: '初中及以下', 208: '中专/中技', 206: '高中', 202: '大专', 203: '本科', 204: '硕士', 205: '博士' },
-  scale: { 301: '0-20人', 302: '20-99人', 303: '100-499人', 304: '500-999人', 305: '1000-9999人', 306: '10000人以上' },
-  stage: { 801: '未融资', 802: '天使轮', 803: 'A轮', 804: 'B轮', 805: 'C轮', 806: 'D轮及以上', 807: '已上市', 808: '不需要融资' },
-  industry: { 1001: '互联网', 1002: '电子商务', 1003: '金融', 1004: '游戏', 1005: '企业服务', 1006: '教育培训', 1007: '社交网络', 1008: '医疗健康', 1009: '生活服务', 1010: '广告营销' },
+function matchingCities(query, selected) {
+  const keyword = String(query || '').trim().replace(/市$/, '')
+  if (!keyword) return []
+  return CITY_OPTIONS.filter(city => city.includes(keyword) && !selected.includes(city)).slice(0, 8)
 }
+function appendCity(list, value) {
+  const city = String(value || '').trim().replace(/市$/, '')
+  if (city && !list.includes(city)) list.push(city)
+  return city
+}
+const FILTER_OPTIONS = {
+  experience: ['不限', '1-3年', '3-5年', '5-10年'],
+  degree: ['不限', '大专', '本科', '硕士'],
+  scale: ['不限', '20-99人', '100-499人', '500-999人', '1000人以上'],
+  stage: ['不限', '未融资', 'A轮', 'B轮', '已上市'],
+  industry: ['不限', '智能硬件', '人工智能', '医疗健康', '机器人', '物联网'],
+}
+const createPlan = () => ({
+  name: '新的采集计划', mode: 'auto', fetchDetails: true, resumeId: store.selectedResumeId,
+  keywords: '', cities: ['深圳'], pages: 3, salary: '20-50K', experience: '3-5年',
+  degree: '本科', scale: '不限', stage: '不限', industry: '不限', companies: '', generated: false,
+})
+function createCollectionRun(plan, sourceOverride = '') {
+  const keywords = String(plan.keywords || '').split(/[\n,，]+/).map(value => value.trim()).filter(Boolean)
+  const target = Math.min(store.jobs.length, Math.max(6, keywords.length * plan.cities.length))
+  const run = {
+    id: nextRunId(), name: plan.name.trim(), startedAt: new Date().toISOString(), finishedAt: '',
+    status: 'running', enabled: true, collected: 0, target, fetchDetails: plan.fetchDetails,
+    source: sourceOverride || (plan.mode === 'auto' ? 'AI 自动生成' : '手动配置'), kind: 'plan', jobKeys: [],
+  }
+  store.runs.unshift(run)
+  return run
+}
+function runStatusLabel(status) {
+  return { running: '采集中', paused: '已暂停', completed: '已完成', failed: '失败', cancelled: '已取消' }[status] || status
+}
+function xmlEscape(value) {
+  return String(value ?? '').replace(/[<>&"']/g, char => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[char]))
+}
+function safeSpreadsheetValue(value) {
+  const text = String(value ?? '')
+  return /^[=+\-@]/.test(text) ? `'${text}` : text
+}
+function exportRunAsXls(run) {
+  const keys = run.jobKeys.length ? run.jobKeys : store.jobs.slice(0, run.collected).map(job => job.job_key)
+  const rows = keys.map(key => store.jobs.find(job => job.job_key === key)).filter(Boolean)
+  if (!rows.length) { showToast('当前记录还没有可导出的岗位', 'warn'); return }
+  const headers = ['岗位', '公司', '薪资', '地点', '经验', '学历', '标签', 'JD', '采集时间']
+  const values = rows.map(job => [
+    job.title, job.company || '公司信息保密', job.salary, job.location, job.experience, job.degree,
+    deriveJobTags(job).map(tag => tag.label).join('、'), run.fetchDetails ? job.jd : '', fmtTime(run.startedAt),
+  ])
+  const cell = value => `<Cell><Data ss:Type="String">${xmlEscape(safeSpreadsheetValue(value))}</Data></Cell>`
+  const table = [headers, ...values].map(row => `<Row>${row.map(cell).join('')}</Row>`).join('')
+  const xml = `<?xml version="1.0" encoding="UTF-8"?><?mso-application progid="Excel.Sheet"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet ss:Name="采集结果"><Table>${table}</Table></Worksheet></Workbook>`
+  const blob = new Blob(['\ufeff', xml], { type: 'application/vnd.ms-excel;charset=utf-8' })
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(blob)
+  link.download = `采集结果_${run.id}.xls`
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  setTimeout(() => URL.revokeObjectURL(link.href), 0)
+  showToast(`已导出 ${rows.length} 条岗位数据`)
+}
+
 const CollectView = {
   setup() {
-    const config = reactive({ keywords: '嵌入式开发\nAI Agent', city_codes: ['101280600'], pages: 3,
-      salary: '', experience: [], degree: [], scale: [], stage: [], industry: [], companies: '' })
-    const cityGroups = ref(DEFAULT_CITY_GROUPS), citySearch = ref(''), status = ref({ running: false, log: [] })
-    const runs = ref([]), busy = ref(''), xlsxPath = ref(''), jsonDir = ref(''), importResult = ref(null)
-    const optionGroups = {
-      experience: ['经验不限', '在校生', '应届生', '1年以内', '1-3年', '3-5年', '5-10年', '10年以上'],
-      degree: ['不限', '大专', '本科', '硕士', '博士'],
-      scale: ['0-20人', '20-99人', '100-499人', '500-999人', '1000-9999人', '10000人以上'],
-      stage: ['未融资', '天使轮', 'A轮', 'B轮', 'C轮', 'D轮及以上', '已上市', '不需要融资'],
-      industry: ['互联网', '电子商务', '金融', '游戏', '企业服务', '教育培训', '社交网络', '医疗健康', '生活服务', '广告营销'],
+    const screen = ref('history')
+    const step = ref(1)
+    const generating = ref(false)
+    const syncingFavorites = ref(false)
+    const cityQuery = ref('')
+    const plan = reactive(createPlan())
+    const keywords = computed(() => plan.keywords.split(/[\n,，]+/).map(value => value.trim()).filter(Boolean))
+    const companyList = computed(() => plan.companies.split(/\n/).map(value => value.trim()).filter(Boolean))
+    const citySuggestions = computed(() => matchingCities(cityQuery.value, plan.cities))
+    const llmReady = computed(() => isLlmConfigured())
+    const resume = computed(() => store.resumes.find(item => item.id === Number(plan.resumeId)) || store.resumes[0])
+    function startWizard() {
+      Object.assign(plan, createPlan())
+      step.value = 1
+      screen.value = 'wizard'
+      cityQuery.value = ''
     }
-    const optionLabels = { experience: '经验', degree: '学历', scale: '公司规模', stage: '融资阶段', industry: '行业' }
-    const keywords = computed(() => splitLines(config.keywords))
-    const companyTargets = computed(() => splitLines(config.companies))
-    const hasTasks = computed(() => keywords.value.length > 0 || companyTargets.value.length > 0)
-    const combinations = computed(() => keywords.value.length * config.city_codes.length)
-    const selectedCities = computed(() => cityGroups.value.flatMap(group => group.cities.map(city => ({
-      province: group.province, city: city.name, city_code: city.code,
-    }))).filter(city => config.city_codes.includes(city.city_code)))
-    const filteredCityGroups = computed(() => !citySearch.value.trim() ? cityGroups.value : cityGroups.value.map(group => ({ ...group, cities: group.cities.filter(city => city.name.includes(citySearch.value.trim())) })).filter(group => group.cities.length))
-    const listProgress = computed(() => status.value.list_progress || {
-      done: status.value.progress?.list_completed || 0,
-      total: status.value.progress?.list_total || combinations.value,
-    })
-    const detailProgress = computed(() => status.value.detail_progress || {
-      done: status.value.progress?.detail_completed || 0,
-      total: status.value.progress?.detail_total || 0,
-    })
-    const percent = value => value.total ? Math.min(100, Math.round(value.done / value.total * 100)) : 0
-    function toggleOption(field, value) {
-      const list = config[field]; const index = list.indexOf(value)
-      if (index >= 0) list.splice(index, 1); else list.push(value)
+    function closeWizard() { screen.value = 'history' }
+    async function syncFavoriteJobs() {
+      syncingFavorites.value = true
+      await wait(800)
+      const run = addFavoriteSyncRun()
+      syncingFavorites.value = false
+      showToast(`已同步 ${run.collected} 个 BOSS 收藏岗位，并新增采集记录`)
     }
-    function payload() {
-      const companies = companyTargets.value.map(value => /^https?:\/\//.test(value) ? { url: value } : { brand_id: value })
-      return { keywords: keywords.value, cities: selectedCities.value, city_codes: [...config.city_codes], pages: Number(config.pages),
-        filters: { salary: config.salary, experience: [...config.experience], degree: [...config.degree], scale: [...config.scale], stage: [...config.stage], industry: [...config.industry] },
-        companies, company_urls: splitLines(config.companies) }
+    function addCity(city = cityQuery.value) {
+      if (appendCity(plan.cities, city)) cityQuery.value = ''
     }
-    async function loadConfig() {
-      try {
-        const data = await api.get('/api/collect/config')
-        const saved = data.config || data
-        if (Array.isArray(data.city_options) && data.city_options.length) cityGroups.value = data.city_options
-        const asChoices = (field, value) => {
-          const values = Array.isArray(value) ? value : splitLines(value)
-          return values.map(item => FILTER_LABEL_BY_CODE[field]?.[item] || item)
-        }
-        const savedCompanies = saved.company_urls || saved.companies || []
-        Object.assign(config, {
-          keywords: Array.isArray(saved.keywords) ? saved.keywords.join('\n') : (saved.keywords || config.keywords),
-          city_codes: saved.city_codes || (saved.cities || []).map(city => city.city_code || city.code),
-          pages: saved.pages || config.pages,
-          salary: asChoices('salary', first(saved.filters?.salary, saved.salary, []))[0] || '',
-          experience: asChoices('experience', first(saved.filters?.experience, saved.experience, [])),
-          degree: asChoices('degree', first(saved.filters?.degree, saved.degree, [])),
-          scale: asChoices('scale', first(saved.filters?.scale, saved.scale, [])),
-          stage: asChoices('stage', first(saved.filters?.stage, saved.stage, [])),
-          industry: asChoices('industry', first(saved.filters?.industry, saved.industry, [])),
-          companies: savedCompanies.map ? savedCompanies.map(item => typeof item === 'string' ? item : item.url || item.brand_id).filter(Boolean).join('\n') : '',
-        })
-      } catch (_) { /* 首次启动使用内置常用城市。 */ }
+    function removeCity(city) {
+      plan.cities.splice(plan.cities.indexOf(city), 1)
     }
-    async function poll() {
-      try { status.value = await api.get('/api/collect/status'); runs.value = status.value.recent || runs.value }
-      catch (_) {}
+    async function generatePlan() {
+      if (!llmReady.value) {
+        showToast('LLM 未配置，AI 生成采集计划不可用', 'warn')
+        return
+      }
+      generating.value = true
+      await wait(1100)
+      const aiDirection = resume.value.name.includes('AI')
+      Object.assign(plan, {
+        name: aiDirection ? 'AI 应用与 Agent 机会' : '嵌入式核心岗位补采',
+        keywords: aiDirection ? 'AI Agent 应用工程师\nLLM 应用工程师\n边缘 AI 工程师' : '嵌入式软件工程师\n固件开发工程师\nRTOS 平台工程师\n医疗器械嵌入式',
+        cities: ['深圳'], pages: 3, salary: '不限', experience: '不限',
+        degree: '不限', scale: '不限', stage: '不限', industry: '不限', companies: '', generated: true,
+      })
+      generating.value = false
+      showToast('AI 采集计划已生成，可继续修改')
     }
-    onMounted(async () => { await loadConfig(); try { runs.value = await api.get('/api/runs') } catch (_) {} await poll() })
-    const timer = setInterval(poll, 3000); onBeforeUnmount(() => clearInterval(timer))
-    async function save() {
-      if (!hasTasks.value) { alert('至少填写一个关键词或一个公司 URL / brandId'); return false }
-      if (keywords.value.length && !config.city_codes.length) { alert('关键词采集至少选择一个城市'); return false }
-      if (combinations.value > 20) { alert(`当前共有 ${combinations.value} 个关键词×城市组合，最多允许 20 个`); return false }
-      try { await api.put('/api/collect/config', payload()); return true }
-      catch (e) { alert('采集配置保存失败：' + e.message); return false }
+    function nextToConfig() {
+      step.value = 2
+      if (plan.mode === 'manual') plan.generated = true
     }
-    async function start() {
-      if (!await save()) return
-      try { const result = await api.post('/api/collect/run', { kind: 'config', config: payload() }); if (result.ok === false) alert(result.error); await poll() }
-      catch (e) { alert('采集启动失败：' + e.message) }
+    function toReview() {
+      if (!plan.name.trim() || !keywords.value.length || !plan.cities.length) {
+        showToast('请填写计划名称、关键词并至少选择一个城市', 'warn')
+        return
+      }
+      step.value = 3
     }
-    async function cancel() { await api.post('/api/collect/cancel'); poll() }
-    async function retryDetails() { try { await api.post('/api/collect/retry-details'); poll() } catch (e) { alert('重试失败：' + e.message) } }
-    async function doImport(kind) {
-      busy.value = kind
-      try { importResult.value = await api.post(kind === 'xlsx' ? '/api/import/xlsx' : '/api/import/json', kind === 'xlsx' ? { path: xlsxPath.value } : { dir: jsonDir.value }) }
-      catch (e) { alert('导入失败：' + e.message) }
-      finally { busy.value = '' }
+    function launchPlan() {
+      createCollectionRun(plan)
+      screen.value = 'history'
+      showToast(`采集计划「${plan.name.trim()}」已开始`)
     }
-    return { config, citySearch, filteredCityGroups, status, runs, busy, xlsxPath, jsonDir, importResult,
-      optionGroups, optionLabels, keywords, companyTargets, hasTasks, combinations,
-      listProgress, detailProgress, percent, toggleOption, save, start, cancel,
-      retryDetails, doImport, fmtTime }
+    function toggleRun(run) {
+      if (run.status === 'running') { run.status = 'paused'; showToast('采集计划已暂停', 'info') }
+      else if (run.status === 'paused') { run.status = 'running'; showToast('采集计划已继续') }
+    }
+    function toggleRunData(run, event) {
+      run.enabled = event.target.checked
+      showToast(run.enabled ? `已应用「${run.name}」的岗位数据` : `已禁用「${run.name}」的岗位数据`, 'info')
+    }
+    async function cancelRun(run) {
+      const accepted = await requestConfirm({
+        title: '取消采集计划',
+        message: `确认取消「${run.name}」？已采集的 ${run.collected} 条数据会保留，可继续通过“应用数据”开关控制。`,
+        confirmText: '确认取消', tone: 'danger',
+      })
+      if (!accepted) return
+      run.status = 'cancelled'
+      run.finishedAt = new Date().toISOString()
+      showToast('采集计划已取消', 'info')
+    }
+    return { store, screen, step, plan, generating, syncingFavorites, cityQuery, keywords, companyList, citySuggestions, llmReady, resume, FILTER_OPTIONS,
+      percentOf, fmtTime, runStatusLabel, startWizard, closeWizard, addCity, removeCity, generatePlan,
+      nextToConfig, toReview, launchPlan, syncFavoriteJobs, toggleRun, toggleRunData, cancelRun, exportRunAsXls }
   },
   template: `
   <div>
-    <div class="page-head"><div><h1>采集中心</h1><p>全局配置一次城市与筛选条件，任务按关键词×城市串行执行。</p></div><div class="row"><button @click="save">保存配置</button><button class="primary" :disabled="status.running || !hasTasks || combinations>20" @click="start">开始采集</button></div></div>
-    <div v-if="status.risk || status.halted || status.risk_signal" class="notice bad">采集已因风控信号停止：{{status.risk_reason || status.risk_signal || status.error || '请检查采集账号'}}</div>
-    <div class="collect-grid">
-      <section class="config-module"><h2>搜索关键词</h2><p>每行一个关键词。</p><textarea class="short" v-model="config.keywords"></textarea><div class="module-foot"><span>{{keywords.length}} 个关键词</span></div></section>
-      <section class="config-module"><h2>采集范围</h2><p>页数作用于每个关键词和城市组合。</p><label>每组页数<input type="number" v-model.number="config.pages" min="1" max="10"></label><label>薪资区间<select v-model="config.salary"><option value="">不限</option><option>3K以下</option><option>3-5K</option><option>5-10K</option><option>10-20K</option><option>20-50K</option><option>50K以上</option></select></label><div class="module-foot" :class="combinations>20?'bad':''">{{combinations}} / 20 个组合</div></section>
-    </div>
-    <section class="config-module wide"><div class="section-title"><div><h2>省份 / 城市</h2><p>至少选择一项，城市以 BOSS code 保存。</p></div><input v-model="citySearch" placeholder="搜索城市"></div>
-      <div class="province-groups"><fieldset v-for="group in filteredCityGroups" :key="group.province"><legend>{{group.province}}</legend><label v-for="city in group.cities" :key="city.code" class="check"><input type="checkbox" :value="city.code" v-model="config.city_codes"> {{city.name}}</label></fieldset></div>
-    </section>
-    <section class="config-module wide"><h2>岗位筛选</h2><p>可多选；不选择表示不限。</p>
-      <div class="choice-row" v-for="(options,field) in optionGroups" :key="field"><b>{{optionLabels[field]}}</b><button v-for="value in options" :key="value" :class="{selected:config[field].includes(value)}" @click="toggleOption(field,value)">{{value}}</button></div>
-      <label>公司定向（每行 URL 或 brandId）<textarea class="short" v-model="config.companies"></textarea></label>
-    </section>
-    <section v-if="status.running || status.current || status.run_id || status.last_result" class="run-panel"><div class="section-title"><div><h2>执行状态</h2><p>{{status.current || (status.phase==='finished' ? '最近任务已结束' : '等待任务')}}</p></div><div class="row"><button v-if="!status.running && (status.retry_details_available || detailProgress.total>detailProgress.done)" @click="retryDetails">仅重试缺失 JD</button><button v-if="status.running" @click="cancel">取消采集</button></div></div>
-      <div class="progress-row"><span>列表采集 {{listProgress.done}} / {{listProgress.total}}</span><div class="progress"><i :style="{width:percent(listProgress)+'%'}"></i></div></div>
-      <div class="progress-row"><span>JD 详情 {{detailProgress.done}} / {{detailProgress.total}}</span><div class="progress"><i :style="{width:percent(detailProgress)+'%'}"></i></div></div>
-      <pre v-if="status.log?.length" class="log">{{status.log.join('\\n')}}</pre>
-    </section>
-    <details class="import-panel"><summary>导入已有文件</summary><div class="form-grid two"><label>xlsx 文件路径<div class="input-action"><input v-model="xlsxPath" placeholder="~/Desktop/岗位表.xlsx"><button :disabled="!xlsxPath || busy" @click="doImport('xlsx')">导入</button></div></label><label>scraper JSON 目录<div class="input-action"><input v-model="jsonDir" placeholder="留空使用默认目录"><button :disabled="busy" @click="doImport('json')">导入</button></div></label></div><pre v-if="importResult" class="log">{{JSON.stringify(importResult,null,2)}}</pre></details>
-    <section class="section-block"><div class="section-title"><div><h2>最近任务</h2><p>只有成功任务才参与来源缺失判断。</p></div></div><div class="table-wrap"><table><thead><tr><th>开始时间</th><th>类型</th><th>状态</th><th>列表 / JD</th></tr></thead><tbody><tr v-for="run in runs" :key="run.id"><td>{{fmtTime(run.started_at)}}</td><td>{{run.kind}}</td><td>{{run.status || (run.finished_at ? '已完成' : '执行中')}}</td><td>{{run.list_count ?? run.stats?.list_count ?? '—'}} / {{run.detail_count ?? run.stats?.detail_count ?? '—'}}</td></tr></tbody></table></div></section>
+    <header class="page-head">
+      <div><div class="eyebrow">岗位发现</div><h1>采集中心</h1><p>{{screen==='history'?'采集计划与历史记录':'创建可检查、可修改的采集计划'}}</p></div>
+      <div v-if="screen==='history'" class="row"><button :disabled="syncingFavorites" @click="syncFavoriteJobs">{{syncingFavorites?'同步中…':'同步 BOSS 收藏'}}</button><button class="primary" @click="startWizard">新建采集计划</button></div>
+      <button v-else @click="closeWizard">返回历史记录</button>
+    </header>
+
+    <template v-if="screen==='history'">
+      <div class="table-wrap collect-history">
+        <table>
+          <thead><tr><th>时间 / 计划</th><th>采集条数</th><th>状态与进度</th><th>应用数据</th><th class="actions-col">操作</th></tr></thead>
+          <tbody>
+            <tr v-for="run in store.runs" :key="run.id">
+              <td><b>{{run.name}}</b><p>{{fmtTime(run.startedAt)}} · {{run.source}} · {{run.fetchDetails?'含完整 JD':'仅岗位列表'}}</p><span v-if="run.kind==='favorite_sync'" class="tag blue">收藏同步采集</span></td>
+              <td><strong class="table-number">{{run.collected}}</strong><span class="muted"> / {{run.target}} 条</span></td>
+              <td><div class="run-progress-cell"><div class="progress-copy"><span class="status-badge" :class="run.status">{{runStatusLabel(run.status)}}</span><b>{{run.status==='completed'?100:percentOf(run)}}%</b><small>{{run.collected}} / {{run.target}}</small></div><div class="progress"><i :style="{width:(run.status==='completed'?100:percentOf(run))+'%'}"></i></div></div></td>
+              <td><label class="switch compact"><input type="checkbox" :checked="run.enabled" @change="toggleRunData(run,$event)"><span class="switch-track"><span class="switch-thumb"></span></span><span>{{run.enabled?'已应用':'已禁用'}}</span></label></td>
+              <td><div class="row end"><button v-if="run.status==='running' || run.status==='paused'" @click="toggleRun(run)">{{run.status==='running'?'暂停':'继续'}}</button><button v-if="run.status==='running' || run.status==='paused'" class="danger-quiet" @click="cancelRun(run)">取消</button><button class="icon-button" :disabled="!run.collected" title="导出 Excel 兼容文件" :aria-label="'导出 ' + run.name" @click="exportRunAsXls(run)">↓</button></div></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </template>
+
+    <template v-else>
+      <ol class="stepper" aria-label="采集计划步骤">
+        <li :class="{active:step===1,done:step>1}"><span>1</span><div><b>采集方式</b><small>选择生成方式</small></div></li>
+        <li :class="{active:step===2,done:step>2}"><span>2</span><div><b>计划配置</b><small>生成并修改</small></div></li>
+        <li :class="{active:step===3}"><span>3</span><div><b>确认开始</b><small>检查执行范围</small></div></li>
+      </ol>
+
+      <section v-if="step===1" class="wizard-panel">
+        <div v-if="!llmReady" class="llm-warning"><b>LLM 未配置</b><span>AI 自动生成不可用，请改用手动选择或先到设置页配置 LLM。</span></div>
+        <div class="field-group"><span class="field-label">计划生成方式</span><div class="segmented wide"><button :class="{active:plan.mode==='auto'}" :disabled="!llmReady" @click="plan.mode='auto'"><b>AI 自动生成</b><small>根据选定简历生成关键词与范围</small></button><button :class="{active:plan.mode==='manual'}" @click="plan.mode='manual'"><b>手动选择</b><small>逐项配置关键词、城市和筛选</small></button></div></div>
+        <div class="field-group"><span class="field-label">采集详细程度</span><div class="segmented"><button :class="{active:!plan.fetchDetails}" @click="plan.fetchDetails=false">采集岗位列表</button><button :class="{active:plan.fetchDetails}" @click="plan.fetchDetails=true">采集完整JD（推荐）</button></div></div>
+        <div class="wizard-actions"><span></span><button class="primary" @click="nextToConfig">下一步</button></div>
+      </section>
+
+      <section v-if="step===2" class="wizard-panel">
+        <div v-if="plan.mode==='auto' && !plan.generated" class="ai-generate">
+          <div><span class="ai-mark">AI</span><h2>根据简历生成采集计划</h2><p>{{llmReady?'选择本次采集使用的简历档案':'LLM 未配置，AI 生成功能不可用'}}</p></div>
+          <label>简历档案<select v-model.number="plan.resumeId"><option v-for="item in store.resumes" :key="item.id" :value="item.id">{{item.name}}</option></select></label>
+          <button class="primary" :disabled="generating || !llmReady" @click="generatePlan"><span v-if="generating" class="spinner"></span>{{generating?'正在分析简历…':'生成采集计划'}}</button>
+        </div>
+        <template v-else>
+          <div class="form-grid two"><label>计划名称<input v-model="plan.name" maxlength="40"></label><label>每个关键词页数<input type="number" v-model.number="plan.pages" min="1" max="10"></label></div>
+          <label class="block-label">搜索关键词<textarea class="short" v-model="plan.keywords" placeholder="每行一个关键词"></textarea></label>
+          <div class="field-group"><span class="field-label">城市范围</span><div class="city-picker"><div class="city-input-row"><input v-model="cityQuery" placeholder="输入城市关键词" @keyup.enter="addCity()"><button @click="addCity()">添加</button></div><div v-if="citySuggestions.length" class="city-suggestions"><button v-for="city in citySuggestions" :key="city" @click="addCity(city)">{{city}}</button></div><div class="city-tags"><span v-for="city in plan.cities" :key="city" class="city-tag">{{city}}<button :aria-label="'移除城市 ' + city" @click="removeCity(city)">×</button></span></div></div></div>
+          <div class="form-grid three"><label>薪资范围<select v-model="plan.salary"><option>不限</option><option>15-30K</option><option>20-50K</option><option>30K以上</option></select></label><label>经验<select v-model="plan.experience"><option v-for="value in FILTER_OPTIONS.experience" :key="value">{{value}}</option></select></label><label>学历<select v-model="plan.degree"><option v-for="value in FILTER_OPTIONS.degree" :key="value">{{value}}</option></select></label><label>公司规模<select v-model="plan.scale"><option v-for="value in FILTER_OPTIONS.scale" :key="value">{{value}}</option></select></label><label>融资阶段<select v-model="plan.stage"><option v-for="value in FILTER_OPTIONS.stage" :key="value">{{value}}</option></select></label><label>行业<select v-model="plan.industry"><option v-for="value in FILTER_OPTIONS.industry" :key="value">{{value}}</option></select></label></div>
+          <label v-if="plan.mode==='manual'" class="block-label">定向公司<textarea class="short" v-model="plan.companies" placeholder="每行一个公司名称，可留空"></textarea></label>
+        </template>
+        <div class="wizard-actions"><button @click="step=1">上一步</button><button v-if="plan.mode==='manual' || plan.generated" class="primary" @click="toReview">检查计划</button></div>
+      </section>
+
+      <section v-if="step===3" class="wizard-panel review-plan">
+        <div class="review-head"><div><span class="status-badge completed">准备就绪</span><h2>{{plan.name}}</h2><p>{{plan.mode==='auto'?'AI 自动生成':'手动配置'}} · {{plan.fetchDetails?'采集完整JD':'仅岗位列表'}}</p></div><strong>{{keywords.length * plan.cities.length}}</strong><small>关键词 × 城市组合</small></div>
+        <dl class="review-grid"><div><dt>关键词</dt><dd><span v-for="value in keywords" :key="value" class="tag blue">{{value}}</span></dd></div><div><dt>城市</dt><dd>{{plan.cities.join('、')}}</dd></div><div><dt>筛选条件</dt><dd>{{[plan.salary,plan.experience,plan.degree,plan.scale,plan.stage,plan.industry].filter(v=>v&&v!=='不限').join(' · ') || '不限'}}</dd></div><div v-if="plan.mode==='manual'"><dt>定向公司</dt><dd>{{companyList.join('、') || '无'}}</dd></div></dl>
+        <div class="wizard-actions"><button @click="step=2">返回修改</button><button class="primary" @click="launchPlan">开始采集</button></div>
+      </section>
+    </template>
   </div>`,
 }
 
-// ── 原生 SVG 数据图表 ────────────────────────────────────────────
-const SvgBars = {
-  props: ['items', 'color'],
-  setup(props) {
-    const rows = computed(() => arrayOf(props.items).slice(0, 10))
-    const max = computed(() => Math.max(1, ...rows.value.map(item => Number(item.count || item.value || 0))))
-    return { rows, max }
-  },
-  // 柱状图颜色走 CSS 变量（随主题切换）；fill 属性不支持 var()，须用内联 style
-  template: `<div class="bar-chart"><div v-for="item in rows" :key="item.label" class="bar-row"><span :title="item.label">{{item.label}}</span><svg viewBox="0 0 100 12" preserveAspectRatio="none" role="img" :aria-label="item.label + ' ' + (item.count ?? item.value)"><rect class="bar-bg" width="100" height="12" rx="2"></rect><rect :width="(item.count ?? item.value) > 0 ? Math.max(1,(item.count ?? item.value)/max*100) : 0" height="12" rx="2" :style="{fill: color || 'var(--accent)'}"></rect></svg><b>{{item.count ?? item.value}}</b></div><div v-if="!rows.length" class="empty">暂无数据</div></div>`,
+// -- 页面：数据分析 -----------------------------------------------------
+function countRows(items, getter) {
+  const counts = new Map()
+  items.forEach(item => {
+    const label = getter(item) || '未知'
+    counts.set(label, (counts.get(label) || 0) + 1)
+  })
+  return [...counts].map(([label, value]) => ({ label, value })).sort((a, b) => b.value - a.value)
 }
 const AnalyticsView = {
   components: { SvgBars },
   setup() {
-    const data = ref({}), loading = ref(false), error = ref('')
-    const filters = reactive({ keyword: '', city_code: '', date_from: '', date_to: '' })
-    async function load() {
-      loading.value = true
-      error.value = ''
-      try { data.value = await api.get('/api/analytics?' + new URLSearchParams(filters)) }
-      catch (e) { error.value = '分析数据加载失败：' + e.message }
-      finally { loading.value = false }
-    }
-    onMounted(load)
-    const summary = computed(() => data.value.summary || {})
-    const dist = computed(() => data.value.distributions || {})
-    const meta = computed(() => data.value.meta || {})
+    const filters = reactive({ keyword: '', city: '', tag: '', dateFrom: '', dateTo: '' })
+    const baseJobs = computed(() => jobsFromEnabledRuns())
+    const jobs = computed(() => baseJobs.value.filter(job => {
+      if (filters.keyword && job.source_keyword !== filters.keyword) return false
+      if (filters.city && !job.location.startsWith(filters.city)) return false
+      if (filters.tag && !deriveJobTags(job).some(tag => tag.key === filters.tag)) return false
+      if (filters.dateFrom && job.active_ts.slice(0, 10) < filters.dateFrom) return false
+      if (filters.dateTo && job.active_ts.slice(0, 10) > filters.dateTo) return false
+      return true
+    }))
+    const meta = computed(() => ({
+      keywords: [...new Set(baseJobs.value.map(job => job.source_keyword))],
+      cities: [...new Set(baseJobs.value.map(job => job.location.split('·')[0]))],
+    }))
+    const summary = computed(() => {
+      const values = jobs.value
+      const avgMin = values.length ? Math.round(values.reduce((sum, job) => sum + job.salary_min, 0) / values.length) : 0
+      const avgMax = values.length ? Math.round(values.reduce((sum, job) => sum + job.salary_max, 0) / values.length) : 0
+      return {
+        total: values.length, avg: `${avgMin}-${avgMax}K`,
+        highMatch: values.filter(job => job.match_score >= 90).length,
+        favoriteRate: values.length ? Math.round(values.filter(job => job.favorite).length / values.length * 100) : 0,
+      }
+    })
+    const salaryRows = computed(() => countRows(jobs.value, job => job.salary_max >= 45 ? '45K以上' : job.salary_max >= 35 ? '35-45K' : job.salary_max >= 25 ? '25-35K' : '25K以下'))
+    const tagRows = computed(() => {
+      const tags = jobs.value.flatMap(job => deriveJobTags(job).map(tag => ({ label: tag.label })))
+      return countRows(tags, item => item.label)
+    })
     const charts = computed(() => [
-      ['salary', '月薪分布', 'var(--chart-1)'], ['annual_salary', '年包估算', 'var(--chart-2)'],
-      ['experience', '经验要求', 'var(--chart-3)'], ['degree', '学历要求', 'var(--chart-4)'],
-      ['industry', '行业分布', 'var(--chart-5)'], ['scale', '公司规模', 'var(--chart-6)'],
-      ['priority', '岗位 P 级', 'var(--chart-7)'], ['trend', '采集趋势', 'var(--chart-8)'],
+      { title: '薪资上限分布', rows: salaryRows.value, color: 'var(--chart-1)' },
+      { title: '经验要求', rows: countRows(jobs.value, job => job.experience), color: 'var(--chart-2)' },
+      { title: '学历要求', rows: countRows(jobs.value, job => job.degree), color: 'var(--chart-3)' },
+      { title: '行业分布', rows: countRows(jobs.value, job => job.industry), color: 'var(--chart-4)' },
+      { title: '岗位标签', rows: tagRows.value, color: 'var(--chart-5)' },
+      { title: 'P 级分布', rows: countRows(jobs.value, job => job.priority), color: 'var(--chart-6)' },
+      { title: '城市分布', rows: countRows(jobs.value, job => job.location.split('·')[0]), color: 'var(--chart-7)' },
+      { title: '采集趋势', rows: store.runs.slice().reverse().map(run => ({ label: shortTime(run.startedAt).split(' ')[0], value: run.collected })), color: 'var(--chart-8)' },
     ])
-    return { data, loading, error, filters, summary, dist, meta, charts, load }
+    function resetFilters() { Object.assign(filters, { keyword: '', city: '', tag: '', dateFrom: '', dateTo: '' }) }
+    return { filters, jobs, meta, summary, charts, resetFilters }
   },
   template: `
-  <div><div class="page-head"><div><h1>数据分析</h1><p>默认分析全部当前岗位；关键词、城市、日期和趋势仅使用可靠采集来源。</p></div><button class="primary" :disabled="loading" @click="load">应用筛选</button></div>
-    <div v-if="error" class="notice bad">{{error}}</div>
-    <div v-else-if="!loading && summary.unattributed_jobs" class="notice">当前包含 {{summary.unattributed_jobs}} 个历史导入或收藏岗位；来源筛选与采集趋势覆盖 {{summary.reliable_jobs || 0}} 个可靠来源岗位。</div>
-    <div class="filterbar"><select v-model="filters.keyword"><option value="">全部关键词</option><option v-for="value in meta.keywords" :value="value">{{value}}</option></select><select v-model="filters.city_code"><option value="">全部城市</option><option v-for="city in meta.cities" :value="city.code">{{city.name}}</option></select><label>起始日期<input type="date" v-model="filters.date_from"></label><label>结束日期<input type="date" v-model="filters.date_to"></label></div>
-    <div class="metric-grid compact"><div class="metric"><span>分析样本</span><strong>{{summary.jobs || 0}}</strong><small>可靠来源 {{summary.reliable_jobs || 0}} · 其他可用 {{summary.unattributed_jobs || 0}}</small></div><div class="metric"><span>平均月薪</span><strong>{{summary.avg_salary_min ?? '—'}} - {{summary.avg_salary_max ?? '—'}}K</strong><small>按可解析薪资统计</small></div><div class="metric"><span>猎头占比</span><strong>{{summary.headhunter_ratio ?? 0}}%</strong><small>{{summary.headhunter_jobs || 0}} 个岗位</small></div><div class="metric"><span>覆盖关键词</span><strong>{{summary.keywords || 0}}</strong><small>{{summary.cities || 0}} 个城市</small></div></div>
-    <div class="chart-grid"><section v-for="[key,title,color] in charts" :key="key" class="chart-panel"><h2>{{title}}</h2><SvgBars :items="key==='trend' ? data.trends : dist[key]" :color="color" /></section></div>
+  <div>
+    <header class="page-head"><div><div class="eyebrow">市场洞察</div><h1>数据分析</h1><p>从演示岗位中观察机会分布与匹配质量</p></div><button @click="resetFilters">重置筛选</button></header>
+    <div class="filterbar analytics-filter"><select v-model="filters.keyword"><option value="">全部关键词</option><option v-for="value in meta.keywords" :key="value">{{value}}</option></select><select v-model="filters.city"><option value="">全部城市</option><option v-for="value in meta.cities" :key="value">{{value}}</option></select><select v-model="filters.tag"><option value="">全部标签</option><option value="headhunter">猎头</option><option value="weekend">双休</option><option value="benefits">福利</option></select><label>起始日期<input type="date" v-model="filters.dateFrom"></label><label>结束日期<input type="date" v-model="filters.dateTo"></label></div>
+    <div class="metric-grid compact"><div class="metric tone-blue"><span>分析样本</span><strong>{{summary.total}}</strong><small>当前筛选内岗位</small></div><div class="metric tone-green"><span>平均月薪</span><strong>{{summary.avg}}</strong><small>按薪资上下限估算</small></div><div class="metric tone-amber"><span>高匹配岗位</span><strong>{{summary.highMatch}}</strong><small>匹配度 90 分及以上</small></div><div class="metric tone-red"><span>收藏率</span><strong>{{summary.favoriteRate}}%</strong><small>当前样本收藏占比</small></div></div>
+    <div class="chart-grid"><section v-for="chart in charts" :key="chart.title" class="chart-panel"><h2>{{chart.title}}</h2><SvgBars :items="chart.rows" :color="chart.color" /></section></div>
   </div>`,
 }
 
-// ── 页面：模拟面试（保留原能力）──────────────────────────────────
-const InterviewView = {
+// -- 页面：岗位列表 -----------------------------------------------------
+const EXPERIENCE_RANK = { '不限': 0, '经验不限': 0, '1-3年': 1, '3-5年': 2, '5-10年': 3, '10年以上': 4 }
+const DEGREE_RANK = { '不限': 0, '大专': 1, '本科': 2, '硕士': 3, '博士': 4 }
+const PRIORITY_RANK = { P0: 0, P1: 1, P2: 2, P3: 3 }
+const JobsView = {
   setup() {
-    const sessions = ref([]), current = ref(null), input = ref(''), busy = ref(false), report = ref(null)
-    async function load() { try { sessions.value = await api.get('/api/interviews') } catch (_) {} }
-    onMounted(load)
-    async function start() {
-      const query = prompt('输入要模拟面试的岗位关键词：', '')
-      if (!query) return
-      const data = await api.get('/api/jobs?status=active&q=' + encodeURIComponent(query) + '&limit=5')
-      const job = data.items?.[0]
-      if (!job || !confirm(`对「${job.title} · ${job.company}」开始模拟面试？`)) return
-      busy.value = true
-      try { const result = await api.post('/api/interview/start', { job_key: job.job_key }); current.value = { id: result.id, title: result.title, transcript: [{ role: 'interviewer', content: result.first_question }] }; report.value = null }
-      catch (e) { alert('开始失败：' + e.message) } finally { busy.value = false }
+    const q = ref('')
+    const favoriteFilter = ref('all')
+    const tagFilter = ref('all')
+    const expanded = ref('')
+    const sortState = reactive({ key: 'match_score', direction: 'desc' })
+    const columns = [
+      { key: 'title', label: '岗位' }, { key: 'company', label: '公司' }, { key: 'salary_max', label: '薪资' },
+      { key: 'experience', label: '经验 / 学历' }, { key: 'job_score', label: '岗位评分' },
+      { key: 'match_score', label: '匹配度评分' }, { key: 'priority', label: 'P级' }, { key: 'active_ts', label: '活跃时间' },
+    ]
+    const filtered = computed(() => jobsFromEnabledRuns().filter(job => {
+      const query = q.value.trim().toLowerCase()
+      if (query && !`${job.title}${job.company}${job.location}`.toLowerCase().includes(query)) return false
+      if (favoriteFilter.value === 'only' && !job.favorite) return false
+      if (favoriteFilter.value === 'exclude' && job.favorite) return false
+      if (tagFilter.value !== 'all' && !deriveJobTags(job).some(tag => tag.key === tagFilter.value)) return false
+      return true
+    }))
+    function sortValue(job, key) {
+      if (key === 'experience') return EXPERIENCE_RANK[job.experience] ?? 99
+      if (key === 'degree') return DEGREE_RANK[job.degree] ?? 99
+      if (key === 'priority') return PRIORITY_RANK[job.priority] ?? 99
+      if (key === 'active_ts') return new Date(job.active_ts).getTime()
+      return job[key]
     }
-    async function answer() {
-      if (!input.value.trim() || !current.value) return
-      const text = input.value; input.value = ''; current.value.transcript.push({ role: 'candidate', content: text }); busy.value = true
-      try { const result = await api.post(`/api/interview/${current.value.id}/answer`, { text }); current.value.transcript.push({ role: 'interviewer', content: result.content, feedback: result.feedback }) }
-      catch (e) { alert('提交失败：' + e.message) } finally { busy.value = false }
+    const sortedJobs = computed(() => filtered.value.map((job, index) => ({ job, index })).sort((left, right) => {
+      const a = sortValue(left.job, sortState.key)
+      const b = sortValue(right.job, sortState.key)
+      const emptyA = a === null || a === undefined || a === ''
+      const emptyB = b === null || b === undefined || b === ''
+      if (emptyA !== emptyB) return emptyA ? 1 : -1
+      let result = 0
+      if (typeof a === 'number' && typeof b === 'number') result = a - b
+      else result = String(a).localeCompare(String(b), 'zh-CN', { numeric: true })
+      if (result === 0) return left.index - right.index
+      return sortState.direction === 'asc' ? result : -result
+    }).map(item => item.job))
+    function setSort(key) {
+      if (sortState.key === key) sortState.direction = sortState.direction === 'asc' ? 'desc' : 'asc'
+      else { sortState.key = key; sortState.direction = 'asc' }
     }
-    async function finish() { busy.value = true; try { report.value = await api.post(`/api/interview/${current.value.id}/finish`); load() } catch (e) { alert('报告生成失败：' + e.message) } finally { busy.value = false } }
-    async function open(item) { const data = await api.get('/api/interview/' + item.id); current.value = { id: data.id, title: item.title, transcript: data.transcript.filter(turn => turn.role !== 'bank') }; report.value = data.report || null }
-    return { sessions, current, input, busy, report, start, answer, finish, open }
+    const ariaSort = key => sortState.key === key ? (sortState.direction === 'asc' ? 'ascending' : 'descending') : 'none'
+    function toggleExpanded(job) { expanded.value = expanded.value === job.job_key ? '' : job.job_key }
+    function toggleFavorite(job) {
+      job.favorite = !job.favorite
+      showToast(job.favorite ? '已加入收藏工作台' : '已取消收藏', job.favorite ? 'ok' : 'info')
+    }
+    async function excludeJob(job) {
+      const accepted = await requestConfirm({ title: '排除岗位', message: `确认将「${job.title} · ${job.company || '公司信息保密'}」移出当前列表？`, confirmText: '确认排除', tone: 'danger' })
+      if (!accepted) return
+      job.excluded = true
+      expanded.value = ''
+      showToast('岗位已移入排除项', 'info')
+    }
+    async function simulateScore(kind) {
+      showToast(`${kind} 评分正在演示执行`, 'info')
+      await wait(700)
+      showToast(`${kind} 评分已完成`)
+    }
+    return { q, favoriteFilter, tagFilter, expanded, sortState, columns, sortedJobs, deriveJobTags,
+      setSort, ariaSort, toggleExpanded, toggleFavorite, excludeJob, simulateScore }
   },
-  template: `<div><div class="page-head"><div><h1>模拟面试</h1><p>基于当前岗位和简历进行结构化练习。</p></div><button class="primary" :disabled="busy" @click="start">新建面试</button></div><div class="interview-layout"><aside class="session-list"><button v-for="item in sessions" :key="item.id" @click="open(item)"><b>{{item.title}}</b><span>{{item.company}} · {{item.status}}</span></button><div v-if="!sessions.length" class="empty">暂无历史面试</div></aside><section><div v-if="current" class="transcript"><h2>{{current.title}}</h2><div v-for="(turn,index) in current.transcript" :key="index" class="turn" :class="turn.role"><b>{{turn.role==='candidate'?'我':'面试官'}}</b><p>{{turn.content}}</p><small v-if="turn.feedback">点评：{{turn.feedback}}</small></div><div v-if="!report" class="input-action"><input v-model="input" placeholder="输入回答" @keyup.enter="answer"><button :disabled="busy" @click="answer">回答</button><button :disabled="busy" @click="finish">结束并生成报告</button></div><div v-else class="report"><h2>面试报告 · {{report.score ?? '—'}} 分</h2><p>{{report.overall}}</p></div></div><div v-else class="empty large">选择历史记录或开始一次新面试</div></section></div></div>`,
+  template: `
+  <div>
+    <header class="page-head"><div><div class="eyebrow">岗位池</div><h1>岗位列表</h1><p>共 {{sortedJobs.length}} 个符合条件的演示岗位</p></div><div class="row"><button @click="simulateScore('匹配度评分')">匹配度评分</button><button class="primary" @click="simulateScore('岗位评分')">岗位评分</button></div></header>
+    <div class="filterbar"><input v-model="q" aria-label="搜索岗位或公司" placeholder="搜索岗位、公司或地点"><select v-model="tagFilter" aria-label="岗位标签"><option value="all">全部标签</option><option value="headhunter">猎头</option><option value="weekend">双休</option><option value="benefits">福利</option></select><select v-model="favoriteFilter" aria-label="收藏状态"><option value="all">全部岗位</option><option value="only">仅收藏</option><option value="exclude">未收藏</option></select><span class="filter-result">{{sortedJobs.length}} 条结果</span></div>
+    <div class="table-wrap">
+      <table class="jobs-table">
+        <thead><tr><th v-for="column in columns" :key="column.key" :aria-sort="ariaSort(column.key)"><button class="sort-button" @click="setSort(column.key)"><span>{{column.label}}</span><i :class="{active:sortState.key===column.key,desc:sortState.key===column.key&&sortState.direction==='desc'}"></i></button></th></tr></thead>
+        <tbody>
+          <template v-for="job in sortedJobs" :key="job.job_key">
+            <tr class="job-row" :class="{open:expanded===job.job_key}" tabindex="0" @click="toggleExpanded(job)" @keyup.enter="toggleExpanded(job)">
+              <td data-label="岗位"><div class="job-title"><span class="chevron"></span><div><b>{{job.title}}</b><p>{{job.location}}</p><div class="tag-line"><span v-for="tag in deriveJobTags(job)" :key="tag.key" class="tag" :class="tag.tone">{{tag.label}}</span><span v-if="job.favorite" class="tag neutral">已收藏</span><span v-if="job.contacted" class="tag blue">已打招呼</span><span v-if="job.applied" class="tag ok">已投递</span><span v-if="job.interviewed" class="tag warn">已面试</span></div></div></div></td>
+              <td data-label="公司"><b>{{job.company || '公司信息保密'}}</b><p>{{job.industry}} · {{job.scale || '规模未知'}}</p></td>
+              <td data-label="薪资" class="nowrap"><b>{{job.salary}}</b></td>
+              <td data-label="经验 / 学历"><b>{{job.experience}}</b><p>{{job.degree}}</p></td>
+              <td data-label="岗位评分" class="score">{{job.job_score ?? '—'}}</td>
+              <td data-label="匹配度评分" class="score accent-score">{{job.match_score ?? '—'}}</td>
+              <td data-label="P级"><span class="priority" :class="job.priority.toLowerCase()">{{job.priority}}</span></td>
+              <td data-label="活跃时间"><b>{{job.active}}</b><p>{{job.active_ts.slice(0,10)}}</p></td>
+            </tr>
+            <tr v-if="expanded===job.job_key" class="detail-row"><td colspan="8"><div class="job-detail"><div class="detail-toolbar"><button :class="{primary:job.favorite}" @click.stop="toggleFavorite(job)">{{job.favorite?'取消收藏':'添加收藏'}}</button><button @click.stop="excludeJob(job)">不再显示</button></div><div class="detail-meta"><div><span>岗位评分</span><b>{{job.job_score}}</b></div><div><span>匹配度</span><b>{{job.match_score}}</b></div><div><span>优先级</span><b>{{job.priority}}</b></div><div><span>来源关键词</span><b>{{job.source_keyword}}</b></div></div><h3>职位描述（JD）</h3><p class="jd-copy">{{job.jd}}</p></div></td></tr>
+          </template>
+        </tbody>
+      </table>
+      <div v-if="!sortedJobs.length" class="empty large"><b>没有匹配的岗位</b><span>调整关键词或筛选条件后重试</span></div>
+    </div>
+  </div>`,
 }
 
-// ── 页面：账号管理 ───────────────────────────────────────────────
+// -- 页面：收藏工作台 ---------------------------------------------------
+const JobCardView = {
+  setup() {
+    const query = ref('')
+    const statusFilter = ref('all')
+    const selectedKeys = ref([])
+    const initial = store.jobs.find(job => job.favorite && !job.excluded)
+    const activeKey = ref(initial ? initial.job_key : '')
+    const interview = reactive({ open: false, jobKey: '', questionIndex: 0, answers: [], input: '', report: null })
+    const questions = computed(() => {
+      const job = store.jobs.find(item => item.job_key === interview.jobKey)
+      return job ? [
+        `请用两分钟介绍你与「${job.title}」最相关的一段经历。`,
+        `这个岗位重视${job.source_keyword}。请讲一个你独立定位复杂问题并完成闭环的案例。`,
+        '如果需求、进度和质量发生冲突，你会如何做技术取舍？',
+      ] : []
+    })
+    const jobs = computed(() => store.jobs.filter(job => {
+      if (!job.favorite || job.excluded) return false
+      if (query.value && !`${job.title}${job.company}`.toLowerCase().includes(query.value.toLowerCase())) return false
+      if (statusFilter.value === 'pending' && (job.analysisReady || job.greeting)) return false
+      if (statusFilter.value === 'generated' && !job.greeting) return false
+      if (statusFilter.value === 'contacted' && !job.contacted) return false
+      if (statusFilter.value === 'applied' && !job.applied) return false
+      if (statusFilter.value === 'interviewed' && !job.interviewed) return false
+      if (statusFilter.value === 'failed' && !job.actionError) return false
+      return true
+    }))
+    const activeJob = computed(() => store.jobs.find(job => job.job_key === activeKey.value) || jobs.value[0] || null)
+    const allSelected = computed(() => jobs.value.length > 0 && jobs.value.every(job => selectedKeys.value.includes(job.job_key)))
+    function selectJob(job) { activeKey.value = job.job_key }
+    function toggleAll() { selectedKeys.value = allSelected.value ? [] : jobs.value.map(job => job.job_key) }
+    function openBoss(job) { showToast(`演示模式：已模拟打开「${job.title}」`, 'info') }
+    function setWorkflowStage(job, stage) {
+      if (stage === 'contacted') {
+        const enabled = !job.contacted
+        job.contacted = enabled
+        if (!enabled) { job.applied = false; job.interviewed = false }
+      } else if (stage === 'applied') {
+        const enabled = !job.applied
+        job.contacted = enabled ? true : job.contacted
+        job.applied = enabled
+        if (!enabled) job.interviewed = false
+      } else {
+        const enabled = !job.interviewed
+        if (enabled) { job.contacted = true; job.applied = true }
+        job.interviewed = enabled
+      }
+      showToast(`岗位状态已更新为「${workflowLabel(job)}」`, 'info')
+    }
+    async function generateAnalysis(job) {
+      showToast('正在生成岗位分析…', 'info'); await wait(650)
+      job.analysisReady = true; job.advice = adviceFor(job); job.actionError = ''
+      showToast('岗位分析与应聘建议已生成')
+    }
+    async function generateGreeting(job) {
+      showToast('正在生成招呼语…', 'info'); await wait(600)
+      job.greeting = greetingFor(job); job.actionError = ''
+      showToast('招呼语已生成')
+    }
+    async function executeBatch(type, explicitKeys = null) {
+      if (store.batch.running) return
+      const keys = explicitKeys || selectedKeys.value
+      const targets = keys.map(key => store.jobs.find(job => job.job_key === key)).filter(Boolean)
+      if (!targets.length) { showToast('请先选择岗位', 'warn'); return }
+      const labels = { analysis: '生成分析', greeting: '生成招呼语', auto: '自动打招呼' }
+      const accepted = await requestConfirm({
+        title: `${labels[type]} · ${targets.length} 个岗位`,
+        message: type === 'auto' ? '本次仅演示护栏确认和逐条执行，不会打开 BOSS 或发送任何消息。' : '将按当前简历逐条处理所选岗位。',
+        confirmText: `开始${labels[type]}`,
+        tone: type === 'auto' ? 'danger' : 'primary',
+      })
+      if (!accepted) return
+      Object.assign(store.batch, { running: true, type, label: labels[type], done: 0, total: targets.length, failures: [] })
+      for (let index = 0; index < targets.length; index++) {
+        const job = targets[index]
+        await wait(420)
+        const shouldFail = type === 'auto' && targets.length > 3 && index === targets.length - 1
+        if (shouldFail) {
+          job.actionError = '演示：页面状态确认超时'
+          store.batch.failures.push(job.job_key)
+        } else if (type === 'analysis') {
+          job.analysisReady = true; job.advice = adviceFor(job); job.actionError = ''
+        } else if (type === 'greeting') {
+          job.greeting = greetingFor(job); job.actionError = ''
+        } else {
+          if (!job.greeting) job.greeting = greetingFor(job)
+          job.contacted = true; job.actionError = ''
+        }
+        store.batch.done = index + 1
+      }
+      store.batch.running = false
+      const failed = store.batch.failures.length
+      showToast(failed ? `处理完成，成功 ${targets.length - failed} 个，失败 ${failed} 个` : `${labels[type]}已完成`, failed ? 'warn' : 'ok')
+      if (!explicitKeys) selectedKeys.value = []
+    }
+    function removeFavorite(job) {
+      job.favorite = false
+      selectedKeys.value = selectedKeys.value.filter(key => key !== job.job_key)
+      const next = jobs.value.find(item => item.job_key !== job.job_key)
+      activeKey.value = next ? next.job_key : ''
+      showToast('已从收藏工作台移除', 'info')
+    }
+    function startInterview(job) {
+      Object.assign(interview, { open: true, jobKey: job.job_key, questionIndex: 0, answers: [], input: '', report: null })
+    }
+    function submitAnswer() {
+      if (!interview.input.trim()) { showToast('请先输入回答', 'warn'); return }
+      interview.answers.push({ question: questions.value[interview.questionIndex], answer: interview.input.trim() })
+      interview.input = ''
+      if (interview.questionIndex >= questions.value.length - 1) {
+        interview.report = { score: 87, summary: '回答结构清晰，能够结合真实项目说明技术判断。建议进一步量化结果，并减少背景铺垫。', strengths: ['项目经历与岗位高度相关', '问题定位过程完整', '能说明技术取舍'], improvements: ['补充关键指标和结果数据', '控制单题回答在 2-3 分钟'] }
+      } else interview.questionIndex += 1
+    }
+    function closeInterview() { interview.open = false }
+    return { store, query, statusFilter, selectedKeys, activeKey, interview, questions, jobs, activeJob, allSelected,
+      deriveJobTags, workflowLabel, selectJob, toggleAll, openBoss, setWorkflowStage, generateAnalysis, generateGreeting, executeBatch,
+      removeFavorite, startInterview, submitAnswer, closeInterview }
+  },
+  template: `
+  <div>
+    <header class="page-head workbench-head"><div><div class="eyebrow">候选岗位</div><h1>收藏工作台</h1><p>在同一视图完成分析、准备与沟通演练</p></div><select v-model.number="store.selectedResumeId" aria-label="当前简历"><option v-for="resume in store.resumes" :key="resume.id" :value="resume.id">{{resume.name}}</option></select></header>
+    <div class="batch-toolbar">
+      <label class="check"><input type="checkbox" :checked="allSelected" @change="toggleAll"> 全选当前岗位</label>
+      <span class="selection-count">已选 {{selectedKeys.length}} 个</span><span class="grow"></span>
+      <button :disabled="!selectedKeys.length || store.batch.running" @click="executeBatch('analysis')">生成分析</button>
+      <button :disabled="!selectedKeys.length || store.batch.running" @click="executeBatch('greeting')">生成招呼语</button>
+      <button class="primary" :disabled="!selectedKeys.length || store.batch.running" @click="executeBatch('auto')">自动打招呼</button>
+    </div>
+    <div v-if="store.batch.running || store.batch.total" class="batch-progress" :class="{done:!store.batch.running}"><span>{{store.batch.running ? store.batch.label + '处理中' : '最近批量操作已结束'}}</span><div class="progress"><i :style="{width:(store.batch.total?store.batch.done/store.batch.total*100:0)+'%'}"></i></div><b>{{store.batch.done}} / {{store.batch.total}}</b><small v-if="store.batch.failures.length">{{store.batch.failures.length}} 个待重试</small></div>
+    <div class="workbench-layout">
+      <aside class="workbench-list">
+        <div class="workbench-filters"><input v-model="query" placeholder="搜索收藏岗位" aria-label="搜索收藏岗位"><select v-model="statusFilter" aria-label="处理状态"><option value="all">全部状态</option><option value="pending">待准备</option><option value="generated">已生成招呼语</option><option value="contacted">已打招呼</option><option value="applied">已投递</option><option value="interviewed">已面试</option><option value="failed">处理失败</option></select></div>
+        <div class="workbench-scroll">
+          <button v-for="job in jobs" :key="job.job_key" class="workbench-job" :class="{active:activeJob&&activeJob.job_key===job.job_key}" @click="selectJob(job)">
+            <span class="workbench-check" @click.stop><input type="checkbox" :value="job.job_key" v-model="selectedKeys" :aria-label="'选择 ' + job.title"></span>
+            <span class="workbench-copy"><b>{{job.title}}</b><small>{{job.company || '公司信息保密'}} · {{job.salary}}</small><span class="tag-line"><span v-for="tag in deriveJobTags(job)" :key="tag.key" class="tag" :class="tag.tone">{{tag.label}}</span><span class="tag neutral">{{workflowLabel(job)}}</span></span></span>
+            <strong>{{job.match_score}}</strong>
+          </button>
+          <div v-if="!jobs.length" class="empty"><b>当前筛选无岗位</b></div>
+        </div>
+      </aside>
+      <section v-if="activeJob" class="workbench-detail">
+        <div class="detail-hero"><div><div class="tag-line"><span v-for="tag in deriveJobTags(activeJob)" :key="tag.key" class="tag" :class="tag.tone">{{tag.label}}</span></div><h2>{{activeJob.title}}</h2><p>{{activeJob.company || '公司信息保密'}} · {{activeJob.location}} · {{activeJob.salary}} · {{activeJob.experience}}</p></div><div class="row"><button @click="openBoss(activeJob)">打开 BOSS</button><button @click="startInterview(activeJob)">模拟面试</button><button @click="removeFavorite(activeJob)">取消收藏</button></div></div>
+        <section class="workflow-status"><div><h3>求职状态</h3><p>点击即可手动更新，后续阶段会自动补齐前置状态</p></div><div class="workflow-actions"><button :class="{active:activeJob.contacted}" @click="setWorkflowStage(activeJob,'contacted')"><span>{{activeJob.contacted?'✓':'1'}}</span>已打招呼</button><button :class="{active:activeJob.applied}" @click="setWorkflowStage(activeJob,'applied')"><span>{{activeJob.applied?'✓':'2'}}</span>已投递</button><button :class="{active:activeJob.interviewed}" @click="setWorkflowStage(activeJob,'interviewed')"><span>{{activeJob.interviewed?'✓':'3'}}</span>已面试</button></div></section>
+        <div class="score-overview"><div><span>岗位评分</span><strong>{{activeJob.job_score}}</strong><small>岗位本身质量</small></div><div><span>匹配度评分</span><strong>{{activeJob.match_score}}</strong><small>当前简历匹配</small></div><div><span>优先级</span><strong>{{activeJob.priority}}</strong><small>{{activeJob.active}}</small></div></div>
+        <section class="detail-section"><div class="section-title"><div><h3>职位描述（JD）</h3><p>{{activeJob.industry}} · {{activeJob.scale || '规模未知'}}</p></div></div><p class="jd-copy">{{activeJob.jd}}</p></section>
+        <section class="detail-section"><div class="section-title"><div><h3>招呼语</h3><p>按当前简历生成，可继续编辑</p></div><button v-if="!activeJob.greeting" @click="generateGreeting(activeJob)">生成招呼语</button></div><textarea v-if="activeJob.greeting" v-model="activeJob.greeting" class="greeting-editor"></textarea><div v-else class="inline-empty">尚未生成招呼语</div><div v-if="activeJob.greeting" class="section-actions"><span>{{activeJob.greeting.length}} 字</span><button class="primary" @click="executeBatch('auto',[activeJob.job_key])">自动打招呼</button></div></section>
+        <section class="detail-section"><div class="section-title"><div><h3>AI 应聘建议</h3><p>结合岗位要求与当前简历</p></div><button v-if="!activeJob.analysisReady" @click="generateAnalysis(activeJob)">生成分析</button></div><p v-if="activeJob.advice" class="advice-copy">{{activeJob.advice}}</p><div v-else class="inline-empty">等待生成岗位分析与应聘建议</div></section>
+        <div v-if="activeJob.actionError" class="notice bad"><b>上次处理失败</b><span>{{activeJob.actionError}}</span><button @click="executeBatch('auto',[activeJob.job_key])">重试</button></div>
+      </section>
+      <section v-else class="workbench-detail empty large"><b>选择一个收藏岗位查看详情</b></section>
+    </div>
+
+    <div v-if="interview.open" class="interview-overlay" role="dialog" aria-modal="true" aria-label="模拟面试">
+      <header><div><span class="eyebrow">模拟面试</span><h2>{{store.jobs.find(j=>j.job_key===interview.jobKey)?.title}}</h2></div><button aria-label="关闭模拟面试" title="关闭" @click="closeInterview">×</button></header>
+      <main v-if="!interview.report" class="interview-main">
+        <div class="interview-progress"><span>第 {{interview.questionIndex+1}} / {{questions.length}} 题</span><div class="progress"><i :style="{width:(interview.questionIndex/questions.length*100)+'%'}"></i></div></div>
+        <div class="interview-history"><div v-for="(turn,index) in interview.answers" :key="index" class="interview-turn"><b>面试官</b><p>{{turn.question}}</p><b>我的回答</b><p>{{turn.answer}}</p></div></div>
+        <section class="current-question"><span>面试官</span><h3>{{questions[interview.questionIndex]}}</h3></section>
+        <label class="answer-box">我的回答<textarea v-model="interview.input" placeholder="结合真实项目，按背景、行动、结果组织回答"></textarea></label>
+        <div class="interview-actions"><button @click="closeInterview">退出面试</button><button class="primary" @click="submitAnswer">{{interview.questionIndex===questions.length-1?'提交并生成报告':'提交回答'}}</button></div>
+      </main>
+      <main v-else class="interview-report"><div class="report-score"><strong>{{interview.report.score}}</strong><span>综合得分</span></div><div><h3>面试总结</h3><p>{{interview.report.summary}}</p><div class="report-columns"><section><h3>表现亮点</h3><ul><li v-for="item in interview.report.strengths" :key="item">{{item}}</li></ul></section><section><h3>改进建议</h3><ul><li v-for="item in interview.report.improvements" :key="item">{{item}}</li></ul></section></div><button class="primary" @click="closeInterview">完成并返回工作台</button></div></main>
+    </div>
+  </div>`,
+}
+
+// -- 页面：账号管理 -----------------------------------------------------
 const AccountsView = {
   setup() {
-    const accounts = ref({}), dualEnabled = ref(true), modeBusy = ref(false), checking = ref('')
-    const loginStates = reactive({})
-    const visibleAccounts = computed(() => Object.fromEntries(Object.entries(accounts.value).filter(([, item]) => item.enabled)))
-    function formatLoginState(state, cached = false) {
-      const prefix = cached ? '上次检测：' : ''
-      const suffix = state.checked_at ? ' · ' + fmtTime(state.checked_at) : ''
-      if (state.logged_in === true) return { kind: 'ok', text: prefix + '已登录' + suffix }
-      if (state.logged_in === false) return { kind: 'warn', text: prefix + '未登录' + suffix }
-      return { kind: 'neutral', text: prefix + (state.hint || '无法确认登录态') + suffix }
+    const busy = ref('')
+    async function accountAction(account, action) {
+      busy.value = `${account.key}-${action}`
+      await wait(520)
+      if (action === 'launch' || action === 'login') account.running = true
+      if (action === 'stop') account.running = false
+      if (action === 'check') { account.loggedIn = true; account.checkedAt = new Date().toISOString() }
+      busy.value = ''
+      const labels = { launch: '已模拟启动', login: '已模拟打开登录页', check: '登录态检测完成', stop: '已模拟停止' }
+      showToast(`${account.label}${labels[action]}`, action === 'stop' ? 'info' : 'ok')
     }
-    async function load() {
-      try {
-        const [accountData, settings] = await Promise.all([api.get('/api/accounts'), api.get('/api/settings')])
-        accounts.value = accountData; dualEnabled.value = settings.dual_account_enabled !== false
-        for (const [name, item] of Object.entries(accountData)) if (item.login_state) loginStates[name] = formatLoginState(item.login_state, true)
-      } catch (e) { alert('账号状态加载失败：' + e.message) }
+    function toggleMode(event) {
+      store.settings.dualAccount = event.target.checked
+      showToast(store.settings.dualAccount ? '已切换为双账号隔离模式' : '已切换为单账号模式', 'info')
     }
-    onMounted(load)
-    async function launch(name) { await api.post('/api/accounts/' + name + '/launch'); load() }
-    async function loginPage(name) { const result = await api.post('/api/accounts/' + name + '/login-page'); if (!result.ok) alert(result.error); load() }
-    async function loginState(name) { checking.value = name; try { loginStates[name] = formatLoginState(await api.get('/api/accounts/' + name + '/login-state')) } catch (e) { loginStates[name] = { kind: 'bad', text: '检测失败：' + e.message } } finally { checking.value = '' } }
-    async function stop(name) { await api.post('/api/accounts/' + name + '/stop'); load() }
-    async function changeMode(event) {
-      const desired = event.target.checked
-      dualEnabled.value = desired; modeBusy.value = true
-      try { await api.put('/api/settings', { dual_account_enabled: desired }); await load() }
-      catch (e) { dualEnabled.value = !desired; alert('账号模式保存失败：' + e.message) }
-      finally { modeBusy.value = false }
-    }
-    return { visibleAccounts, dualEnabled, modeBusy, checking, loginStates, load, launch, loginPage, loginState, stop, changeMode }
+    return { store, busy, fmtTime, accountAction, toggleMode }
   },
-  template: `<div><div class="page-head"><div><h1>账号管理</h1><p>采集号承担读操作风险，沟通号仅用于受护栏保护的发送。</p></div><button @click="load">刷新</button></div><section class="section-block"><div class="setting-row"><div><b>双账号模式</b><p>开启后采集与沟通隔离；关闭后统一使用沟通号。</p></div><label class="switch" :class="{disabled:modeBusy}"><input type="checkbox" :checked="dualEnabled" :disabled="modeBusy" @change="changeMode"><span class="switch-track"><span class="switch-thumb"></span></span><span>{{dualEnabled?'已开启':'已关闭'}}</span></label></div></section><article v-for="(account,name) in visibleAccounts" :key="name" class="account-item"><div><h2>{{account.label}}</h2><p>{{account.description}} · CDP :{{account.port}}</p><span v-for="role in account.roles" :key="role" class="tag">{{role}}</span></div><div class="account-state"><span class="status-dot" :class="account.running?'ok':'neutral'"></span>{{account.running?'运行中':'未启动'}}</div><div class="item-actions"><button @click="launch(name)">启动</button><button @click="loginPage(name)">打开登录页</button><button :disabled="checking===name" @click="loginState(name)">{{checking===name?'检测中…':'检测登录态'}}</button><button @click="stop(name)">停止</button><span v-if="loginStates[name]" :class="loginStates[name].kind">{{loginStates[name].text}}</span></div></article></div>`,
+  template: `
+  <div>
+    <header class="page-head"><div><div class="eyebrow">运行环境</div><h1>账号管理</h1><p>采集与沟通账号状态</p></div></header>
+    <section class="setting-row section-block"><div><h2>双账号隔离模式</h2><p>采集号负责只读操作，沟通号承接受护栏保护的沟通动作</p></div><label class="switch"><input type="checkbox" :checked="store.settings.dualAccount" @change="toggleMode"><span class="switch-track"><span class="switch-thumb"></span></span><span>{{store.settings.dualAccount?'已开启':'已关闭'}}</span></label></section>
+    <div class="account-grid">
+      <article v-for="account in store.accounts" :key="account.key" class="account-card">
+        <header><div><span class="account-icon">{{account.label.slice(0,1)}}</span><div><h2>{{account.label}}</h2><p>{{account.description}}</p></div></div><span class="status-badge" :class="account.running?'running':'paused'">{{account.running?'运行中':'未启动'}}</span></header>
+        <dl><div><dt>调试端口</dt><dd>{{account.port}}</dd></div><div><dt>登录状态</dt><dd :class="account.loggedIn?'ok':'warn'">{{account.loggedIn?'已登录':'待登录'}}</dd></div><div><dt>上次检测</dt><dd>{{fmtTime(account.checkedAt)}}</dd></div></dl>
+        <div class="tag-line"><span v-for="role in account.roles" :key="role" class="tag neutral">{{role}}</span></div>
+        <footer><button :disabled="busy" @click="accountAction(account,'launch')">启动</button><button :disabled="busy" @click="accountAction(account,'login')">打开登录页</button><button :disabled="busy" @click="accountAction(account,'check')">{{busy===account.key+'-check'?'检测中…':'检测登录态'}}</button><button :disabled="busy || !account.running" @click="accountAction(account,'stop')">停止</button></footer>
+      </article>
+    </div>
+  </div>`,
 }
 
-// ── 页面：设置 ───────────────────────────────────────────────────
+// -- 页面：设置 ---------------------------------------------------------
 const SettingsView = {
   setup() {
-    const settings = reactive({}), loaded = ref(false), saving = ref(false), testing = ref(false), result = ref(null)
-    onMounted(async () => { Object.assign(settings, await api.get('/api/settings')); loaded.value = true })
-    async function save() { saving.value = true; try { await api.put('/api/settings', JSON.parse(JSON.stringify(settings))); alert('设置已保存') } catch (e) { alert('保存失败：' + e.message) } finally { saving.value = false } }
-    async function testLlm() { testing.value = true; result.value = null; try { const data = await api.post('/api/llm/test', { base_url: settings.llm_base_url, api_key: settings.llm_api_key, model: settings.llm_model }); result.value = { ok: true, text: `连接成功 · ${data.model} · ${data.latency_ms} ms` } } catch (e) { result.value = { ok: false, text: e.message } } finally { testing.value = false } }
-    return { settings, loaded, saving, testing, result, save, testLlm }
+    const draft = reactive(clone(store.settings))
+    const testing = ref(false)
+    const testResult = ref(null)
+    function save() {
+      Object.assign(store.settings, clone(draft))
+      showToast('设置已保存到当前演示会话')
+    }
+    async function testConnection() {
+      testResult.value = null
+      if (!draft.llmBaseUrl.trim() || !draft.llmModel.trim()) { showToast('请填写服务地址和模型', 'warn'); return }
+      testing.value = true
+      await wait(850)
+      testing.value = false
+      testResult.value = { ok: true, text: `连接成功 · ${draft.llmModel} · 286 ms（演示）` }
+    }
+    return { draft, testing, testResult, save, testConnection }
   },
-  template: `<div v-if="loaded"><div class="page-head"><div><h1>设置</h1><p>LLM 未配置时，导入、L1、采集和人工流程仍可使用。</p></div><button class="primary" :disabled="saving" @click="save">保存设置</button></div><section class="settings-section"><h2>LLM 服务</h2><div class="form-grid"><label>Base URL<input v-model="settings.llm_base_url" placeholder="https://api.deepseek.com/v1"></label><label>API Key<input v-model="settings.llm_api_key" type="password" placeholder="sk-…"></label><label>模型<input v-model="settings.llm_model" placeholder="deepseek-chat"></label></div><div class="item-actions"><button :disabled="testing" @click="testLlm">{{testing?'测试中…':'测试连通性'}}</button><span v-if="result" :class="result.ok?'ok':'bad'">{{result.text}}</span></div></section><section class="settings-section"><h2>发送护栏</h2><div class="form-grid four"><label>每日上限<input type="number" v-model.number="settings.send_daily_limit"></label><label>硬顶<input type="number" v-model.number="settings.send_daily_hard_cap"></label><label>最小间隔（秒）<input type="number" v-model.number="settings.send_gap_min_sec"></label><label>最大间隔（秒）<input type="number" v-model.number="settings.send_gap_max_sec"></label></div><p class="hint">护栏不可关闭；自动发送结果不明确时停止批次并等待人工核验。</p></section><section class="settings-section"><h2>评分与同步</h2><div class="form-grid two"><label>HR 不活跃阈值（天）<input type="number" v-model.number="settings.hr_inactive_days"></label><label>L2 默认 Top N<input type="number" v-model.number="settings.l2_top_n"></label></div></section></div>`,
+  template: `
+  <div>
+    <header class="page-head"><div><div class="eyebrow">系统偏好</div><h1>设置</h1><p>模型服务、发送护栏与评分参数</p></div><button class="primary" @click="save">保存设置</button></header>
+    <section class="settings-section"><div class="section-title"><div><h2>LLM 服务</h2><p>用于采集计划、精评、招呼语和模拟面试</p></div><span class="status-badge completed">演示连接</span></div><div class="form-grid three"><label>Base URL<input v-model="draft.llmBaseUrl" placeholder="https://api.example.com/v1"></label><label>API Key<input v-model="draft.llmApiKey" type="password" placeholder="仅保留在当前会话"></label><label>模型<input v-model="draft.llmModel" placeholder="model-name"></label></div><div class="setting-actions"><button :disabled="testing" @click="testConnection">{{testing?'测试中…':'测试连通性'}}</button><span v-if="testResult" :class="testResult.ok?'ok':'bad'">{{testResult.text}}</span></div></section>
+    <section class="settings-section"><div class="section-title"><div><h2>发送护栏</h2><p>自动打招呼始终遵守以下边界</p></div><span class="status-badge paused">不可关闭</span></div><div class="form-grid four"><label>每日上限<input type="number" v-model.number="draft.sendDailyLimit" min="1" max="110"></label><label>硬顶<input type="number" v-model.number="draft.sendDailyHardCap" min="1" max="110"></label><label>最小间隔（秒）<input type="number" v-model.number="draft.sendGapMin" min="30" max="90"></label><label>最大间隔（秒）<input type="number" v-model.number="draft.sendGapMax" min="30" max="90"></label></div><div class="guardrail-list"><span>每日上限 {{draft.sendDailyLimit}}</span><span>硬顶 {{draft.sendDailyHardCap}}</span><span>{{draft.sendGapMin}}-{{draft.sendGapMax}} 秒随机间隔</span><span>同公司 30 天去重</span><span>风控信号当日熔断</span></div></section>
+    <section class="settings-section"><div class="section-title"><div><h2>评分与活跃度</h2><p>控制匹配度评分数量和岗位有效性判断</p></div></div><div class="form-grid two"><label>匹配度评分默认岗位数<input type="number" v-model.number="draft.matchScoreTopN" min="1" max="100"></label><label>HR 不活跃阈值（天）<input type="number" v-model.number="draft.inactiveDays" min="1" max="90"></label></div></section>
+  </div>`,
 }
 
-// ── 应用组装 ─────────────────────────────────────────────────────
+// -- 应用组装 -----------------------------------------------------------
 const App = {
   setup() {
-    const view = computed(() => {
-      const path = route.value
-      if (path.startsWith('/dashboard')) return DashboardView
-      if (path.startsWith('/jobcard')) return JobCardView
-      if (path.startsWith('/analytics')) return AnalyticsView
-      if (path.startsWith('/greetings')) return GreetingsView
-      if (path.startsWith('/collect')) return CollectView
-      if (path.startsWith('/profile')) return ProfileView
-      if (path.startsWith('/interview')) return InterviewView
-      if (path.startsWith('/accounts')) return AccountsView
-      if (path.startsWith('/settings')) return SettingsView
-      return JobsView
+    const view = computed(() => ({
+      '/dashboard': DashboardView, '/profile': ProfileView, '/collect': CollectView,
+      '/analytics': AnalyticsView, '/jobs': JobsView, '/jobcard': JobCardView,
+      '/accounts': AccountsView, '/settings': SettingsView,
+    })[route.value] || DashboardView)
+    const collectionSummary = computed(() => {
+      const runs = store.runs.filter(run => run.status === 'running' || run.status === 'paused')
+      const collected = runs.reduce((sum, run) => sum + run.collected, 0)
+      const target = runs.reduce((sum, run) => sum + run.target, 0)
+      return {
+        visible: runs.length > 0,
+        label: runs.some(run => run.status === 'running') ? '采集中' : '采集已暂停',
+        collected, target, percent: target ? Math.round(collected / target * 100) : 0,
+      }
     })
-    // 主题：默认深色（初版风格），index.html 已在首帧前设置 data-theme，这里接管切换并持久化
     const theme = ref(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark')
     function toggleTheme() {
       theme.value = theme.value === 'dark' ? 'light' : 'dark'
       document.documentElement.dataset.theme = theme.value
       localStorage.setItem('theme', theme.value)
     }
-    return { route, nav, view, theme, toggleTheme }
+    return { store, route, nav, view, theme, collectionSummary, toggleTheme, settleConfirm }
   },
-  template: `<div class="layout"><aside class="side"><div class="logo">boss<span>-copilot</span></div><nav><a v-for="[href,label] in nav" :key="href" :class="{on:route.startsWith(href)}" :href="'#'+href">{{label}}</a></nav><button class="theme-toggle" type="button" @click="toggleTheme">{{theme === 'dark' ? '☀️ 切换浅色' : '🌙 切换深色'}}</button><div class="side-foot">本地运行 · 数据不出设备</div></aside><main class="main"><component :is="view" /></main></div>`,
+  template: `
+  <div class="layout">
+    <aside class="side">
+      <div class="brand-row"><div class="logo">boss<span>-copilot</span></div><span class="demo-badge">演示数据</span></div>
+      <nav aria-label="主导航"><a v-for="[href,label] in nav" :key="href" :class="{on:route===href}" :href="'#'+href">{{label}}</a></nav>
+      <div class="side-bottom">
+        <a v-if="collectionSummary.visible" class="side-progress" href="#/collect"><div><span>{{collectionSummary.label}}</span><b>{{collectionSummary.percent}}%</b></div><div class="progress"><i :style="{width:collectionSummary.percent+'%'}"></i></div><small>{{collectionSummary.collected}} / {{collectionSummary.target}} 条</small></a>
+        <button class="theme-toggle" type="button" :aria-label="theme==='dark'?'切换浅色主题':'切换深色主题'" @click="toggleTheme"><span>{{theme==='dark'?'☀':'☾'}}</span>{{theme==='dark'?'切换浅色':'切换深色'}}</button>
+        <div class="side-foot"><span class="status-dot ok"></span>本地演示 · 不连接真实账号</div>
+      </div>
+    </aside>
+    <main class="main"><component :is="view" /></main>
+
+    <transition name="toast"><div v-if="store.ui.toast" class="toast" :class="store.ui.toast.tone" role="status">{{store.ui.toast.message}}</div></transition>
+    <div v-if="store.ui.confirm" class="modal-backdrop" role="presentation" @click.self="settleConfirm(false)">
+      <section class="confirm-dialog" role="dialog" aria-modal="true" :aria-label="store.ui.confirm.title"><h2>{{store.ui.confirm.title}}</h2><p>{{store.ui.confirm.message}}</p><div class="row end"><button @click="settleConfirm(false)">取消</button><button :class="store.ui.confirm.tone==='danger'?'danger':'primary'" @click="settleConfirm(true)">{{store.ui.confirm.confirmText}}</button></div></section>
+    </div>
+  </div>`,
 }
 
 createApp(App).mount('#app')
