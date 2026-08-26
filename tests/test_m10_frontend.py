@@ -84,6 +84,9 @@ class FrontendWorkspaceTests(unittest.TestCase):
         self.assertIn("status.run_id", self.source)
         self.assertIn("const SvgBars", self.source)
         self.assertIn('<svg viewBox="0 0 100 12"', self.source)
+        self.assertIn("默认分析全部当前岗位", self.source)
+        self.assertIn("历史导入或收藏岗位", self.source)
+        self.assertIn("分析数据加载失败", self.source)
         self.assertNotIn("chart.js", self.source.lower())
 
     def test_layout_has_responsive_constraints(self):

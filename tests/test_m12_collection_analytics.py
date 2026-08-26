@@ -390,17 +390,42 @@ class AnalyticsTests(M12DatabaseTestCase):
         sync.record_source_success(run_py, id_py, task_py, {"one"})
 
         result = analytics.aggregate()
-        self.assertEqual(result["summary"]["jobs"], 2)
+        self.assertEqual(result["summary"]["jobs"], 3)
         self.assertEqual(result["summary"]["active_relations"], 3)
-        self.assertEqual(result["summary"]["headhunter_jobs"], 1)
-        self.assertEqual(result["summary"]["headhunter_rate"], 50.0)
+        self.assertEqual(result["summary"]["reliable_jobs"], 2)
+        self.assertEqual(result["summary"]["unattributed_jobs"], 1)
+        self.assertEqual(result["summary"]["scope"], "all_current")
+        self.assertEqual(result["summary"]["headhunter_jobs"], 2)
+        self.assertEqual(result["summary"]["headhunter_rate"], 66.7)
         by_keyword = {item["label"]: item["count"] for item in result["by_keyword"]}
         self.assertEqual(by_keyword, {"AI": 2, "Python": 1})
         self.assertTrue(result["trend"])
 
         filtered = analytics.aggregate({"keyword": "Python"})
         self.assertEqual(filtered["summary"]["jobs"], 1)
+        self.assertEqual(filtered["summary"]["reliable_jobs"], 1)
+        self.assertEqual(filtered["summary"]["unattributed_jobs"], 0)
+        self.assertEqual(filtered["summary"]["scope"], "reliable_filtered")
         self.assertEqual(filtered["summary"]["monthly_salary_avg_k"], 25.0)
+
+    def test_default_analytics_uses_current_jobs_when_no_source_hits_exist(self):
+        self.insert_job("active")
+        self.insert_job("inactive", status="hr_inactive", industry="机器人")
+        self.insert_job("delisted", status="delisted")
+        self.insert_job("excluded", status="excluded")
+
+        result = analytics.aggregate()
+
+        self.assertEqual(result["summary"]["jobs"], 2)
+        self.assertEqual(result["summary"]["reliable_jobs"], 0)
+        self.assertEqual(result["summary"]["unattributed_jobs"], 2)
+        self.assertEqual(result["summary"]["source_coverage_rate"], 0)
+        self.assertEqual(result["summary"]["scope"], "all_current")
+        self.assertEqual(
+            {item["label"]: item["count"] for item in result["industry"]},
+            {"人工智能": 1, "机器人": 1},
+        )
+        self.assertEqual(analytics.aggregate({"keyword": "AI"})["summary"]["jobs"], 0)
 
     def test_historical_date_filter_includes_reliable_inactive_snapshot(self):
         self.insert_job("history")

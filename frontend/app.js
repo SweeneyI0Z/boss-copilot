@@ -786,11 +786,13 @@ const SvgBars = {
 const AnalyticsView = {
   components: { SvgBars },
   setup() {
-    const data = ref({}), loading = ref(false), filters = reactive({ keyword: '', city_code: '', date_from: '', date_to: '' })
+    const data = ref({}), loading = ref(false), error = ref('')
+    const filters = reactive({ keyword: '', city_code: '', date_from: '', date_to: '' })
     async function load() {
       loading.value = true
+      error.value = ''
       try { data.value = await api.get('/api/analytics?' + new URLSearchParams(filters)) }
-      catch (e) { alert('分析数据加载失败：' + e.message) }
+      catch (e) { error.value = '分析数据加载失败：' + e.message }
       finally { loading.value = false }
     }
     onMounted(load)
@@ -803,12 +805,14 @@ const AnalyticsView = {
       ['industry', '行业分布', 'var(--chart-5)'], ['scale', '公司规模', 'var(--chart-6)'],
       ['priority', '岗位 P 级', 'var(--chart-7)'], ['trend', '采集趋势', 'var(--chart-8)'],
     ])
-    return { data, loading, filters, summary, dist, meta, charts, load }
+    return { data, loading, error, filters, summary, dist, meta, charts, load }
   },
   template: `
-  <div><div class="page-head"><div><h1>数据分析</h1><p>仅统计新采集任务中具有可靠来源关系的数据。</p></div><button class="primary" :disabled="loading" @click="load">应用筛选</button></div>
+  <div><div class="page-head"><div><h1>数据分析</h1><p>默认分析全部当前岗位；关键词、城市、日期和趋势仅使用可靠采集来源。</p></div><button class="primary" :disabled="loading" @click="load">应用筛选</button></div>
+    <div v-if="error" class="notice bad">{{error}}</div>
+    <div v-else-if="!loading && summary.unattributed_jobs" class="notice">当前包含 {{summary.unattributed_jobs}} 个历史导入或收藏岗位；来源筛选与采集趋势覆盖 {{summary.reliable_jobs || 0}} 个可靠来源岗位。</div>
     <div class="filterbar"><select v-model="filters.keyword"><option value="">全部关键词</option><option v-for="value in meta.keywords" :value="value">{{value}}</option></select><select v-model="filters.city_code"><option value="">全部城市</option><option v-for="city in meta.cities" :value="city.code">{{city.name}}</option></select><label>起始日期<input type="date" v-model="filters.date_from"></label><label>结束日期<input type="date" v-model="filters.date_to"></label></div>
-    <div class="metric-grid compact"><div class="metric"><span>可靠样本</span><strong>{{summary.jobs || 0}}</strong><small>去重岗位</small></div><div class="metric"><span>平均月薪</span><strong>{{summary.avg_salary_min ?? '—'}} - {{summary.avg_salary_max ?? '—'}}K</strong><small>按可解析薪资统计</small></div><div class="metric"><span>猎头占比</span><strong>{{summary.headhunter_ratio ?? 0}}%</strong><small>{{summary.headhunter_jobs || 0}} 个岗位</small></div><div class="metric"><span>覆盖关键词</span><strong>{{summary.keywords || 0}}</strong><small>{{summary.cities || 0}} 个城市</small></div></div>
+    <div class="metric-grid compact"><div class="metric"><span>分析样本</span><strong>{{summary.jobs || 0}}</strong><small>可靠来源 {{summary.reliable_jobs || 0}} · 其他可用 {{summary.unattributed_jobs || 0}}</small></div><div class="metric"><span>平均月薪</span><strong>{{summary.avg_salary_min ?? '—'}} - {{summary.avg_salary_max ?? '—'}}K</strong><small>按可解析薪资统计</small></div><div class="metric"><span>猎头占比</span><strong>{{summary.headhunter_ratio ?? 0}}%</strong><small>{{summary.headhunter_jobs || 0}} 个岗位</small></div><div class="metric"><span>覆盖关键词</span><strong>{{summary.keywords || 0}}</strong><small>{{summary.cities || 0}} 个城市</small></div></div>
     <div class="chart-grid"><section v-for="[key,title,color] in charts" :key="key" class="chart-panel"><h2>{{title}}</h2><SvgBars :items="key==='trend' ? data.trends : dist[key]" :color="color" /></section></div>
   </div>`,
 }

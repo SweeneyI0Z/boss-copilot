@@ -1,7 +1,7 @@
-"""基于可靠采集来源关系的数据分析。
+"""岗位数据分析。
 
-岗位分布只读取当前有效的 job_collection_hits；趋势读取该表的历史运行记录。
-旧 origin_query 和没有来源命中的手工导入岗位不会混入统计。
+默认分布覆盖全部当前可用岗位，避免历史导入或收藏同步的数据因缺少来源关系而
+无法分析；关键词、城市、日期和趋势仍只读取可靠的 job_collection_hits。
 """
 from collections import defaultdict
 
@@ -99,6 +99,9 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
     filters = dict(filters or {})
     if resume_id is None:
         resume_id = filters.get("resume_id")
+    source_filters_active = any(
+        _as_list(filters.get(field)) for field in ("keyword", "city_code", "city")
+    ) or bool(filters.get("date_from") or filters.get("date_to"))
     clauses, where_args = _where(filters)
     score_join, score_args = _score_join(resume_id)
     score_select = (
@@ -115,14 +118,33 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
         f"{score_select} FROM job_collection_hits h JOIN jobs j ON j.job_key=h.job_key "
         f"{score_join} WHERE {' AND '.join(clauses)} AND j.status<>'excluded'"
     )
-    rows = [dict(row) for row in get_db().execute(
+    reliable_rows = [dict(row) for row in get_db().execute(
         sql, [*score_args, *where_args]).fetchall()]
+
+    if source_filters_active:
+        rows = reliable_rows
+    else:
+        # 历史导入和 BOSS 收藏同步没有可靠关键词关系，但岗位属性本身仍可分析。
+        # 默认总览纳入这些当前岗位；一旦使用来源筛选，则只返回可靠命中。
+        current_sql = (
+            "SELECT j.job_key,'' keyword,'' province,j.location city,'' city_code,"
+            "j.last_seen_at,j.salary_min,j.salary_max,j.salary_months,j.experience,"
+            "j.degree,j.industry,j.scale,j.status,"
+            "COALESCE(j.headhunter_override,j.is_headhunter,0) headhunter,"
+            f"{score_select} FROM jobs j {score_join} "
+            "WHERE j.status NOT IN ('excluded','delisted')"
+        )
+        rows = [dict(row) for row in get_db().execute(
+            current_sql, score_args).fetchall()]
 
     # 同一岗位可命中多个关键词；总体分布只计一次，来源维度再分别去重。
     jobs = {}
     for row in rows:
         jobs.setdefault(row["job_key"], row)
     unique = list(jobs.values())
+    reliable_job_keys = {row["job_key"] for row in reliable_rows}
+    reliable_jobs = sum(row["job_key"] in reliable_job_keys for row in unique)
+    unattributed_jobs = len(unique) - reliable_jobs
     monthly = []
     annual = []
     for row in unique:
@@ -167,17 +189,22 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
         ]),
         "priority": _distribution(row["priority"] for row in unique),
     }
-    keywords = sorted({row["keyword"] for row in rows if row["keyword"]})
+    keywords = sorted({row["keyword"] for row in reliable_rows if row["keyword"]})
     city_values = sorted(
         {row["city_code"]: {"city": row["city"], "city_code": row["city_code"]}
-         for row in rows if row["city_code"]}.values(), key=lambda item: item["city"])
+         for row in reliable_rows if row["city_code"]}.values(),
+        key=lambda item: item["city"])
     salary_mins = [float(row["salary_min"]) for row in unique
                    if row["salary_min"] is not None]
     salary_maxes = [float(row["salary_max"]) for row in unique
                     if row["salary_max"] is not None]
     headhunter_rate = round(headhunters / len(unique) * 100, 1) if unique else 0
     summary = {
-        "jobs": len(unique), "active_relations": len(rows),
+        "jobs": len(unique), "active_relations": len(reliable_rows),
+        "reliable_jobs": reliable_jobs, "unattributed_jobs": unattributed_jobs,
+        "source_coverage_rate": round(reliable_jobs / len(unique) * 100, 1)
+        if unique else 0,
+        "scope": "reliable_filtered" if source_filters_active else "all_current",
         "headhunter_jobs": headhunters, "headhunter_rate": headhunter_rate,
         "headhunter_ratio": headhunter_rate,
         "monthly_salary_avg_k": round(sum(known_monthly) / len(known_monthly), 1)
@@ -202,8 +229,8 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
         "experience": distributions["experience"], "degree": distributions["degree"],
         "industry": distributions["industry"], "scale": distributions["scale"],
         "job_score": distributions["job_score"], "priority": distributions["priority"],
-        "by_keyword": _group_distinct(rows, "keyword", "公司定向"),
-        "by_city": _group_distinct(rows, "city"), "trend": trend,
+        "by_keyword": _group_distinct(reliable_rows, "keyword", "公司定向"),
+        "by_city": _group_distinct(reliable_rows, "city"), "trend": trend,
         "filters": {"keywords": keywords, "cities": city_values},
     }
 
