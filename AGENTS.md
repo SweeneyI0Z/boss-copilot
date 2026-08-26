@@ -5,7 +5,7 @@
 ## 常用命令
 
 ```bash
-# 回归测试（184 例，任何 backend/ 或 frontend/ 改动后必须全绿才可提交）
+# 回归测试（259 例，任何 backend/ 或 frontend/ 改动后必须全绿才可提交）
 .venv/bin/python -m unittest discover tests -v
 
 # 启动（浏览器打开 http://127.0.0.1:8787）
@@ -18,7 +18,7 @@
 ## 架构边界
 
 - `backend/main.py`：**全部** REST 端点 + 前端静态托管，单文件新增端点。
-- `backend/db.py`：SQLite（WAL、thread-local 连接、DB_PATH 变化自动重连）。原则：**岗位永不物理删除**，用状态机 active/delisted/hr_inactive/excluded；评分字段同时存 JSON 明细与标量摘要（列表页不解析 JSON）。
+- `backend/db.py`：SQLite（WAL、thread-local 连接、DB_PATH 变化自动重连）。原则：岗位常规生命周期不物理删除，使用状态机 active/delisted/hr_inactive/excluded；唯一例外是用户在采集中心二次确认删除采集记录及其独占岗位数据，共享岗位必须保留。评分字段同时存 JSON 明细与标量摘要（列表页不解析 JSON）。
 - `backend/scoring/l1.py` 规则电算 / `l2.py` LLM 精评（LLM 只出维度分，算术由代码合成，绝不 LLM 算总分）。
 - `backend/sender.py` 发送器 / `chatpoll.py` 消息中心 / `interview.py` 模拟面试 / `collector.py` 采集执行器（subprocess 调外部仓库）/ `favorites.py` 双账号BOSS收藏同步（推荐页感兴趣Tab只读 + 增量合并）。
 - `backend/boss/cdp.py`：双账号 Chrome CDP 管理。

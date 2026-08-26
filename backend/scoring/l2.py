@@ -113,7 +113,7 @@ def finalize(result: dict, cap: float) -> dict:
 
 
 def score_job_llm(job_key: str, client=None, resume_id: int = None,
-                  force: bool = False) -> dict:
+                  force: bool = False, on_delta=None, cancelled=None) -> dict:
     """同一岗位×简历在单进程内只允许一个 L2 调用，避免并发随机覆盖。"""
     claim = (job_key, int(resume_id) if resume_id is not None else None)
     with _INFLIGHT_LOCK:
@@ -121,14 +121,15 @@ def score_job_llm(job_key: str, client=None, resume_id: int = None,
             raise llm.LLMError("该岗位与简历正在进行 L2 评分，请勿重复提交")
         _INFLIGHT.add(claim)
     try:
-        return _score_job_llm(job_key, client=client, resume_id=resume_id, force=force)
+        return _score_job_llm(job_key, client=client, resume_id=resume_id, force=force,
+                              on_delta=on_delta, cancelled=cancelled)
     finally:
         with _INFLIGHT_LOCK:
             _INFLIGHT.discard(claim)
 
 
 def _score_job_llm(job_key: str, client=None, resume_id: int = None,
-                   force: bool = False) -> dict:
+                   force: bool = False, on_delta=None, cancelled=None) -> dict:
     conn = get_db()
     row = conn.execute(
         "SELECT j.*, d.jd FROM jobs j LEFT JOIN job_details d ON d.job_key=j.job_key "
@@ -145,8 +146,11 @@ def _score_job_llm(job_key: str, client=None, resume_id: int = None,
     l1_detail = (profile_score or {}).get("l1_detail") or \
         json.loads(row["l1_detail"] or "{}")
     expect = {"salary_max": 30, **expect}
-    result = llm.chat_json(build_messages(dict(row), row["jd"] or "", resume,
-                                          l1_detail, expect), client=client)
+    result = llm.chat_json(
+        build_messages(dict(row), row["jd"] or "", resume, l1_detail, expect),
+        client=client, on_delta=on_delta, cancelled=cancelled)
+    if cancelled and cancelled():
+        raise llm.LLMCancelledError("评分任务已取消，结果未保存")
     result = finalize(result, cap=float(l1_detail.get("cap", 100)))
     result["engine"] = "l2-llm"
     if resume_id is not None:

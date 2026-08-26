@@ -61,7 +61,7 @@ class FrontendWorkspaceTests(unittest.TestCase):
 
     def test_workbench_contains_batch_and_single_job_workflows(self):
         for text in ("全选当前岗位", "生成分析", "生成招呼语", "自动打招呼",
-                     "打开 BOSS", "模拟面试", "AI 应聘建议"):
+                     "打开 BOSS", "模拟面试", "应聘建议"):
             self.assertIn(text, self.source)
         self.assertIn('v-model="selectedKeys"', self.source)
         self.assertIn("async function executeBatch", self.source)

@@ -3,8 +3,8 @@ from .db import get_db, now_iso
 from .resumes import get_default_resume, get_resume
 
 
-VALID_STAGES = {"greeted", "applied", "interviewed"}
-STAGE_ORDER = ("greeted", "applied", "interviewed")
+STAGE_ORDER = ("greeted", "applied", "interviewed", "offered")
+VALID_STAGES = set(STAGE_ORDER)
 QUERY_CHUNK_SIZE = 400
 
 
@@ -49,23 +49,19 @@ def _fact_keys(job_keys: list[str], resume_id: int, table: str,
 
 
 def states_for_jobs(job_keys, resume_id=None) -> dict[str, dict]:
-    """批量返回当前简历的三阶段状态，已有业务事实优先点亮。"""
+    """批量返回当前简历的四阶段状态，已有业务事实优先点亮。"""
     source_keys = [job_keys] if isinstance(job_keys, str) else job_keys
     keys = list(dict.fromkeys(str(key) for key in source_keys if key))
     resume = _resolve_resume(resume_id)
-    result = {key: {"greeted": False, "applied": False, "interviewed": False}
-              for key in keys}
+    result = {key: {name: False for name in STAGE_ORDER} for key in keys}
     if not keys:
         return result
     manual = _manual_rows(keys, resume["id"])
     for key, row in manual.items():
-        if row.get("greeted_at"):
-            result[key]["greeted"] = True
-        if row.get("applied_at"):
-            result[key].update({"greeted": True, "applied": True})
-        if row.get("interviewed_at"):
-            result[key].update(
-                {"greeted": True, "applied": True, "interviewed": True})
+        for index, name in enumerate(STAGE_ORDER):
+            if row.get(f"{name}_at"):
+                result[key].update(
+                    {previous: True for previous in STAGE_ORDER[:index + 1]})
 
     greeted = _fact_keys(
         keys, resume["id"], "greetings",
@@ -100,7 +96,8 @@ def set_stage(job_key: str, stage: str, enabled: bool, resume_id=None) -> dict:
     resume = _resolve_resume(resume_id)
     conn = get_db()
     row = conn.execute(
-        "SELECT greeted_at,applied_at,interviewed_at FROM job_workflow_states "
+        "SELECT greeted_at,applied_at,interviewed_at,offered_at "
+        "FROM job_workflow_states "
         "WHERE job_key=? AND resume_id=?", (job_key, resume["id"])).fetchone()
     values = {name: row[f"{name}_at"] if row else None for name in STAGE_ORDER}
     ts = now_iso()
@@ -113,11 +110,12 @@ def set_stage(job_key: str, stage: str, enabled: bool, resume_id=None) -> dict:
             values[name] = None
     conn.execute(
         "INSERT INTO job_workflow_states(job_key,resume_id,greeted_at,applied_at,"
-        "interviewed_at,updated_at) VALUES(?,?,?,?,?,?) "
+        "interviewed_at,offered_at,updated_at) VALUES(?,?,?,?,?,?,?) "
         "ON CONFLICT(job_key,resume_id) DO UPDATE SET greeted_at=excluded.greeted_at,"
         "applied_at=excluded.applied_at,interviewed_at=excluded.interviewed_at,"
+        "offered_at=excluded.offered_at,"
         "updated_at=excluded.updated_at",
         (job_key, resume["id"], values["greeted"], values["applied"],
-         values["interviewed"], ts))
+         values["interviewed"], values["offered"], ts))
     conn.commit()
     return {**get_state(job_key, resume["id"]), "updated_at": ts}

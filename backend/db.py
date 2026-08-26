@@ -1,7 +1,7 @@
 """SQLite 数据层：schema、连接、通用 DAO。
 
 状态机与字段设计原则：
-- 岗位永不物理删除，靠 status 表达生命周期
+- 岗位常规生命周期不物理删除；仅采集中心用户二次确认删除采集记录时，可删除其独占岗位数据
 - 评分字段同时存原始 JSON 明细与标量摘要，列表页不解析 JSON
 """
 import json
@@ -257,6 +257,7 @@ CREATE TABLE IF NOT EXISTS job_workflow_states (
   greeted_at TEXT,
   applied_at TEXT,
   interviewed_at TEXT,
+  offered_at TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY(job_key, resume_id)
 );
@@ -454,6 +455,9 @@ def init_db() -> None:
     _add_columns(conn, "interviews", {
         "resume_id": "INTEGER",
         "resume_revision": "INTEGER",
+    })
+    _add_columns(conn, "job_workflow_states", {
+        "offered_at": "TEXT",
     })
     # 默认设置与档案占位
     for k, v in config.DEFAULT_SETTINGS.items():

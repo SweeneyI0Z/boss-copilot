@@ -53,7 +53,8 @@ def _resume_context(resume_id=None):
     return (prof.get("resume_text") or "").strip(), int(prof["id"]), int(prof["revision"])
 
 
-def generate(job_key: str, client=None, resume_id: int = None) -> dict:
+def generate(job_key: str, client=None, resume_id: int = None,
+             fallback_on_error: bool = True, on_delta=None, cancelled=None) -> dict:
     """为岗位生成 3 个招呼语变体并入队（status=draft）。"""
     conn = get_db()
     row = conn.execute(
@@ -77,15 +78,21 @@ def generate(job_key: str, client=None, resume_id: int = None) -> dict:
                 f"# L2 评委给出的匹配切入点\n{angle or '（无，请从 JD 与简历自行提炼）'}\n\n"
                 f"# 我的简历（节选）\n{resume[:2000]}\n\n按此结构输出：\n{SCHEMA}")
         try:
-            out = llm.chat_json([{"role": "system", "content": SYSTEM_PROMPT},
-                                 {"role": "user", "content": user}], client=client)
+            out = llm.chat_json(
+                [{"role": "system", "content": SYSTEM_PROMPT},
+                 {"role": "user", "content": user}],
+                client=client, on_delta=on_delta, cancelled=cancelled)
             if isinstance(out.get("variants"), list):
                 candidates = out["variants"]
             else:
                 candidates = [out.get("professional"), out.get("concise"),
                               out.get("technical")]
             variants = [v.strip() for v in candidates if isinstance(v, str) and v.strip()]
+        except llm.LLMCancelledError:
+            raise
         except llm.LLMError:
+            if not fallback_on_error:
+                raise
             variants = None
     fallback_variants = _fallback_variants(
         row["title"], angle or f"{row['title'][:12]}相关")
@@ -96,6 +103,9 @@ def generate(job_key: str, client=None, resume_id: int = None) -> dict:
         variants = [variants[index] if index < len(variants) and variants[index]
                     else fallback_variants[index] for index in range(3)]
     variants = variants[:3]
+
+    if cancelled and cancelled():
+        raise llm.LLMCancelledError("招呼语任务已取消，结果未保存")
 
     if resume_id is None:
         exist = conn.execute("SELECT id FROM greetings WHERE job_key=? AND resume_id IS NULL "

@@ -8,10 +8,48 @@
 import json
 import re
 import time
+from typing import Optional
 
 
 class LLMError(Exception):
     pass
+
+
+class LLMRateLimitError(LLMError):
+    """保留上游 429 语义，供页级任务队列动态降并发和退避。"""
+
+    def __init__(self, message: str, retry_after: float = None):
+        super().__init__(message)
+        self.status_code = 429
+        self.retry_after = retry_after
+
+
+class LLMCancelledError(LLMError):
+    """用户切换简历或主动取消任务。"""
+
+
+def _retry_after(error) -> Optional[float]:
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None) or getattr(error, "headers", None) or {}
+    raw = headers.get("retry-after") or headers.get("Retry-After") if hasattr(headers, "get") else None
+    try:
+        return max(0.0, float(raw)) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _wrap_error(error: Exception, prefix: str = "LLM 调用失败") -> LLMError:
+    message = str(error).strip() or error.__class__.__name__
+    response = getattr(error, "response", None)
+    status = getattr(error, "status_code", None) or getattr(response, "status_code", None)
+    lowered = message.lower()
+    if status == 429 or "429" in lowered or "rate limit" in lowered or "too many requests" in lowered:
+        return LLMRateLimitError(f"{prefix}：{message}", _retry_after(error))
+    return LLMError(f"{prefix}：{message}")
+
+
+def _cancelled(cancelled) -> bool:
+    return bool(cancelled and cancelled())
 
 
 def configured() -> bool:
@@ -30,20 +68,49 @@ def make_client():
                   api_key=get_setting("llm_api_key"), timeout=120)
 
 
-def chat(messages, client=None, temperature=0.3, max_tokens=2000) -> str:
-    """普通对话调用，返回文本。"""
+def chat(messages, client=None, temperature=0.3, max_tokens=2000,
+         on_delta=None, cancelled=None) -> str:
+    """普通对话调用；传入 on_delta 时使用流式响应并逐片通知任务层。"""
     from .db import get_setting
     try:
+        if _cancelled(cancelled):
+            raise LLMCancelledError("生成任务已取消")
         cli = client or make_client()
-        resp = cli.chat.completions.create(
-            model=get_setting("llm_model"), messages=messages,
-            temperature=temperature, max_tokens=max_tokens)
-        return resp.choices[0].message.content or ""
+        try:
+            model = get_setting("llm_model")
+        except Exception:
+            # 单测或探针注入客户端时不强依赖已初始化的设置表。
+            if client is None:
+                raise
+            model = ""
+        kwargs = {
+            "model": model, "messages": messages,
+            "temperature": temperature, "max_tokens": max_tokens,
+        }
+        if on_delta is None:
+            resp = cli.chat.completions.create(**kwargs)
+            return resp.choices[0].message.content or ""
+        stream = cli.chat.completions.create(**kwargs, stream=True)
+        parts = []
+        try:
+            for chunk in stream:
+                if _cancelled(cancelled):
+                    raise LLMCancelledError("生成任务已取消")
+                choices = getattr(chunk, "choices", None) or []
+                delta = getattr(choices[0], "delta", None) if choices else None
+                text = getattr(delta, "content", None) or ""
+                if text:
+                    parts.append(text)
+                    on_delta(text)
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+        return "".join(parts)
     except LLMError:
         raise
     except Exception as e:
-        message = str(e).strip() or e.__class__.__name__
-        raise LLMError(f"LLM 调用失败：{message}") from e
+        raise _wrap_error(e) from e
 
 
 def test_connection(base_url: str, api_key: str, model: str, client=None) -> dict:
@@ -69,8 +136,7 @@ def test_connection(base_url: str, api_key: str, model: str, client=None) -> dic
         )
         reply = (resp.choices[0].message.content or "").strip()
     except Exception as e:
-        message = str(e).strip() or e.__class__.__name__
-        raise LLMError(f"LLM 连接失败：{message}") from e
+        raise _wrap_error(e, "LLM 连接失败") from e
     return {"ok": True, "model": model, "reply": reply[:80],
             "latency_ms": round((time.perf_counter() - started) * 1000)}
 
@@ -101,13 +167,14 @@ def extract_json(text: str):
     raise LLMError("JSON 对象未闭合")
 
 
-def chat_json(messages, client=None, retries=2) -> dict:
+def chat_json(messages, client=None, retries=2, on_delta=None, cancelled=None) -> dict:
     """结构化输出：低温 + 失败重试（追加纠错提示）。"""
     cli = client or make_client()
     msgs = list(messages)
     last_err = None
     for _ in range(retries + 1):
-        text = chat(msgs, client=cli, temperature=0.1)
+        text = chat(msgs, client=cli, temperature=0.1,
+                    on_delta=on_delta, cancelled=cancelled)
         try:
             return extract_json(text)
         except (LLMError, json.JSONDecodeError) as e:

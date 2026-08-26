@@ -8,7 +8,7 @@
 
 ```bash
 cd ~/project/boss-copilot
-.venv/bin/python -m unittest discover tests -v   # 回归（184 例，必须全绿）
+.venv/bin/python -m unittest discover tests -v   # 回归（259 例，必须全绿）
 .venv/bin/uvicorn backend.main:app --port 8787
 # 浏览器打开 http://127.0.0.1:8787
 ```
@@ -42,6 +42,8 @@ cd ~/project/boss-copilot
 
 唯一的跨账号读操作是「同步BOSS收藏」：收藏工作台会分别只读打开两个账号的推荐页「感兴趣」Tab（`/web/geek/recommend?tab=4`），逐页导航 + DOM 读取，零点击零注入请求。同步按账号增量合并——新命中的岗位入库并点亮本地收藏，本地已取消的收藏不会被复活，BOSS 侧取消感兴趣也不会删除或下架本地岗位；同一岗位被两个账号收藏时只保留一条岗位记录并显示双方标签。
 
+采集中心允许用户删除历史采集数据。删除前必须先读取影响预览并二次确认；删除会物理移除指定采集记录及仅归属于该记录的岗位数据，共享给其他采集记录的岗位会保留。无法可靠恢复归属的旧记录只删除采集记录，不猜测删除岗位；运行中、暂停中或正被补采任务引用的记录不能删除。
+
 点击「检测登录态」时，如果对应 Chrome 尚未运行，应用会临时启动它、打开登录页、完成检测并自动停止；原本已运行的 Chrome 不会被自动停止。结果及检测时间会保存并在页面刷新后继续显示。
 
 ## 数据目录与迁移
@@ -68,6 +70,7 @@ cd ~/project/boss-copilot
 | M13 | 双账号BOSS收藏同步/增量合并/JD补齐 | 本次提交 |
 | M15 | 全模拟前端体验重构/向导/采集工作台/响应式布局 | 7fc0e4a |
 | M16 | 前后端真实接入/采集暂停恢复与来源启停/岗位求职阶段 | 本次改动 |
+| M17 | 采集数据确认删除/页面级 AI 任务队列/流式进度/OFFER 工作流 | 本次改动 |
 
 ## 发送护栏（不可关闭）
 
@@ -78,7 +81,7 @@ cd ~/project/boss-copilot
 1. **每个功能必须带测试用例**；任何 `backend/`、`frontend/` 改动后必须全量回归：
    `.venv/bin/python -m unittest discover tests -v`
 2. **里程碑 = 一次 git commit**（Conventional Commits）
-3. 数据永不物理删除：岗位用状态机（active/delisted/hr_inactive/excluded）
+3. 常规岗位生命周期不物理删除，使用状态机（active/delisted/hr_inactive/excluded）。唯一例外是用户在「采集中心」主动发起并二次确认删除：允许物理删除指定采集记录及仅归属于该记录的采集数据；仍归属于其他采集记录的岗位必须保留
 4. 导入的评分是基线，引擎评分不覆盖基线（`keep_imported`）
 5. BOSS 写操作只走沟通号、只走 UI 级操作、必须有护栏；spike 脚本放 `tests/spike_*.py`（只读验证用）
 6. 聊天页/搜索页后台标签必须开 `Emulation.setFocusEmulationEnabled`（BOSS SPA 无焦点不渲染）
@@ -92,8 +95,9 @@ backend/
   importer.py    xlsx / scraper JSON 导入（评分基线保护）
   collector.py   在线采集执行器（后台线程，调 scraper，任务间隔 120s）
   favorites.py   双账号BOSS收藏同步（推荐页感兴趣Tab只读 + 增量合并）
-  collection_runs.py 采集来源归属、启停与 xlsx 导出
-  workflow.py    岗位已打招呼/已投递/已面试阶段聚合
+  collection_runs.py 采集来源归属、启停、删除与 xlsx 导出
+  workflow.py    岗位待开始/已打招呼/已投递/已面试/OFFER 阶段聚合
+  ai_tasks.py    岗位页与工作台独立 AI 队列（单页并发 5、取消、SSE、429 退避）
   sync.py        同步刷新：同词下架 diff / HR 活跃度剔除 / P 级漂移报告
   scoring/l1.py  L1 电算评分（《岗位筛选评分规则》全量落码）
   scoring/l2.py  L2 LLM 精评（LLM 只出维度分，算术代码合成）
@@ -106,7 +110,7 @@ backend/
   interview.py   模拟面试 agent
   boss/cdp.py    账号 CDP 管理（单/双账号切换 + 代理绕过）
 frontend/        无构建 Vue3（app.js 单文件 + vendored vue.esm）
-tests/           184 个单测 + 真实登录态只读 spike 脚本
+tests/           259 个单测 + 真实登录态只读 spike 脚本
 ```
 
 ## 已知边界
@@ -116,5 +120,6 @@ tests/           184 个单测 + 真实登录态只读 spike 脚本
 - 公司页采集的岗位缺 industry/JD 字段时 L1 命中率记 0，补详情后重算即恢复
 - 列表文件每次增量落盘、详情文件每新增一条都会立即导入 SQLite；`/api/collect/status` 与 `/api/favorites/sync/status` 的 `progress.detail_completed/detail_total` 提供单条进度。详情重试只提交数据库中仍缺 JD 的岗位，已完成项不会重复访问
 - LLM 未配置时：L1/导入/采集/人工流程可用，L2/策略/招呼语(LLM)/面试降级并提示
+- 岗位列表与收藏工作台的生成任务互相独立，均可在运行时继续追加；单页最大并发为 5，遇到 429 会降低该页并发并按 `Retry-After` 或指数退避重试，连续成功后逐步恢复
 - 数据分析默认覆盖全部当前岗位；旧导入和收藏岗位也会进入属性分布，但关键词、城市、日期筛选与采集趋势只使用 M12 可靠来源关系
 - 收藏同步依赖推荐页「感兴趣」Tab 的列表组件（实测为专用 `li.item-boss` 卡片，岗位链接自带 encryptJobId；搜索系 `job-card-box` 作为兼容家族一并支持）；若 BOSS 改版解析为空，可跑 `tests/spike_m13_favorites.py`（只读）核对 DOM 后调整解析启发式。每页翻页用独立后台标签（Chrome 会回收闲置后台标签），列表不足一页时第 2 页返回空态自动停止。同步入库的新岗位默认无 JD，状态条会提示缺失数量并可一键补齐（采集号只读执行）

@@ -85,6 +85,8 @@ const apiClient = {
   runs: {
     list: () => apiRequest('/api/runs?limit=100'),
     setEnabled: (id, enabled) => apiRequest(`/api/runs/${id}/enabled`, { method: 'PUT', body: { enabled } }),
+    deletePreview: id => apiRequest(`/api/runs/${id}/delete-preview`),
+    delete: id => apiRequest(`/api/runs/${id}`, { method: 'DELETE', body: { confirm_run_id: id } }),
     exportUrl: id => `/api/runs/${id}/export`,
   },
   collect: {
@@ -119,9 +121,15 @@ const apiClient = {
   greetings: {
     list: () => apiRequest('/api/greetings'),
     generate: (jobKey, resumeId) => apiRequest('/api/greeting/generate', { method: 'POST', body: { job_key: jobKey, resume_id: resumeId } }),
-    approve: (id, chosenText) => apiRequest(`/api/greetings/${id}`, { method: 'PUT', body: { index: 0, chosen_text: chosenText } }),
+    approve: (id, index, chosenText) => apiRequest(`/api/greetings/${id}`, { method: 'PUT', body: { index, chosen_text: chosenText } }),
     sendBatch: jobKeys => apiRequest('/api/greeting/send-batch', { method: 'POST', body: { job_keys: jobKeys } }),
     sendStatus: () => apiRequest('/api/greeting/send-status'),
+  },
+  ai: {
+    status: page => apiRequest(`/api/ai/tasks/${page}`),
+    enqueue: (page, body) => apiRequest(`/api/ai/tasks/${page}`, { method: 'POST', body }),
+    cancel: (page, body = {}) => apiRequest(`/api/ai/tasks/${page}/cancel`, { method: 'POST', body }),
+    streamUrl: page => `/api/ai/tasks/${page}/stream`,
   },
   interviews: {
     list: () => apiRequest('/api/interviews'),
@@ -146,11 +154,17 @@ const EMPTY_SETTINGS = {
 const EMPTY_ANALYTICS = {
   summary: {}, distributions: {}, meta: { keywords: [], cities: [] }, trends: [],
 }
+const EMPTY_AI_PAGE = page => ({
+  page, tasks: [], active: 0, effective_concurrency: 5, max_concurrency: 5,
+  progress: { total: 0, completed: 0, percent: 0, queued: 0, running: 0, retrying: 0, succeeded: 0, failed: 0, cancelled: 0 },
+})
 const store = reactive({
   resumes: [], selectedResumeId: null, jobs: [], jobTotal: 0, runs: [], accounts: [],
   settings: clone(EMPTY_SETTINGS), dashboard: null, analytics: clone(EMPTY_ANALYTICS),
   greetings: [], interviews: [],
   collect: { status: {}, favoritesStatus: {}, config: null, options: { city_options: [], filter_values: {}, max_combinations: 20 } },
+  ai: { jobs: EMPTY_AI_PAGE('jobs'), workbench: EMPTY_AI_PAGE('workbench') },
+  aiTracking: { jobs: [], workbench: [] },
   ui: { toast: null, confirm: null, bootstrapLoading: true, bootstrapError: '', refreshing: false, lastUpdated: '' },
   batch: { running: false, type: '', label: '', done: 0, total: 0, failures: [] },
 })
@@ -207,9 +221,21 @@ function normalizeRun(row = {}) {
   }
 }
 function adviceFromDetail(detail = {}) {
-  const parts = [detail.advice, detail.summary, detail.resume_advice].filter(Boolean)
-  const gaps = Array.isArray(detail.gaps) ? detail.gaps.map(item => item.action || item.gap).filter(Boolean) : []
-  return [...parts, ...gaps].join('；')
+  if (!detail || !Object.keys(detail).length) return ''
+  const lines = []
+  if (detail.summary) lines.push(`### 总体判断\n${detail.summary}`)
+  if (detail.advice) lines.push(`### 投递建议\n${detail.advice}`)
+  if (Array.isArray(detail.strengths) && detail.strengths.length) {
+    lines.push(`### 匹配优势\n${detail.strengths.map(item => `- ${item}`).join('\n')}`)
+  }
+  if (Array.isArray(detail.gaps) && detail.gaps.length) {
+    lines.push(`### 面试前准备\n${detail.gaps.map(item => {
+      if (typeof item === 'string') return `- ${item}`
+      return `- **${item.gap || '能力缺口'}**：${item.action || '建议结合真实经历准备说明'}`
+    }).join('\n')}`)
+  }
+  if (detail.resume_advice) lines.push(`### 简历侧重点\n${detail.resume_advice}`)
+  return lines.join('\n\n')
 }
 function normalizeJob(row = {}, previous = {}) {
   const detail = row.l2_detail && typeof row.l2_detail === 'object' ? row.l2_detail : previous.l2_detail || {}
@@ -221,6 +247,7 @@ function normalizeJob(row = {}, previous = {}) {
     contacted: Boolean(row.greeted ?? row.contacted ?? workflow.greeted ?? previous.contacted),
     applied: Boolean(row.applied ?? workflow.applied ?? previous.applied),
     interviewed: Boolean(row.interviewed ?? workflow.interviewed ?? previous.interviewed),
+    offered: Boolean(row.offered ?? workflow.offered ?? previous.offered),
     active: row.hr_active || previous.active || '未标注', active_ts: row.last_seen_at || previous.active_ts || '',
     source_keyword: row.source_keyword || row.keyword || row.source || previous.source_keyword || '未标注',
     priority: row.priority || previous.priority || '—', jd: row.jd ?? previous.jd ?? '',
@@ -260,15 +287,19 @@ async function refreshResumes() {
 async function refreshJobs() {
   if (!store.selectedResumeId) { store.jobs = []; store.jobTotal = 0; return }
   const result = await apiClient.jobs.list({ status: 'active', resume_id: store.selectedResumeId, limit: 500, sort: 'composite' })
-  const previous = new Map(store.jobs.map(job => [job.job_key, job]))
-  store.jobs = (result.items || []).map(row => normalizeJob(row, previous.get(row.job_key)))
+  const sameResume = store.jobs.length === 0
+    || store.jobs.every(job => Number(job.score_resume_id) === Number(result.resume_id))
+  const previous = new Map((sameResume ? store.jobs : []).map(job => [job.job_key, job]))
+  store.jobs = (result.items || []).map(row => normalizeJob(
+    { ...row, score_resume_id: result.resume_id }, previous.get(row.job_key)))
   store.jobTotal = Number(result.total || 0)
   applyGreetingsToJobs()
 }
 async function refreshJobDetail(jobKey) {
   const detail = await apiClient.jobs.detail(jobKey, store.selectedResumeId)
   const index = store.jobs.findIndex(job => job.job_key === jobKey)
-  if (index >= 0) store.jobs[index] = normalizeJob(detail, store.jobs[index])
+  if (index >= 0) store.jobs[index] = normalizeJob(
+    { ...detail, score_resume_id: detail.resume && detail.resume.id }, store.jobs[index])
   applyGreetingsToJobs()
   return index >= 0 ? store.jobs[index] : normalizeJob(detail)
 }
@@ -295,6 +326,10 @@ async function refreshGreetings() {
 async function refreshInterviews() { store.interviews = await apiClient.interviews.list() || [] }
 async function refreshAccounts() { store.accounts = normalizeAccounts(await apiClient.accounts.list()) }
 
+async function refreshAiTasks(page, notify = false) {
+  applyAiSnapshot(page, await apiClient.ai.status(page), notify)
+}
+
 function applyGreetingsToJobs() {
   const byJob = new Map()
   for (const greeting of store.greetings) {
@@ -305,9 +340,112 @@ function applyGreetingsToJobs() {
     const greeting = byJob.get(job.job_key)
     job.greetingId = greeting ? greeting.id : null
     job.greetingStatus = greeting ? greeting.status : ''
-    job.greeting = greeting ? (greeting.chosen || (greeting.variants || [])[0] || '') : ''
+    job.greetingVariants = greeting ? (greeting.variants || []).slice(0, 3) : []
+    job.greetingLabels = greeting ? (greeting.variant_labels || []).slice(0, 3) : []
+    const chosenIndex = greeting && greeting.chosen ? job.greetingVariants.indexOf(greeting.chosen) : -1
+    const previousIndex = Number(job.greetingSelectedIndex || 0)
+    job.greetingSelectedIndex = chosenIndex >= 0 ? chosenIndex : Math.min(previousIndex, Math.max(0, job.greetingVariants.length - 1))
+    job.greeting = greeting ? (greeting.chosen || job.greetingVariants[job.greetingSelectedIndex] || '') : ''
     if (greeting && (greeting.delivery_status === 'confirmed' || greeting.status === 'sent')) job.contacted = true
   }
+}
+
+const AI_ACTIVE = new Set(['queued', 'running', 'retrying'])
+const AI_TERMINAL = new Set(['succeeded', 'failed', 'cancelled'])
+const seenAiFailures = new Set()
+const aiRefreshTimers = { jobs: null, workbench: null }
+
+function trackAiTasks(page, tasks = []) {
+  const current = store.aiTracking[page] || []
+  const hasActive = current.some(id => {
+    const task = (store.ai[page].tasks || []).find(item => item.id === id)
+    return task && AI_ACTIVE.has(task.status)
+  })
+  const base = hasActive ? current : []
+  store.aiTracking[page] = [...new Set([...base, ...tasks.map(task => task.id)])]
+}
+
+function scheduleAiRefresh(page) {
+  window.clearTimeout(aiRefreshTimers[page])
+  aiRefreshTimers[page] = window.setTimeout(async () => {
+    const loaders = page === 'workbench'
+      ? [['岗位', refreshJobs], ['招呼语', refreshGreetings], ['总览', refreshDashboard]]
+      : [['岗位', refreshJobs], ['总览', refreshDashboard], ['数据分析', refreshAnalytics]]
+    await runLoaders(loaders)
+  }, 180)
+}
+
+function applyAiSnapshot(page, snapshot, notify = true) {
+  if (!snapshot || !Array.isArray(snapshot.tasks)) return
+  const previous = new Map((store.ai[page].tasks || []).map(task => [task.id, task.status]))
+  store.ai[page] = snapshot
+  const activeForResume = snapshot.tasks.filter(task => AI_ACTIVE.has(task.status)
+    && Number(task.resume_id) === Number(store.selectedResumeId))
+  if (!store.aiTracking[page].length && activeForResume.length) trackAiTasks(page, activeForResume)
+  let shouldRefresh = false
+  for (const task of snapshot.tasks) {
+    const changedToTerminal = AI_TERMINAL.has(task.status) && previous.get(task.id) !== task.status
+    if (changedToTerminal && task.status === 'succeeded') {
+      shouldRefresh = true
+      const job = store.jobs.find(item => item.job_key === task.job_key)
+      if (job && (!job.actionErrorType || job.actionErrorType === task.kind)) {
+        job.actionError = ''
+        job.actionErrorType = ''
+      }
+    }
+    if (notify && task.status === 'failed' && !seenAiFailures.has(task.id)) {
+      seenAiFailures.add(task.id)
+      const job = store.jobs.find(item => item.job_key === task.job_key)
+      if (job) {
+        job.actionError = task.error || '生成失败'
+        job.actionErrorType = task.kind
+      }
+      const label = task.kind === 'greeting' ? '招呼语' : task.kind === 'analysis' ? '分析' : '评分'
+      showToast(`${label}生成失败：${task.error || '未知错误'}，请重新生成`, 'bad')
+    }
+  }
+  if (shouldRefresh) scheduleAiRefresh(page)
+}
+
+function aiTaskFor(page, jobKey, kinds, activeOnly = true) {
+  const wanted = Array.isArray(kinds) ? kinds : [kinds]
+  const tasks = [...(store.ai[page].tasks || [])].reverse()
+  return tasks.find(task => task.job_key === jobKey
+    && Number(task.resume_id) === Number(store.selectedResumeId)
+    && (!wanted[0] || wanted.includes(task.kind))
+    && (!activeOnly || AI_ACTIVE.has(task.status))) || null
+}
+
+function scoreLabel(job, field, page) {
+  const kinds = page === 'jobs' ? ['score'] : ['analysis']
+  return aiTaskFor(page, job.job_key, kinds) ? '评分中' : (job[field] ?? '未评分')
+}
+
+function aiSummary(page) {
+  const all = store.ai[page].tasks || []
+  const tracked = new Set(store.aiTracking[page] || [])
+  const tasks = all.filter(task => tracked.has(task.id))
+  const active = tasks.filter(task => AI_ACTIVE.has(task.status))
+  const completed = tasks.filter(task => AI_TERMINAL.has(task.status)).length
+  const failures = tasks.filter(task => task.status === 'failed').length
+  const kinds = [...new Set(active.map(task => task.kind))]
+  const labels = kinds.map(kind => kind === 'greeting' ? '正在生成招呼语' : kind === 'analysis' ? '正在生成分析' : '正在生成岗位与匹配度评分')
+  return {
+    visible: tasks.length > 0, running: active.length > 0, total: tasks.length, completed,
+    failures, percent: tasks.length ? Math.round(completed / tasks.length * 100) : 0,
+    label: labels.join(' / ') || (failures ? '生成完成，部分任务失败' : '最近生成任务已完成'),
+    effective: Number(store.ai[page].effective_concurrency || 1),
+    max: Number(store.ai[page].max_concurrency || 5),
+  }
+}
+
+async function enqueueAi(page, kind, jobKeys, force = true) {
+  const result = await apiClient.ai.enqueue(page, {
+    kind, job_keys: jobKeys, resume_id: store.selectedResumeId, force,
+  })
+  trackAiTasks(page, result.tasks || [])
+  applyAiSnapshot(page, result.snapshot || store.ai[page], false)
+  return result
 }
 
 async function runLoaders(loaders) {
@@ -326,6 +464,8 @@ async function bootstrap() {
     ['收藏同步状态', refreshFavoriteStatus], ['账号', refreshAccounts], ['岗位', refreshJobs],
     ['招呼语', refreshGreetings], ['面试记录', refreshInterviews], ['数据分析', refreshAnalytics],
     ['采集配置', refreshCollectConfig],
+    ['岗位生成任务', () => refreshAiTasks('jobs', false)],
+    ['工作台生成任务', () => refreshAiTasks('workbench', false)],
   ]))
   store.ui.bootstrapError = errors.join('；')
   store.ui.bootstrapLoading = false
@@ -337,6 +477,8 @@ async function refreshRuntime() {
   const errors = await runLoaders([
     ['采集状态', refreshCollectStatus], ['采集历史', refreshRuns],
     ['收藏同步状态', refreshFavoriteStatus], ['发送状态', async () => { store.sendStatus = await apiClient.greetings.sendStatus() }],
+    ['岗位生成任务', () => refreshAiTasks('jobs')],
+    ['工作台生成任务', () => refreshAiTasks('workbench')],
   ])
   if (errors.length) store.ui.bootstrapError = errors.join('；')
   const active = store.runs.some(run => run.status === 'running' || run.status === 'paused')
@@ -347,6 +489,23 @@ async function refreshRuntime() {
     ])
   }
   observedRuntimeActive = active
+}
+
+const aiStreams = []
+function connectAiStreams() {
+  if (typeof EventSource === 'undefined' || aiStreams.length) return
+  for (const page of ['jobs', 'workbench']) {
+    const source = new EventSource(apiClient.ai.streamUrl(page))
+    source.addEventListener('snapshot', event => {
+      try { applyAiSnapshot(page, JSON.parse(event.data), true) }
+      catch (_) { /* 轮询会继续兜底刷新状态。 */ }
+    })
+    aiStreams.push(source)
+  }
+}
+
+function closeAiStreams() {
+  aiStreams.splice(0).forEach(source => source.close())
 }
 
 let toastTimer = null
@@ -381,11 +540,11 @@ function deriveJobTags(job) {
   return tags
 }
 function workflowLabel(job) {
+  if (job.offered) return 'OFFER'
   if (job.interviewed) return '已面试'
   if (job.applied) return '已投递'
   if (job.contacted) return '已打招呼'
-  if (job.greeting) return '已生成'
-  return '待准备'
+  return '待开始'
 }
 
 // -- Hash 路由 -----------------------------------------------------------
@@ -669,7 +828,7 @@ const DashboardView = {
           <div class="segmented"><button :class="{active:guide.resumeMode==='existing'}" @click="guide.resumeMode='existing'">使用已有简历</button><button :class="{active:guide.resumeMode==='new'}" @click="guide.resumeMode='new'">新建简历</button></div>
           <label v-if="guide.resumeMode==='existing'">简历档案<select v-model.number="guide.resumeId"><option v-for="resume in store.resumes" :key="resume.id" :value="resume.id">{{resume.name}}</option></select></label>
           <template v-else><label>档案名称<input v-model="guide.resumeName"></label><label>简历正文<textarea v-model="guide.resumeBody" class="guide-resume"></textarea></label></template>
-          <div class="guide-actions"><span></span><button class="primary" :disabled="guide.busy" @click="finishResumeStep">{{guide.busy==='resume'?'保存中…':'下一步'}}</button></div>
+          <div class="guide-actions"><span></span><button class="primary" :disabled="!!guide.busy" @click="finishResumeStep">{{guide.busy==='resume'?'保存中…':'下一步'}}</button></div>
         </section>
 
         <section v-if="guide.step===2" class="guide-content">
@@ -677,20 +836,20 @@ const DashboardView = {
           <div v-if="!guideLlmConfigured" class="llm-warning"><b>LLM 尚未配置</b><span>跳过后，AI 生成采集计划、岗位评分、匹配度评分、AI 招呼语和模拟面试将不可用，手动采集仍可使用。</span></div>
           <div v-else-if="guide.llmTested" class="llm-success"><b>连接测试通过</b><span>{{guide.llmModel}} 可用</span></div>
           <div class="form-grid three"><label>Base URL<input v-model="guide.llmBaseUrl" placeholder="https://api.example.com/v1" @input="guide.llmTested=false"></label><label>API Key<input v-model="guide.llmApiKey" type="password" placeholder="sk-…" @input="guide.llmTested=false"></label><label>模型<input v-model="guide.llmModel" placeholder="model-name" @input="guide.llmTested=false"></label></div>
-          <div class="guide-actions"><button @click="guide.step=1">上一步</button><div class="row"><button v-if="!guideLlmConfigured" :disabled="guide.busy" @click="saveGuideLlm">暂不配置，继续</button><button :disabled="guide.busy || !guideLlmConfigured" @click="testGuideLlm">{{guide.busy==='llm'?'测试中…':'测试连接'}}</button><button v-if="guideLlmConfigured" class="primary" :disabled="guide.busy || !guide.llmTested" @click="saveGuideLlm">{{guide.busy==='save-llm'?'保存中…':'保存并下一步'}}</button></div></div>
+          <div class="guide-actions"><button @click="guide.step=1">上一步</button><div class="row"><button v-if="!guideLlmConfigured" :disabled="!!guide.busy" @click="saveGuideLlm">暂不配置，继续</button><button :disabled="!!guide.busy || !guideLlmConfigured" @click="testGuideLlm">{{guide.busy==='llm'?'测试中…':'测试连接'}}</button><button v-if="guideLlmConfigured" class="primary" :disabled="!!guide.busy || !guide.llmTested" @click="saveGuideLlm">{{guide.busy==='save-llm'?'保存中…':'保存并下一步'}}</button></div></div>
         </section>
 
         <section v-if="guide.step===3" class="guide-content">
           <div><h3>登录 BOSS 并同步收藏岗位</h3><p>同步结果会作为一条独立采集记录，可在采集中心启用或禁用。</p></div>
-          <div class="guide-account"><span class="account-icon">沟</span><div><b>{{communicationAccount.loggedIn?'BOSS 已登录':'等待登录 BOSS'}}</b><small>{{communicationAccount.running?'沟通号运行中':'沟通号尚未启动'}}</small></div><button :disabled="guide.busy" @click="guideLogin">{{guide.busy==='login'?'检测中…':communicationAccount.loggedIn?'重新检测':'登录 BOSS'}}</button></div>
-          <div class="guide-sync"><div><b>同步 BOSS 收藏岗位 <span class="optional-mark">可选</span></b><span>{{guide.synced?'本次同步已加入采集历史':'读取“感兴趣”岗位并加入本地岗位池，也可稍后处理'}}</span></div><button class="primary" :disabled="guide.busy || guide.synced" @click="guideSyncFavorites">{{guide.busy==='sync'?'同步中…':guide.synced?'同步完成':'开始同步'}}</button></div>
+          <div class="guide-account"><span class="account-icon">沟</span><div><b>{{communicationAccount.loggedIn?'BOSS 已登录':'等待登录 BOSS'}}</b><small>{{communicationAccount.running?'沟通号运行中':'沟通号尚未启动'}}</small></div><button :disabled="!!guide.busy" @click="guideLogin">{{guide.busy==='login'?'检测中…':communicationAccount.loggedIn?'重新检测':'登录 BOSS'}}</button></div>
+          <div class="guide-sync"><div><b>同步 BOSS 收藏岗位 <span class="optional-mark">可选</span></b><span>{{guide.synced?'本次同步已加入采集历史':'读取“感兴趣”岗位并加入本地岗位池，也可稍后处理'}}</span></div><button class="primary" :disabled="!!guide.busy || guide.synced" @click="guideSyncFavorites">{{guide.busy==='sync'?'同步中…':guide.synced?'同步完成':'开始同步'}}</button></div>
           <div class="guide-actions"><button @click="guide.step=2">上一步</button><button class="primary" @click="guide.step=4">{{guide.synced?'下一步':'跳过，下一步'}}</button></div>
         </section>
 
         <section v-if="guide.step===4" class="guide-content">
           <div><h3>设置新的采集计划</h3><p>配置主动搜索范围，稍后可在采集中心继续调整。</p></div>
           <div class="segmented"><button :class="{active:guidePlan.mode==='manual'}" @click="guidePlan.mode='manual';guidePlan.generated=true">手动配置</button><button :class="{active:guidePlan.mode==='auto'}" @click="guidePlan.mode='auto';guidePlan.generated=false">AI 生成</button></div>
-          <div v-if="guidePlan.mode==='auto'" class="guide-ai-plan"><div><b>{{llmReady?'根据当前简历生成采集配置':'LLM 未配置，AI 生成不可用'}}</b><span>{{llmReady?'AI 只生成关键词与城市，不附加额外筛选条件':'返回上一步配置 LLM，或切换为手动配置'}}</span></div><button class="primary" :disabled="guide.busy || !llmReady" @click="guideGeneratePlan">{{guide.busy==='plan'?'生成中…':guidePlan.generated?'重新生成':'AI 生成采集计划'}}</button></div>
+          <div v-if="guidePlan.mode==='auto'" class="guide-ai-plan"><div><b>{{llmReady?'根据当前简历生成采集配置':'LLM 未配置，AI 生成不可用'}}</b><span>{{llmReady?'AI 只生成关键词与城市，不附加额外筛选条件':'返回上一步配置 LLM，或切换为手动配置'}}</span></div><button class="primary" :disabled="!!guide.busy || !llmReady" @click="guideGeneratePlan">{{guide.busy==='plan'?'生成中…':guidePlan.generated?'重新生成':'AI 生成采集计划'}}</button></div>
           <div class="form-grid two"><label>计划名称<input v-model="guidePlan.name"></label><label>每组页数<input type="number" min="1" max="10" v-model.number="guidePlan.pages"></label></div>
           <label>搜索关键词<textarea class="short" v-model="guidePlan.keywords" placeholder="每行一个关键词"></textarea></label>
           <div class="field-group"><span class="field-label">城市范围</span><div class="city-picker"><div class="city-input-row"><input v-model="guideCityQuery" placeholder="输入城市关键词" @keyup.enter="addGuideCity()"><button @click="addGuideCity()">添加</button></div><div v-if="guideCitySuggestions.length" class="city-suggestions"><button v-for="city in guideCitySuggestions" :key="city" @click="addGuideCity(city)">{{city}}</button></div><div class="city-tags"><span v-for="city in guidePlan.cities" :key="city" class="city-tag">{{city}}<button :aria-label="'移除城市 ' + city" @click="removeGuideCity(city)">×</button></span></div></div></div>
@@ -701,7 +860,7 @@ const DashboardView = {
         <section v-if="guide.step===5" class="guide-content guide-finish">
           <span class="finish-mark">✓</span><h3>准备开始采集</h3><p>基础配置已确认，采集开始后可在左侧查看总进度。</p>
           <dl><div><dt>当前简历</dt><dd>{{store.resumes.find(item=>item.id===store.selectedResumeId)?.name}}</dd></div><div><dt>LLM</dt><dd>{{llmReady?guide.llmModel+' · 可用':'未配置 · AI 功能不可用'}}</dd></div><div><dt>收藏同步</dt><dd>{{guide.synced?'已作为采集记录应用':'已跳过，可稍后同步'}}</dd></div><div><dt>采集计划</dt><dd>{{guidePlan.name}} · {{guidePlan.cities.join('、')}}</dd></div></dl>
-          <div class="guide-actions"><button @click="guide.step=4">返回修改</button><button class="primary" :disabled="guide.busy" @click="finishGuide">{{guide.busy==='collect'?'启动中…':'开始采集并返回总览'}}</button></div>
+          <div class="guide-actions"><button @click="guide.step=4">返回修改</button><button class="primary" :disabled="!!guide.busy" @click="finishGuide">{{guide.busy==='collect'?'启动中…':'开始采集并返回总览'}}</button></div>
         </section>
       </div>
     </div>
@@ -996,9 +1155,36 @@ const CollectView = {
         showToast(`取消失败：${error.message}`, 'bad')
       }
     }
+    async function deleteRunData(run) {
+      let preview
+      try {
+        preview = await apiClient.runs.deletePreview(run.id)
+      } catch (error) {
+        showToast(`删除范围读取失败：${error.message}`, 'bad')
+        return
+      }
+      const exclusive = Number(preview.exclusive_jobs ?? preview.exclusive_job_count ?? 0)
+      const shared = Number(preview.shared_jobs ?? preview.shared_job_count ?? 0)
+      const unattributed = Number(preview.legacy_unattributed ?? preview.unattributed_jobs ?? 0)
+      const accepted = await requestConfirm({
+        title: `删除采集数据 · ${run.name}`,
+        message: `此操作会永久删除该采集记录和 ${exclusive} 个仅属于它的岗位；${shared} 个同时属于其他采集记录的岗位会保留。${unattributed ? `另有 ${unattributed} 条旧数据无法可靠追溯，不会猜测删除。` : ''} 删除后无法恢复。`,
+        confirmText: '永久删除', tone: 'danger',
+      })
+      if (!accepted) return
+      try {
+        const result = await apiClient.runs.delete(run.id)
+        await Promise.allSettled([refreshRuns(), refreshDashboard(), refreshAnalytics(), refreshJobs()])
+        const deleted = Number(result.deleted_jobs ?? result.deleted_job_count ?? exclusive)
+        const preserved = Number(result.preserved_shared_jobs ?? result.shared_jobs ?? shared)
+        showToast(`采集数据已删除：删除 ${deleted} 个独占岗位，保留 ${preserved} 个共享岗位`, 'info')
+      } catch (error) {
+        showToast(`采集数据删除失败：${error.message}`, 'bad')
+      }
+    }
     return { store, screen, step, plan, generating, syncingFavorites, cityQuery, keywords, companyList, citySuggestions, llmReady, resume, FILTER_OPTIONS,
       percentOf, fmtTime, runStatusLabel, startWizard, closeWizard, addCity, removeCity, generatePlan,
-      nextToConfig, toReview, launchPlan, syncFavoriteJobs, toggleRun, toggleRunData, cancelRun, apiClient }
+      nextToConfig, toReview, launchPlan, syncFavoriteJobs, toggleRun, toggleRunData, cancelRun, deleteRunData, apiClient }
   },
   template: `
   <div>
@@ -1018,7 +1204,7 @@ const CollectView = {
               <td><strong class="table-number">{{run.itemCount}}</strong><span class="muted"> 条</span></td>
               <td><div class="run-progress-cell"><div class="progress-copy"><span class="status-badge" :class="run.status">{{runStatusLabel(run.status)}}</span><b>{{percentOf(run)}}%</b><small v-if="run.progressTotal">{{run.progressCompleted}} / {{run.progressTotal}} 个步骤</small><small v-else>{{run.itemCount}} 条岗位</small></div><div class="progress"><i :style="{width:percentOf(run)+'%'}"></i></div></div></td>
               <td><label class="switch compact" :title="run.hasSourceOwnership?'控制该次采集数据是否参与岗位展示':'旧记录缺少精确岗位归属'"><input type="checkbox" :checked="run.enabled" :disabled="!run.hasSourceOwnership" @change="toggleRunData(run,$event)"><span class="switch-track"><span class="switch-thumb"></span></span><span>{{run.hasSourceOwnership?(run.enabled?'已应用':'已禁用'):'仅统计'}}</span></label></td>
-              <td><div class="row end"><button v-if="(run.status==='running' || run.status==='paused') && run.kind!=='favorite_sync'" @click="toggleRun(run)">{{run.status==='running'?'暂停':'继续'}}</button><button v-if="run.status==='running' || run.status==='paused'" class="danger-quiet" @click="cancelRun(run)">取消</button><a class="icon-button" :href="apiClient.runs.exportUrl(run.id)" download :aria-disabled="!run.canExport" :title="run.canExport?'导出 Excel':'旧记录缺少可导出的岗位归属'" :aria-label="'导出 ' + run.name" @click="!run.canExport && $event.preventDefault()">↓</a></div></td>
+              <td><div class="row end"><button v-if="(run.status==='running' || run.status==='paused') && run.kind!=='favorite_sync'" @click="toggleRun(run)">{{run.status==='running'?'暂停':'继续'}}</button><button v-if="run.status==='running' || run.status==='paused'" class="danger-quiet" @click="cancelRun(run)">取消</button><button v-else class="danger-quiet" title="永久删除本次采集及独占岗位" @click="deleteRunData(run)">删除数据</button><a class="icon-button" :href="apiClient.runs.exportUrl(run.id)" download :aria-disabled="!run.canExport" :title="run.canExport?'导出 Excel':'旧记录缺少可导出的岗位归属'" :aria-label="'导出 ' + run.name" @click="!run.canExport && $event.preventDefault()">↓</a></div></td>
             </tr>
             <tr v-if="!store.runs.length"><td colspan="5"><div class="empty compact">暂无采集记录</div></td></tr>
           </tbody>
@@ -1130,6 +1316,7 @@ const JobsView = {
     const favoriteFilter = ref('all')
     const tagFilter = ref('all')
     const expanded = ref('')
+    const taskSummary = computed(() => aiSummary('jobs'))
     const sortState = reactive({ key: 'match_score', direction: 'desc' })
     const columns = [
       { key: 'title', label: '岗位' }, { key: 'company', label: '公司' }, { key: 'salary_max', label: '薪资' },
@@ -1201,25 +1388,21 @@ const JobsView = {
     async function runScore(kind) {
       const jobKeys = sortedJobs.value.map(job => job.job_key)
       if (!jobKeys.length) { showToast('当前没有可评分岗位', 'warn'); return }
-      showToast(`${kind}正在后端执行`, 'info')
       try {
-        if (kind === '岗位评分') {
-          await apiClient.jobs.scoreJob({ resume_id: store.selectedResumeId, job_keys: jobKeys, force: true })
-        } else {
-          await apiClient.jobs.scoreMatch({ resume_id: store.selectedResumeId, job_keys: jobKeys, limit: jobKeys.length, force: true })
-        }
-        await Promise.allSettled([refreshJobs(), refreshDashboard(), refreshAnalytics()])
-        showToast(`${kind}已完成`)
+        const result = await enqueueAi('jobs', kind === '岗位评分' ? 'job_score' : 'match_score', jobKeys, true)
+        const note = result.added ? `已将 ${result.added} 个岗位加入评分队列` : '所选岗位已在评分队列中'
+        showToast(note, 'info')
       } catch (error) {
-        showToast(`${kind}失败：${error.message}`, 'bad')
+        showToast(`${kind}任务创建失败：${error.message}`, 'bad')
       }
     }
-    return { q, favoriteFilter, tagFilter, expanded, sortState, columns, sortedJobs, deriveJobTags,
-      setSort, ariaSort, toggleExpanded, toggleFavorite, excludeJob, runScore }
+    return { store, q, favoriteFilter, tagFilter, expanded, sortState, columns, sortedJobs, taskSummary,
+      deriveJobTags, workflowLabel, scoreLabel, setSort, ariaSort, toggleExpanded, toggleFavorite, excludeJob, runScore }
   },
   template: `
   <div>
-    <header class="page-head"><div><div class="eyebrow">岗位池</div><h1>岗位列表</h1><p>共 {{sortedJobs.length}} 个符合条件的岗位</p></div><div class="row"><button @click="runScore('匹配度评分')">匹配度评分</button><button class="primary" @click="runScore('岗位评分')">岗位评分</button></div></header>
+    <header class="page-head"><div><div class="eyebrow">岗位池</div><h1>岗位列表</h1><p>共 {{sortedJobs.length}} 个符合条件的岗位</p></div><div class="row scoring-controls"><label class="inline-select"><span>当前简历</span><select v-model.number="store.selectedResumeId"><option v-for="resume in store.resumes" :key="resume.id" :value="resume.id">{{resume.name}}</option></select></label><button @click="runScore('匹配度评分')">匹配度评分</button><button class="primary" @click="runScore('岗位评分')">岗位评分</button></div></header>
+    <div v-if="taskSummary.visible" class="ai-task-progress" :class="{done:!taskSummary.running}"><div><b>{{taskSummary.label}}</b><span>动态并发 {{taskSummary.effective}} / {{taskSummary.max}}</span></div><div class="progress"><i :style="{width:taskSummary.percent+'%'}"></i></div><strong>{{taskSummary.completed}} / {{taskSummary.total}}</strong><small v-if="taskSummary.failures">{{taskSummary.failures}} 个失败，可重新评分</small></div>
     <div class="filterbar"><input v-model="q" aria-label="搜索岗位或公司" placeholder="搜索岗位、公司或地点"><select v-model="tagFilter" aria-label="岗位标签"><option value="all">全部标签</option><option value="headhunter">猎头</option><option value="weekend">双休</option><option value="benefits">福利</option></select><select v-model="favoriteFilter" aria-label="收藏状态"><option value="all">全部岗位</option><option value="only">仅收藏</option><option value="exclude">未收藏</option></select><span class="filter-result">{{sortedJobs.length}} 条结果</span></div>
     <div class="table-wrap">
       <table class="jobs-table">
@@ -1227,16 +1410,16 @@ const JobsView = {
         <tbody>
           <template v-for="job in sortedJobs" :key="job.job_key">
             <tr class="job-row" :class="{open:expanded===job.job_key}" tabindex="0" @click="toggleExpanded(job)" @keyup.enter="toggleExpanded(job)">
-              <td data-label="岗位"><div class="job-title"><span class="chevron"></span><div><b>{{job.title}}</b><p>{{job.location}}</p><div class="tag-line"><span v-for="tag in deriveJobTags(job)" :key="tag.key" class="tag" :class="tag.tone">{{tag.label}}</span><span v-if="job.favorite" class="tag neutral">已收藏</span><span v-if="job.contacted" class="tag blue">已打招呼</span><span v-if="job.applied" class="tag ok">已投递</span><span v-if="job.interviewed" class="tag warn">已面试</span></div></div></div></td>
+              <td data-label="岗位"><div class="job-title"><span class="chevron"></span><div><b>{{job.title}}</b><p>{{job.location}}</p><div class="tag-line"><span v-for="tag in deriveJobTags(job)" :key="tag.key" class="tag" :class="tag.tone">{{tag.label}}</span><span v-if="job.favorite" class="tag neutral">已收藏</span><span class="tag blue">{{workflowLabel(job)}}</span></div></div></div></td>
               <td data-label="公司"><b>{{job.company || '公司信息保密'}}</b><p>{{job.industry}} · {{job.scale || '规模未知'}}</p></td>
               <td data-label="薪资" class="nowrap"><b>{{job.salary}}</b></td>
               <td data-label="经验 / 学历"><b>{{job.experience}}</b><p>{{job.degree}}</p></td>
-              <td data-label="岗位评分" class="score">{{job.job_score ?? '—'}}</td>
-              <td data-label="匹配度评分" class="score accent-score">{{job.match_score ?? '—'}}</td>
+              <td data-label="岗位评分" class="score" :class="{'score-pending':scoreLabel(job,'job_score','jobs')==='评分中'}">{{scoreLabel(job,'job_score','jobs')}}</td>
+              <td data-label="匹配度评分" class="score accent-score" :class="{'score-pending':scoreLabel(job,'match_score','jobs')==='评分中'}">{{scoreLabel(job,'match_score','jobs')}}</td>
               <td data-label="P级"><span class="priority" :class="String(job.priority||'').toLowerCase()">{{job.priority}}</span></td>
               <td data-label="活跃时间"><b>{{job.active}}</b><p>{{(job.active_ts||'').slice(0,10) || '—'}}</p></td>
             </tr>
-            <tr v-if="expanded===job.job_key" class="detail-row"><td colspan="8"><div class="job-detail"><div class="detail-toolbar"><button :class="{primary:job.favorite}" @click.stop="toggleFavorite(job)">{{job.favorite?'取消收藏':'添加收藏'}}</button><button @click.stop="excludeJob(job)">不再显示</button></div><div class="detail-meta"><div><span>岗位评分</span><b>{{job.job_score ?? '—'}}</b></div><div><span>匹配度</span><b>{{job.match_score ?? '—'}}</b></div><div><span>优先级</span><b>{{job.priority || '—'}}</b></div><div><span>来源关键词</span><b>{{job.source_keyword}}</b></div></div><h3>职位描述（JD）</h3><p class="jd-copy">{{job.jd}}</p></div></td></tr>
+            <tr v-if="expanded===job.job_key" class="detail-row"><td colspan="8"><div class="job-detail"><div class="detail-toolbar"><button :class="{primary:job.favorite}" @click.stop="toggleFavorite(job)">{{job.favorite?'取消收藏':'添加收藏'}}</button><button @click.stop="excludeJob(job)">不再显示</button></div><div class="detail-meta"><div><span>岗位评分</span><b>{{scoreLabel(job,'job_score','jobs')}}</b></div><div><span>匹配度</span><b>{{scoreLabel(job,'match_score','jobs')}}</b></div><div><span>优先级</span><b>{{job.priority || '—'}}</b></div><div><span>来源关键词</span><b>{{job.source_keyword}}</b></div></div><h3>职位描述（JD）</h3><p class="jd-copy">{{job.jd}}</p></div></td></tr>
           </template>
         </tbody>
       </table>
@@ -1253,6 +1436,7 @@ const JobCardView = {
     const selectedKeys = ref([])
     const initial = store.jobs.find(job => job.favorite && !job.excluded)
     const activeKey = ref(initial ? initial.job_key : '')
+    const taskSummary = computed(() => aiSummary('workbench'))
     const interview = reactive({
       open: false, busy: false, sessionId: null, jobKey: '', totalQuestions: 0,
       questionIndex: 0, currentQuestion: '', answers: [], input: '', report: null, canFinish: false,
@@ -1260,11 +1444,11 @@ const JobCardView = {
     const jobs = computed(() => store.jobs.filter(job => {
       if (!job.favorite || job.excluded) return false
       if (query.value && !`${job.title}${job.company}`.toLowerCase().includes(query.value.toLowerCase())) return false
-      if (statusFilter.value === 'pending' && (job.analysisReady || job.greeting)) return false
       if (statusFilter.value === 'generated' && !job.greeting) return false
-      if (statusFilter.value === 'contacted' && !job.contacted) return false
-      if (statusFilter.value === 'applied' && !job.applied) return false
-      if (statusFilter.value === 'interviewed' && !job.interviewed) return false
+      const latestStage = job.offered ? 'offered' : job.interviewed ? 'interviewed'
+        : job.applied ? 'applied' : job.contacted ? 'contacted' : 'pending'
+      if (['pending', 'contacted', 'applied', 'interviewed', 'offered'].includes(statusFilter.value)
+          && latestStage !== statusFilter.value) return false
       if (statusFilter.value === 'failed' && !job.actionError) return false
       return true
     }))
@@ -1292,60 +1476,79 @@ const JobCardView = {
       } catch (error) { showToast(`打开 BOSS 失败：${error.message}`, 'bad') }
     }
     async function setWorkflowStage(job, stage) {
+      const pending = stage === 'pending'
       const property = stage === 'contacted' ? 'contacted' : stage
-      const backendStage = stage === 'contacted' ? 'greeted' : stage
+      const backendStage = pending ? 'greeted' : (stage === 'contacted' ? 'greeted' : stage)
       try {
         const result = await apiClient.jobs.workflow(job.job_key, {
-          stage: backendStage, enabled: !job[property], resume_id: store.selectedResumeId,
+          stage: backendStage, enabled: pending ? false : !job[property], resume_id: store.selectedResumeId,
         })
         job.contacted = Boolean(result.greeted)
         job.applied = Boolean(result.applied)
         job.interviewed = Boolean(result.interviewed)
+        job.offered = Boolean(result.offered)
         showToast(`岗位状态已更新为「${workflowLabel(job)}」`, 'info')
       } catch (error) { showToast(`岗位状态更新失败：${error.message}`, 'bad') }
     }
     async function generateAnalysis(job, silent = false) {
-      if (!silent) showToast('正在生成岗位分析…', 'info')
       try {
-        const result = await apiClient.jobs.scoreMatch({
-          resume_id: store.selectedResumeId, job_keys: [job.job_key], limit: 1, force: true,
-        })
-        if (result.failed && result.failed.length) throw new ApiError(result.failed[0].error || '岗位分析失败')
-        await refreshJobDetail(job.job_key)
+        const result = await enqueueAi('workbench', 'analysis', [job.job_key], true)
         job.actionError = ''
-        if (!silent) showToast('岗位分析与应聘建议已生成')
-        return job
+        job.actionErrorType = ''
+        if (!silent) showToast(result.added ? '岗位分析已加入生成队列' : '该岗位正在生成分析', 'info')
+        return result
       } catch (error) {
         job.actionError = error.message
+        job.actionErrorType = 'analysis'
         if (!silent) showToast(`岗位分析失败：${error.message}`, 'bad')
         throw error
       }
     }
     async function generateGreeting(job, silent = false) {
-      if (!silent) showToast('正在生成招呼语…', 'info')
       try {
-        const result = await apiClient.greetings.generate(job.job_key, store.selectedResumeId)
-        job.greetingId = result.id
-        job.greeting = (result.variants || [])[0] || ''
-        job.greetingStatus = 'draft'
+        const result = await enqueueAi('workbench', 'greeting', [job.job_key], true)
         job.actionError = ''
-        await refreshGreetings()
-        if (!silent) showToast(result.source === 'template' ? 'LLM 不可用，已使用模板生成招呼语' : '招呼语已生成', result.source === 'template' ? 'warn' : 'ok')
-        return job
+        job.actionErrorType = ''
+        if (!silent) showToast(result.added ? '招呼语已加入生成队列' : '该岗位正在生成招呼语', 'info')
+        return result
       } catch (error) {
         job.actionError = error.message
+        job.actionErrorType = 'greeting'
         if (!silent) showToast(`招呼语生成失败：${error.message}`, 'bad')
         throw error
       }
     }
     async function saveGreeting(job, silent = false) {
       if (!job.greetingId || !job.greeting.trim()) throw new ApiError('请先生成并填写招呼语')
-      await apiClient.greetings.approve(job.greetingId, job.greeting.trim())
+      await apiClient.greetings.approve(job.greetingId, Number(job.greetingSelectedIndex || 0), job.greeting.trim())
       job.greetingStatus = 'approved'
       if (!silent) showToast('招呼语已保存并批准')
     }
+    function selectGreetingVariant(job, index) {
+      job.greetingSelectedIndex = Number(index)
+      job.greeting = (job.greetingVariants || [])[index] || ''
+    }
+    async function copyAndOpenBoss(job) {
+      if (!job.greeting || !job.greeting.trim()) { showToast('请先生成招呼语', 'warn'); return }
+      try {
+        await navigator.clipboard.writeText(job.greeting.trim())
+        await apiClient.jobs.openBoss(job.job_key)
+        showToast('招呼语已复制，并已在沟通号 Chrome 打开 BOSS', 'info')
+      } catch (error) { showToast(`复制并打开 BOSS 失败：${error.message}`, 'bad') }
+    }
+    async function waitForTaskIds(ids, timeoutMs = 600000) {
+      const wanted = new Set(ids)
+      const deadline = Date.now() + timeoutMs
+      while (Date.now() < deadline) {
+        const snapshot = await apiClient.ai.status('workbench')
+        applyAiSnapshot('workbench', snapshot, true)
+        const tasks = snapshot.tasks.filter(task => wanted.has(task.id))
+        if (tasks.length === wanted.size && tasks.every(task => AI_TERMINAL.has(task.status))) return tasks
+        await new Promise(resolve => window.setTimeout(resolve, 700))
+      }
+      throw new ApiError('等待招呼语生成超时，请稍后重试')
+    }
     async function executeBatch(type, explicitKeys = null) {
-      if (store.batch.running) return
       const keys = explicitKeys || selectedKeys.value
       const targets = keys.map(key => store.jobs.find(job => job.job_key === key)).filter(Boolean)
       if (!targets.length) { showToast('请先选择岗位', 'warn'); return }
@@ -1359,32 +1562,45 @@ const JobCardView = {
         tone: type === 'auto' ? 'danger' : 'primary',
       })
       if (!accepted) return
-      Object.assign(store.batch, { running: true, type, label: labels[type], done: 0, total: targets.length, failures: [] })
-      for (let index = 0; index < targets.length; index++) {
-        const job = targets[index]
+      if (type === 'analysis' || type === 'greeting') {
         try {
-          if (type === 'analysis') await generateAnalysis(job, true)
-          else if (type === 'greeting') await generateGreeting(job, true)
-          else {
-            if (!job.greetingId || !job.greeting) await generateGreeting(job, true)
-            await saveGreeting(job, true)
-          }
-          job.actionError = ''
-        } catch (error) {
-          job.actionError = error.message
-          store.batch.failures.push(job.job_key)
-        }
-        store.batch.done = index + 1
+          const result = await enqueueAi('workbench', type, targets.map(job => job.job_key), true)
+          showToast(result.added ? `${result.added} 个岗位已加入${labels[type]}队列` : '所选岗位已在生成队列中', 'info')
+          if (!explicitKeys) selectedKeys.value = []
+        } catch (error) { showToast(`${labels[type]}任务创建失败：${error.message}`, 'bad') }
+        return
       }
-      if (type === 'auto' && store.batch.failures.length < targets.length) {
-        try {
-          const result = await apiClient.greetings.sendBatch(keys)
+      if (store.batch.running) return
+      Object.assign(store.batch, { running: true, type, label: labels[type], done: 0, total: targets.length, failures: [] })
+      try {
+        const missing = targets.filter(job => !job.greetingId || !job.greeting)
+        if (missing.length) {
+          const queued = await enqueueAi('workbench', 'greeting', missing.map(job => job.job_key), true)
+          const taskIds = (queued.tasks || []).map(task => task.id)
+          const completed = await waitForTaskIds(taskIds)
+          completed.filter(task => task.status !== 'succeeded').forEach(task => store.batch.failures.push(task.job_key))
+          await Promise.allSettled([refreshGreetings(), refreshJobs()])
+        }
+        for (const [index, original] of targets.entries()) {
+          const job = store.jobs.find(item => item.job_key === original.job_key) || original
+          if (store.batch.failures.includes(job.job_key)) continue
+          try { await saveGreeting(job, true) }
+          catch (error) {
+            job.actionError = error.message
+            job.actionErrorType = 'greeting'
+            store.batch.failures.push(job.job_key)
+          }
+          store.batch.done = index + 1
+        }
+        const sendKeys = keys.filter(key => !store.batch.failures.includes(key))
+        if (sendKeys.length) {
+          const result = await apiClient.greetings.sendBatch(sendKeys)
           if (result && result.ok === false) throw new ApiError(result.error || '发送队列启动失败')
           store.sendStatus = await apiClient.greetings.sendStatus()
-        } catch (error) {
-          showToast(`发送队列启动失败：${error.message}`, 'bad')
-          store.batch.failures.push('send-batch')
         }
+      } catch (error) {
+        showToast(`自动打招呼启动失败：${error.message}`, 'bad')
+        store.batch.failures.push('send-batch')
       }
       store.batch.running = false
       const failed = store.batch.failures.length
@@ -1392,6 +1608,9 @@ const JobCardView = {
       showToast(type === 'auto' && !failed ? '招呼语已交给后端护栏队列处理' : failed ? `处理完成，成功 ${success} 个，失败 ${failed} 个` : `${labels[type]}已完成`, failed ? 'warn' : 'ok')
       await Promise.allSettled([refreshGreetings(), refreshJobs(), refreshDashboard()])
       if (!explicitKeys) selectedKeys.value = []
+    }
+    function retryFailed(job) {
+      return job.actionErrorType === 'greeting' ? generateGreeting(job) : generateAnalysis(job)
     }
     async function removeFavorite(job) {
       try {
@@ -1450,41 +1669,45 @@ const JobCardView = {
     watch(() => jobs.value[0] && jobs.value[0].job_key, key => {
       if (key && !activeKey.value) selectJob(jobs.value[0])
     }, { immediate: true })
-    return { store, query, statusFilter, selectedKeys, activeKey, interview, jobs, activeJob, allSelected,
-      deriveJobTags, workflowLabel, selectJob, toggleAll, openBoss, setWorkflowStage, generateAnalysis, generateGreeting, executeBatch,
-      saveGreeting, removeFavorite, startInterview, submitAnswer, closeInterview }
+    const activeAnalysisTask = job => job ? aiTaskFor('workbench', job.job_key, ['analysis']) : null
+    const activeGreetingTask = job => job ? aiTaskFor('workbench', job.job_key, ['greeting']) : null
+    return { store, query, statusFilter, selectedKeys, activeKey, interview, jobs, activeJob, allSelected, taskSummary,
+      deriveJobTags, workflowLabel, scoreLabel, renderMarkdown, activeAnalysisTask, activeGreetingTask,
+      selectJob, toggleAll, openBoss, setWorkflowStage, generateAnalysis, generateGreeting, executeBatch,
+      saveGreeting, selectGreetingVariant, copyAndOpenBoss, retryFailed, removeFavorite, startInterview, submitAnswer, closeInterview }
   },
   template: `
   <div>
-    <header class="page-head workbench-head"><div><div class="eyebrow">候选岗位</div><h1>收藏工作台</h1><p>在同一视图完成分析、准备与沟通演练</p></div><select v-model.number="store.selectedResumeId" aria-label="当前简历"><option v-for="resume in store.resumes" :key="resume.id" :value="resume.id">{{resume.name}}</option></select></header>
+    <header class="page-head workbench-head"><div><div class="eyebrow">候选岗位</div><h1>收藏工作台</h1><p>在同一视图完成分析、准备与沟通演练</p></div><label class="inline-select"><span>当前简历</span><select v-model.number="store.selectedResumeId" aria-label="当前简历"><option v-for="resume in store.resumes" :key="resume.id" :value="resume.id">{{resume.name}}</option></select></label></header>
     <div class="batch-toolbar">
       <label class="check"><input type="checkbox" :checked="allSelected" @change="toggleAll"> 全选当前岗位</label>
       <span class="selection-count">已选 {{selectedKeys.length}} 个</span><span class="grow"></span>
-      <button :disabled="!selectedKeys.length || store.batch.running" @click="executeBatch('analysis')">生成分析</button>
-      <button :disabled="!selectedKeys.length || store.batch.running" @click="executeBatch('greeting')">生成招呼语</button>
+      <button :disabled="!selectedKeys.length" @click="executeBatch('analysis')">生成分析</button>
+      <button :disabled="!selectedKeys.length" @click="executeBatch('greeting')">生成招呼语</button>
       <button class="primary" :disabled="!selectedKeys.length || store.batch.running" @click="executeBatch('auto')">自动打招呼</button>
     </div>
-    <div v-if="store.batch.running || store.batch.total" class="batch-progress" :class="{done:!store.batch.running}"><span>{{store.batch.running ? store.batch.label + '处理中' : '最近批量操作已结束'}}</span><div class="progress"><i :style="{width:(store.batch.total?store.batch.done/store.batch.total*100:0)+'%'}"></i></div><b>{{store.batch.done}} / {{store.batch.total}}</b><small v-if="store.batch.failures.length">{{store.batch.failures.length}} 个待重试</small></div>
+    <div v-if="taskSummary.visible" class="ai-task-progress" :class="{done:!taskSummary.running}"><div><b>{{taskSummary.label}}</b><span>动态并发 {{taskSummary.effective}} / {{taskSummary.max}}</span></div><div class="progress"><i :style="{width:taskSummary.percent+'%'}"></i></div><strong>{{taskSummary.completed}} / {{taskSummary.total}}</strong><small v-if="taskSummary.failures">{{taskSummary.failures}} 个失败，可在岗位内重新生成</small></div>
+    <div v-if="store.batch.running" class="batch-progress"><span>{{store.batch.label}}处理中</span><div class="progress"><i :style="{width:(store.batch.total?store.batch.done/store.batch.total*100:0)+'%'}"></i></div><b>{{store.batch.done}} / {{store.batch.total}}</b><small v-if="store.batch.failures.length">{{store.batch.failures.length}} 个待重试</small></div>
     <div class="workbench-layout">
       <aside class="workbench-list">
-        <div class="workbench-filters"><input v-model="query" placeholder="搜索收藏岗位" aria-label="搜索收藏岗位"><select v-model="statusFilter" aria-label="处理状态"><option value="all">全部状态</option><option value="pending">待准备</option><option value="generated">已生成招呼语</option><option value="contacted">已打招呼</option><option value="applied">已投递</option><option value="interviewed">已面试</option><option value="failed">处理失败</option></select></div>
+        <div class="workbench-filters"><input v-model="query" placeholder="搜索收藏岗位" aria-label="搜索收藏岗位"><select v-model="statusFilter" aria-label="求职状态"><option value="all">全部状态</option><option value="pending">待开始</option><option value="generated">已生成招呼语</option><option value="contacted">已打招呼</option><option value="applied">已投递</option><option value="interviewed">已面试</option><option value="offered">OFFER</option><option value="failed">处理失败</option></select></div>
         <div class="workbench-scroll">
           <button v-for="job in jobs" :key="job.job_key" class="workbench-job" :class="{active:activeJob&&activeJob.job_key===job.job_key}" @click="selectJob(job)">
             <span class="workbench-check" @click.stop><input type="checkbox" :value="job.job_key" v-model="selectedKeys" :aria-label="'选择 ' + job.title"></span>
             <span class="workbench-copy"><b>{{job.title}}</b><small>{{job.company || '公司信息保密'}} · {{job.salary}}</small><span class="tag-line"><span v-for="tag in deriveJobTags(job)" :key="tag.key" class="tag" :class="tag.tone">{{tag.label}}</span><span class="tag neutral">{{workflowLabel(job)}}</span></span></span>
-            <strong>{{job.match_score ?? '—'}}</strong>
+            <strong :class="{'score-pending':scoreLabel(job,'match_score','workbench')==='评分中'}">{{scoreLabel(job,'match_score','workbench')}}</strong>
           </button>
           <div v-if="!jobs.length" class="empty"><b>当前筛选无岗位</b></div>
         </div>
       </aside>
       <section v-if="activeJob" class="workbench-detail">
         <div class="detail-hero"><div><div class="tag-line"><span v-for="tag in deriveJobTags(activeJob)" :key="tag.key" class="tag" :class="tag.tone">{{tag.label}}</span></div><h2>{{activeJob.title}}</h2><p>{{activeJob.company || '公司信息保密'}} · {{activeJob.location}} · {{activeJob.salary}} · {{activeJob.experience}}</p></div><div class="row"><button @click="openBoss(activeJob)">打开 BOSS</button><button @click="startInterview(activeJob)">模拟面试</button><button @click="removeFavorite(activeJob)">取消收藏</button></div></div>
-        <section class="workflow-status"><div><h3>求职状态</h3><p>点击即可手动更新，后续阶段会自动补齐前置状态</p></div><div class="workflow-actions"><button :class="{active:activeJob.contacted}" @click="setWorkflowStage(activeJob,'contacted')"><span>{{activeJob.contacted?'✓':'1'}}</span>已打招呼</button><button :class="{active:activeJob.applied}" @click="setWorkflowStage(activeJob,'applied')"><span>{{activeJob.applied?'✓':'2'}}</span>已投递</button><button :class="{active:activeJob.interviewed}" @click="setWorkflowStage(activeJob,'interviewed')"><span>{{activeJob.interviewed?'✓':'3'}}</span>已面试</button></div></section>
-        <div class="score-overview"><div><span>岗位评分</span><strong>{{activeJob.job_score}}</strong><small>岗位本身质量</small></div><div><span>匹配度评分</span><strong>{{activeJob.match_score}}</strong><small>当前简历匹配</small></div><div><span>优先级</span><strong>{{activeJob.priority}}</strong><small>{{activeJob.active}}</small></div></div>
+        <section class="workflow-status"><div><h3>求职状态</h3><p>选择当前阶段，推进时自动补齐前置状态</p></div><div class="workflow-actions five"><button :class="{active:!activeJob.contacted&&!activeJob.applied&&!activeJob.interviewed&&!activeJob.offered}" @click="setWorkflowStage(activeJob,'pending')"><span>0</span>待开始</button><button :class="{active:activeJob.contacted&&!activeJob.applied}" @click="setWorkflowStage(activeJob,'contacted')"><span>1</span>已打招呼</button><button :class="{active:activeJob.applied&&!activeJob.interviewed}" @click="setWorkflowStage(activeJob,'applied')"><span>2</span>已投递</button><button :class="{active:activeJob.interviewed&&!activeJob.offered}" @click="setWorkflowStage(activeJob,'interviewed')"><span>3</span>已面试</button><button :class="{active:activeJob.offered}" @click="setWorkflowStage(activeJob,'offered')"><span>4</span>OFFER</button></div></section>
+        <div class="score-overview"><div><span>岗位评分</span><strong :class="{'score-pending':scoreLabel(activeJob,'job_score','workbench')==='评分中'}">{{scoreLabel(activeJob,'job_score','workbench')}}</strong><small>岗位本身质量</small></div><div><span>匹配度评分</span><strong :class="{'score-pending':scoreLabel(activeJob,'match_score','workbench')==='评分中'}">{{scoreLabel(activeJob,'match_score','workbench')}}</strong><small>当前简历匹配</small></div><div><span>优先级</span><strong>{{activeJob.priority || '未评分'}}</strong><small>{{activeJob.active}}</small></div></div>
         <section class="detail-section"><div class="section-title"><div><h3>职位描述（JD）</h3><p>{{activeJob.industry}} · {{activeJob.scale || '规模未知'}}</p></div></div><p class="jd-copy">{{activeJob.jd}}</p></section>
-        <section class="detail-section"><div class="section-title"><div><h3>招呼语</h3><p>按当前简历生成，可继续编辑</p></div><button v-if="!activeJob.greeting" @click="generateGreeting(activeJob)">生成招呼语</button></div><textarea v-if="activeJob.greeting" v-model="activeJob.greeting" class="greeting-editor"></textarea><div v-else class="inline-empty">尚未生成招呼语</div><div v-if="activeJob.greeting" class="section-actions"><span>{{activeJob.greeting.length}} 字 · {{activeJob.greetingStatus==='approved'?'已批准':'草稿'}}</span><div class="row"><button @click="saveGreeting(activeJob)">保存并批准</button><button class="primary" @click="executeBatch('auto',[activeJob.job_key])">自动打招呼</button></div></div></section>
-        <section class="detail-section"><div class="section-title"><div><h3>AI 应聘建议</h3><p>结合岗位要求与当前简历</p></div><button v-if="!activeJob.analysisReady" @click="generateAnalysis(activeJob)">生成分析</button></div><p v-if="activeJob.advice" class="advice-copy">{{activeJob.advice}}</p><div v-else class="inline-empty">等待生成岗位分析与应聘建议</div></section>
-        <div v-if="activeJob.actionError" class="notice bad"><b>上次处理失败</b><span>{{activeJob.actionError}}</span><button @click="executeBatch('auto',[activeJob.job_key])">重试</button></div>
+        <section class="detail-section"><div class="section-title"><div><h3>招呼语</h3><p>按当前简历生成，可在三版之间切换并继续编辑</p></div><button v-if="!activeJob.greeting && !activeGreetingTask(activeJob)" @click="generateGreeting(activeJob)">生成招呼语</button></div><div v-if="activeGreetingTask(activeJob)" class="generation-stream"><span class="spinner"></span><div><b>正在生成招呼语</b><p>{{activeGreetingTask(activeJob).message || '任务已进入队列，生成内容将实时返回'}}</p></div></div><template v-else-if="activeJob.greeting"><div class="variant-tabs" role="tablist"><button v-for="(variant,index) in activeJob.greetingVariants" :key="index" :class="{active:Number(activeJob.greetingSelectedIndex)===index}" role="tab" @click="selectGreetingVariant(activeJob,index)">{{activeJob.greetingLabels[index] || ('版本 ' + (index+1))}}</button></div><textarea v-model="activeJob.greeting" class="greeting-editor"></textarea></template><div v-else class="inline-empty">尚未生成招呼语</div><div v-if="activeJob.greeting && !activeGreetingTask(activeJob)" class="section-actions"><span>{{activeJob.greeting.length}} 字 · {{activeJob.greetingStatus==='approved'?'已批准':'草稿'}}</span><div class="row"><button @click="saveGreeting(activeJob)">保存并批准</button><button @click="copyAndOpenBoss(activeJob)">复制并打开 BOSS</button><button class="primary" @click="executeBatch('auto',[activeJob.job_key])">自动打招呼</button></div></div></section>
+        <section class="detail-section"><div class="section-title"><div><h3>应聘建议</h3><p>结合岗位要求与当前简历，按重点分段呈现</p></div><button v-if="!activeJob.analysisReady && !activeAnalysisTask(activeJob)" @click="generateAnalysis(activeJob)">生成分析</button></div><div v-if="activeAnalysisTask(activeJob)" class="generation-stream"><span class="spinner"></span><div><b>正在生成分析</b><p>{{activeAnalysisTask(activeJob).message || '正在读取 JD 与当前简历'}}</p></div></div><div v-else-if="activeJob.advice" class="advice-copy markdown-body" v-html="renderMarkdown(activeJob.advice)"></div><div v-else class="inline-empty">等待生成岗位分析与应聘建议</div></section>
+        <div v-if="activeJob.actionError" class="notice bad"><b>上次处理失败</b><span>{{activeJob.actionError}}</span><button @click="retryFailed(activeJob)">重新生成</button></div>
       </section>
       <section v-else class="workbench-detail empty large"><b>选择一个收藏岗位查看详情</b></section>
     </div>
@@ -1544,7 +1767,7 @@ const AccountsView = {
         <header><div><span class="account-icon">{{account.label.slice(0,1)}}</span><div><h2>{{account.label}}</h2><p>{{account.description}}</p></div></div><span class="status-badge" :class="account.running?'running':'paused'">{{account.running?'运行中':'未启动'}}</span></header>
         <dl><div><dt>调试端口</dt><dd>{{account.port}}</dd></div><div><dt>登录状态</dt><dd :class="account.loggedIn===true?'ok':'warn'">{{account.loggedIn===true?'已登录':account.loggedIn===false?'未登录':'待检测'}}</dd></div><div><dt>上次检测</dt><dd>{{fmtTime(account.checkedAt)}}</dd></div></dl>
         <div class="tag-line"><span v-for="role in account.roles" :key="role" class="tag neutral">{{role}}</span></div>
-        <footer><button :disabled="busy" @click="accountAction(account,'launch')">启动</button><button :disabled="busy" @click="accountAction(account,'login')">打开登录页</button><button :disabled="busy" @click="accountAction(account,'check')">{{busy===account.key+'-check'?'检测中…':'检测登录态'}}</button><button :disabled="busy || !account.running" @click="accountAction(account,'stop')">停止</button></footer>
+        <footer><button :disabled="!!busy" @click="accountAction(account,'launch')">启动</button><button :disabled="!!busy" @click="accountAction(account,'login')">打开登录页</button><button :disabled="!!busy" @click="accountAction(account,'check')">{{busy===account.key+'-check'?'检测中…':'检测登录态'}}</button><button :disabled="!!busy || !account.running" @click="accountAction(account,'stop')">停止</button></footer>
       </article>
     </div>
   </div>`,
@@ -1616,15 +1839,30 @@ const App = {
     let runtimeTimer = null
     onMounted(async () => {
       await bootstrap()
+      connectAiStreams()
       runtimeTimer = window.setInterval(refreshRuntime, 5000)
     })
-    onBeforeUnmount(() => { if (runtimeTimer) window.clearInterval(runtimeTimer) })
+    onBeforeUnmount(() => {
+      if (runtimeTimer) window.clearInterval(runtimeTimer)
+      closeAiStreams()
+    })
     watch(() => store.selectedResumeId, async (id, previous) => {
       if (!id || !previous || id === previous || store.ui.bootstrapLoading) return
       store.ui.refreshing = true
+      const cancellations = await Promise.allSettled([
+        apiClient.ai.cancel('jobs', { resume_id: previous }),
+        apiClient.ai.cancel('workbench', { resume_id: previous }),
+      ])
+      const cancelled = cancellations.reduce((total, result) => total + (
+        result.status === 'fulfilled' ? Number(result.value.cancelled || 0) : 0), 0)
+      store.aiTracking.jobs = []
+      store.aiTracking.workbench = []
+      if (cancelled) showToast(`已停止旧简历的 ${cancelled} 个生成任务`, 'info')
       const errors = await runLoaders([
         ['岗位', refreshJobs], ['招呼语', refreshGreetings], ['数据分析', refreshAnalytics],
         ['采集配置', refreshCollectConfig],
+        ['岗位生成任务', () => refreshAiTasks('jobs', false)],
+        ['工作台生成任务', () => refreshAiTasks('workbench', false)],
       ])
       store.ui.bootstrapError = errors.join('；')
       store.ui.refreshing = false

@@ -31,6 +31,14 @@ def _startup():
     get_db().commit()
 
 
+@app.on_event("shutdown")
+def _shutdown():
+    global _ai_scheduler
+    if _ai_scheduler is not None:
+        _ai_scheduler.close(wait=True, timeout=2)
+        _ai_scheduler = None
+
+
 # ── 设置 / 档案 ──────────────────────────────────────────────────
 
 @app.get("/api/settings")
@@ -106,60 +114,134 @@ def write_profile(body: ProfileIn):
     return {"ok": True, "resume": updated, "rescore": rescore}
 
 
-_resume_score_state = {"running": {}, "pending": {}, "results": {}}
-_resume_score_lock = threading.Lock()
+_ai_scheduler = None
+_ai_scheduler_lock = threading.Lock()
+_score_flights = {}
+_score_flights_lock = threading.Lock()
 
 
-def _run_resume_l2(resume_id: int, revision: int, favorite_keys: list) -> None:
+def _stream_progress(task: dict):
+    """把模型增量转换为节流后的任务事件，避免每个 token 都广播整份快照。"""
+    parts = []
+    emitted = 0
+    length = 0
+
+    def on_delta(delta: str):
+        nonlocal emitted, length
+        parts.append(delta)
+        length += len(delta)
+        if length - emitted < 240:
+            return
+        emitted = length
+        scheduler = _get_ai_scheduler()
+        scheduler.update_task(
+            task["id"], progress=min(0.9, 0.15 + length / 5000),
+            message=f"模型正在流式生成 · {length} 字",
+            partial_output="".join(parts)[-800:])
+
+    return on_delta
+
+
+def _run_score_artifact(task: dict, cancelled) -> dict:
+    """跨页面共用同一岗位评分调用；等待者复用结果，取消的所有者不会拖垮另一页。"""
+    from . import llm as llm_mod, resumes
     from .scoring import l2 as scoring_l2
-    try:
-        result = scoring_l2.run_l2(
-            limit=len(favorite_keys), only_missing=False,
-            resume_id=resume_id, job_keys=favorite_keys, force=True)
-    except Exception as e:
-        result = {"error": str(e)[:300]}
-    next_job = None
-    key = str(resume_id)
-    with _resume_score_lock:
-        _resume_score_state["results"][key] = result
-        next_job = _resume_score_state["pending"].pop(key, None)
-        if next_job:
-            _resume_score_state["running"][key] = next_job["revision"]
-        else:
-            _resume_score_state["running"].pop(key, None)
-    if next_job:
-        threading.Thread(
-            target=_run_resume_l2,
-            args=(resume_id, next_job["revision"], next_job["job_keys"]),
-            daemon=True).start()
+
+    resume_id = int(task["resume_id"])
+    revision = int(task["payload"]["resume_revision"])
+    current = resumes.get_resume(resume_id)
+    if int(current["revision"]) != revision:
+        raise llm_mod.LLMCancelledError("简历已更新，旧修订评分已取消")
+    if cancelled():
+        raise llm_mod.LLMCancelledError("评分任务已取消")
+
+    scoring_l1.run_l1(
+        force=False, resume_id=resume_id, job_keys=[task["job_key"]])
+    claim = (task["job_key"], resume_id, revision)
+    while True:
+        with _score_flights_lock:
+            flight = _score_flights.get(claim)
+            owner = flight is None
+            if owner:
+                flight = {"event": threading.Event(), "result": None, "error": None}
+                _score_flights[claim] = flight
+        if owner:
+            try:
+                result = scoring_l2.score_job_llm(
+                    task["job_key"], resume_id=resume_id,
+                    force=bool(task["payload"].get("force", True)),
+                    on_delta=_stream_progress(task), cancelled=cancelled)
+                flight["result"] = result
+                return result
+            except Exception as error:
+                flight["error"] = error
+                raise
+            finally:
+                with _score_flights_lock:
+                    _score_flights.pop(claim, None)
+                flight["event"].set()
+
+        while not flight["event"].wait(0.1):
+            if cancelled():
+                raise llm_mod.LLMCancelledError("评分任务已取消")
+        if flight["result"] is not None:
+            return flight["result"]
+        if isinstance(flight["error"], llm_mod.LLMCancelledError) and not cancelled():
+            continue
+        raise flight["error"] or llm_mod.LLMError("评分任务未返回结果")
 
 
-def _schedule_resume_l2(resume: dict, favorite_keys: list) -> str:
-    key = str(resume["id"])
-    payload = {"revision": resume["revision"], "job_keys": list(favorite_keys)}
-    start_now = False
-    with _resume_score_lock:
-        if key in _resume_score_state["running"]:
-            # 同一简历再次更新时只保留最新修订，当前任务结束后串行补跑。
-            _resume_score_state["pending"][key] = payload
-            return "queued"
-        _resume_score_state["running"][key] = resume["revision"]
-        start_now = True
-    if start_now:
-        threading.Thread(
-            target=_run_resume_l2,
-            args=(resume["id"], resume["revision"], favorite_keys), daemon=True).start()
-    return "started"
+def _run_ai_task(task: dict, cancelled):
+    from . import greeting, llm as llm_mod, resumes
+    resume = resumes.get_resume(int(task["resume_id"]))
+    revision = int(task["payload"].get("resume_revision") or 0)
+    if resume.get("archived") or int(resume["revision"]) != revision:
+        raise llm_mod.LLMCancelledError("简历已归档或更新，生成任务已取消")
+    if task["kind"] in ("score", "analysis"):
+        return _run_score_artifact(task, cancelled)
+    if task["kind"] == "greeting":
+        return greeting.generate(
+            task["job_key"], resume_id=resume["id"],
+            fallback_on_error=not llm_mod.configured(),
+            on_delta=_stream_progress(task), cancelled=cancelled)
+    raise ValueError("不支持的 AI 任务类型")
+
+
+def _get_ai_scheduler():
+    global _ai_scheduler
+    if _ai_scheduler is None:
+        with _ai_scheduler_lock:
+            if _ai_scheduler is None:
+                from .ai_tasks import AITaskScheduler
+                _ai_scheduler = AITaskScheduler(_run_ai_task, max_concurrency=5)
+    return _ai_scheduler
+
+
+def _enqueue_ai(page: str, kind: str, job_keys: list, resume: dict,
+                force: bool = True) -> dict:
+    items = [{"job_key": key, "payload": {
+        "resume_revision": int(resume["revision"]), "force": bool(force),
+    }} for key in dict.fromkeys(str(key) for key in job_keys if key)]
+    return _get_ai_scheduler().enqueue_many(
+        page, kind, items, resume_id=int(resume["id"]))
 
 
 def _rescore_resume(resume: dict) -> dict:
-    """保存简历后同步重算 L1；收藏岗位 L2 在后台重评。"""
+    """保存简历后同步重算规则分；收藏岗位精评进入工作台统一队列。"""
     from . import llm as llm_mod
+    if _ai_scheduler is not None:
+        for page in ("jobs", "workbench"):
+            _ai_scheduler.cancel(page=page, resume_id=resume["id"])
     l1_result = scoring_l1.run_l1(force=True, resume_id=resume["id"])
     favorite_keys = [row["job_key"] for row in get_db().execute(
         "SELECT job_key FROM jobs WHERE favorite_at IS NOT NULL AND status='active'")]
     background = bool(favorite_keys and llm_mod.configured())
-    schedule = _schedule_resume_l2(resume, favorite_keys) if background else "not_needed"
+    if background:
+        scheduler = _get_ai_scheduler()
+        queued = _enqueue_ai("workbench", "analysis", favorite_keys, resume)
+        schedule = "started" if queued["added"] else "deduplicated"
+    else:
+        schedule = "not_needed"
     return {"l1": l1_result, "favorite_l2_background": background,
             "favorite_jobs": len(favorite_keys), "l2_schedule": schedule}
 
@@ -248,8 +330,7 @@ def resumes_rescore(resume_id: int):
 
 @app.get("/api/resume-score/status")
 def resumes_rescore_status():
-    with _resume_score_lock:
-        return {key: dict(value) for key, value in _resume_score_state.items()}
+    return _get_ai_scheduler().snapshot("workbench")
 
 
 # ── 总览与岗位用户状态 ──────────────────────────────────────────
@@ -571,7 +652,7 @@ def job_detail(job_key: str, resume_id: Optional[int] = None):
     out["application"] = applications.get_application(job_key, resume["id"])
     out["workflow"] = workflow.get_state(job_key, resume["id"])
     out.update({key: out["workflow"][key]
-                for key in ("greeted", "applied", "interviewed")})
+                for key in ("greeted", "applied", "interviewed", "offered")})
     text = f"{out.get('title', '')}\n{out.get('jd', '')}"
     out["has_weekend"] = "双休" in text
     out["has_benefits"] = any(word in text for word in (
@@ -652,6 +733,31 @@ def run_enabled(run_id: int, body: dict):
         raise HTTPException(404, str(e))
 
 
+@app.get("/api/runs/{run_id}/delete-preview")
+def run_delete_preview(run_id: int):
+    from . import collection_runs
+    try:
+        return collection_runs.preview_delete(run_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.delete("/api/runs/{run_id}")
+def run_delete(run_id: int, body: dict):
+    from . import collection_runs
+    try:
+        return collection_runs.delete_run(run_id, body.get("confirm_run_id"))
+    except ValueError as e:
+        message = str(e)
+        if "不存在" in message:
+            status = 404
+        elif "运行" in message or "暂停" in message or "补采" in message or "尚未结束" in message:
+            status = 409
+        else:
+            status = 400
+        raise HTTPException(status, message)
+
+
 @app.get("/api/runs/{run_id}/export")
 def run_export(run_id: int):
     from . import collection_runs
@@ -697,6 +803,94 @@ def run_l2(body: dict = None):
             job_keys=body.get("job_keys"), force=bool(body.get("force")))
     except (llm_mod.LLMError, ValueError) as e:
         raise HTTPException(400, str(e))
+
+
+# ── 页面级 AI 任务 ──────────────────────────────────────────────
+
+_AI_PAGE_KINDS = {"jobs": {"score"}, "workbench": {"analysis", "greeting"}}
+
+
+def _validate_ai_page_kind(page: str, kind: str = None) -> None:
+    if page not in _AI_PAGE_KINDS:
+        raise HTTPException(404, "AI 任务页面不存在")
+    if kind is not None and kind not in _AI_PAGE_KINDS[page]:
+        raise HTTPException(400, "该页面不支持此生成任务")
+
+
+@app.post("/api/ai/tasks/{page}", status_code=202)
+def ai_tasks_enqueue(page: str, body: dict):
+    from . import llm as llm_mod, resumes
+    kind = str(body.get("kind") or "")
+    # 岗位评分与匹配度来自同一次精评，统一成一个 artifact，避免重复调用。
+    if page == "jobs" and kind in ("job_score", "match_score"):
+        kind = "score"
+    _validate_ai_page_kind(page, kind)
+    raw_keys = body.get("job_keys") or []
+    if isinstance(raw_keys, str):
+        raw_keys = [raw_keys]
+    job_keys = list(dict.fromkeys(str(key) for key in raw_keys if key))
+    if not job_keys:
+        raise HTTPException(400, "请至少选择一个岗位")
+    if len(job_keys) > 500:
+        raise HTTPException(400, "单次最多加入 500 个岗位")
+    try:
+        resume = (resumes.get_resume(int(body["resume_id"]))
+                  if body.get("resume_id") else resumes.get_default_resume())
+    except (TypeError, ValueError) as e:
+        raise HTTPException(400, str(e))
+    if resume.get("archived"):
+        raise HTTPException(400, "已归档简历不能创建生成任务")
+    if kind in ("score", "analysis") and not llm_mod.configured():
+        raise HTTPException(400, "LLM 未配置：请在「设置」页填写 BYOK 信息")
+
+    rows = get_db().execute(
+        "SELECT job_key FROM jobs WHERE status='active' AND job_key IN (%s)" %
+        ",".join("?" for _ in job_keys), job_keys).fetchall()
+    existing = {row["job_key"] for row in rows}
+    missing = [key for key in job_keys if key not in existing]
+    accepted = [key for key in job_keys if key in existing]
+    if not accepted:
+        raise HTTPException(400, "所选岗位不存在或已不在当前列表")
+    result = _enqueue_ai(
+        page, kind, accepted, resume, force=bool(body.get("force", True)))
+    return {**result, "page": page, "kind": kind, "missing": missing,
+            "resume_id": resume["id"], "resume_revision": resume["revision"],
+            "snapshot": _get_ai_scheduler().snapshot(page)}
+
+
+@app.get("/api/ai/tasks/{page}")
+def ai_tasks_status(page: str):
+    _validate_ai_page_kind(page)
+    return _get_ai_scheduler().snapshot(page)
+
+
+@app.post("/api/ai/tasks/{page}/cancel")
+def ai_tasks_cancel(page: str, body: dict = None):
+    _validate_ai_page_kind(page)
+    body = body or {}
+    kind = body.get("kind")
+    if page == "jobs" and kind in ("job_score", "match_score"):
+        kind = "score"
+    if kind:
+        _validate_ai_page_kind(page, str(kind))
+    try:
+        count = _get_ai_scheduler().cancel(
+            page=page, job_key=body.get("job_key"),
+            resume_id=int(body["resume_id"]) if body.get("resume_id") else None,
+            kind=str(kind) if kind else None)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "cancelled": count,
+            "snapshot": _get_ai_scheduler().snapshot(page)}
+
+
+@app.get("/api/ai/tasks/{page}/stream")
+def ai_tasks_stream(page: str, since: Optional[int] = None):
+    _validate_ai_page_kind(page)
+    return StreamingResponse(
+        _get_ai_scheduler().event_stream(page, since_version=since),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ── AI 采集策略 ─────────────────────────────────────────────────

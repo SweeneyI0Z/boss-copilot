@@ -160,15 +160,16 @@ class FrontendUxTests(unittest.TestCase):
         self.assertIn("function setWorkflowStage", self.app)
         self.assertIn("apiClient.jobs.workflow", self.app)
         self.assertIn("function workflowLabel", self.app)
-        for text in ("已收藏", "已打招呼", "已投递", "已面试"):
+        for text in ("已收藏", "待开始", "已打招呼", "已投递", "已面试", "OFFER"):
             self.assertIn(text, self.app)
         self.assertIn('class="workflow-status"', self.app)
-        self.assertIn('v-if="job.applied"', self.app)
-        self.assertIn('v-if="job.interviewed"', self.app)
+        self.assertIn('{{workflowLabel(job)}}', self.app)
+        self.assertNotIn('v-if="job.applied"', self.app)
+        self.assertNotIn('v-if="job.interviewed"', self.app)
 
     def test_scoring_greetings_accounts_and_boss_actions_use_backend(self):
-        for call in ("apiClient.jobs.scoreJob", "apiClient.jobs.scoreMatch",
-                     "apiClient.greetings.generate", "apiClient.greetings.approve",
+        for call in ("enqueueAi('jobs'", "enqueueAi('workbench'",
+                     "apiClient.greetings.approve",
                      "apiClient.greetings.sendBatch", "apiClient.jobs.openBoss",
                      "apiClient.accounts.launch", "apiClient.accounts.login",
                      "apiClient.accounts.check", "apiClient.accounts.stop"):

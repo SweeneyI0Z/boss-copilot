@@ -100,20 +100,24 @@ class WorkflowTests(M16DatabaseTestCase):
         self.add_greeting_fact("greeting")
         self.add_application_fact("application")
         self.add_interview_fact("interview")
-        workflow.set_stage("manual", "interviewed", True, self.resume["id"])
+        workflow.set_stage("manual", "offered", True, self.resume["id"])
 
         states = workflow.states_for_jobs(
             ["greeting", "application", "interview", "manual", "greeting"],
             self.resume["id"])
 
         self.assertEqual(states["greeting"], {
-            "greeted": True, "applied": False, "interviewed": False})
+            "greeted": True, "applied": False, "interviewed": False,
+            "offered": False})
         self.assertEqual(states["application"], {
-            "greeted": True, "applied": True, "interviewed": False})
+            "greeted": True, "applied": True, "interviewed": False,
+            "offered": False})
         self.assertEqual(states["interview"], {
-            "greeted": True, "applied": True, "interviewed": True})
+            "greeted": True, "applied": True, "interviewed": True,
+            "offered": False})
         self.assertEqual(states["manual"], {
-            "greeted": True, "applied": True, "interviewed": True})
+            "greeted": True, "applied": True, "interviewed": True,
+            "offered": True})
         self.assertEqual(workflow.states_for_jobs("greeting", self.resume["id"]),
                          {"greeting": states["greeting"]})
 
@@ -123,13 +127,14 @@ class WorkflowTests(M16DatabaseTestCase):
             workflow.set_stage("flow", "greeted", True, self.resume["id"])
         with patch.object(workflow, "now_iso", return_value="2026-08-02T10:00:00+08:00"):
             advanced = workflow.set_stage(
-                "flow", "interviewed", True, self.resume["id"])
+                "flow", "offered", True, self.resume["id"])
         self.assertTrue(all(advanced[name] for name in workflow.STAGE_ORDER))
         row = get_db().execute(
             "SELECT * FROM job_workflow_states WHERE job_key='flow'").fetchone()
         self.assertEqual(row["greeted_at"], "2026-08-01T10:00:00+08:00")
         self.assertEqual(row["applied_at"], "2026-08-02T10:00:00+08:00")
         self.assertEqual(row["interviewed_at"], "2026-08-02T10:00:00+08:00")
+        self.assertEqual(row["offered_at"], "2026-08-02T10:00:00+08:00")
 
         with patch.object(workflow, "now_iso", return_value="2026-08-03T10:00:00+08:00"):
             rolled_back = workflow.set_stage(
@@ -137,17 +142,67 @@ class WorkflowTests(M16DatabaseTestCase):
         self.assertEqual(rolled_back["greeted"], True)
         self.assertEqual(rolled_back["applied"], False)
         self.assertEqual(rolled_back["interviewed"], False)
+        self.assertEqual(rolled_back["offered"], False)
         row = get_db().execute(
             "SELECT * FROM job_workflow_states WHERE job_key='flow'").fetchone()
         self.assertEqual(row["greeted_at"], "2026-08-01T10:00:00+08:00")
         self.assertIsNone(row["applied_at"])
         self.assertIsNone(row["interviewed_at"])
+        self.assertIsNone(row["offered_at"])
 
         self.add_application_fact("flow")
         effective = workflow.set_stage("flow", "greeted", False, self.resume["id"])
         self.assertTrue(effective["greeted"])
         self.assertTrue(effective["applied"])
         self.assertFalse(effective["interviewed"])
+        self.assertFalse(effective["offered"])
+
+    def test_rollback_interview_clears_offer_but_preserves_earlier_stages(self):
+        self.add_job("offer-rollback")
+        workflow.set_stage("offer-rollback", "offered", True, self.resume["id"])
+
+        state = workflow.set_stage(
+            "offer-rollback", "interviewed", False, self.resume["id"])
+
+        self.assertEqual(
+            {name: state[name] for name in workflow.STAGE_ORDER},
+            {"greeted": True, "applied": True, "interviewed": False,
+             "offered": False})
+        self.assertEqual(state["job_key"], "offer-rollback")
+        self.assertEqual(state["resume_id"], self.resume["id"])
+        self.assertTrue(state["updated_at"])
+        row = get_db().execute(
+            "SELECT * FROM job_workflow_states WHERE job_key='offer-rollback'").fetchone()
+        self.assertIsNotNone(row["greeted_at"])
+        self.assertIsNotNone(row["applied_at"])
+        self.assertIsNone(row["interviewed_at"])
+        self.assertIsNone(row["offered_at"])
+
+    def test_init_db_adds_offer_column_to_legacy_workflow_table(self):
+        self.add_job("legacy-workflow")
+        conn = get_db()
+        conn.execute("DROP TABLE job_workflow_states")
+        conn.execute(
+            "CREATE TABLE job_workflow_states ("
+            "job_key TEXT NOT NULL, resume_id INTEGER NOT NULL, greeted_at TEXT, "
+            "applied_at TEXT, interviewed_at TEXT, updated_at TEXT NOT NULL, "
+            "PRIMARY KEY(job_key,resume_id))")
+        conn.execute(
+            "INSERT INTO job_workflow_states(job_key,resume_id,greeted_at,updated_at) "
+            "VALUES('legacy-workflow',?,?,?)",
+            (self.resume["id"], "2026-08-01T10:00:00+08:00", now_iso()))
+        conn.commit()
+
+        init_db()
+        init_db()
+
+        columns = {row["name"] for row in conn.execute(
+            "PRAGMA table_info(job_workflow_states)")}
+        self.assertIn("offered_at", columns)
+        row = conn.execute(
+            "SELECT * FROM job_workflow_states WHERE job_key='legacy-workflow'").fetchone()
+        self.assertEqual(row["greeted_at"], "2026-08-01T10:00:00+08:00")
+        self.assertIsNone(row["offered_at"])
 
 
 class EnabledSourceAnalyticsTests(M16DatabaseTestCase):
