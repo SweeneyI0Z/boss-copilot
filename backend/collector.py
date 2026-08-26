@@ -5,6 +5,7 @@
 """
 import json
 import os
+import queue
 import re
 import subprocess
 import threading
@@ -149,6 +150,14 @@ def status() -> dict:
                     "status": run["status"], "stats": stats,
                     "finished_at": run["finished_at"],
                 }
+                details = stats.get("details") or {}
+                if "requested" in details:
+                    partial = details.get("partial") or {}
+                    result["progress"].update({
+                        "detail_total": int(details.get("requested") or 0),
+                        "detail_completed": int(details.get(
+                            "updated", partial.get("updated", 0)) or 0),
+                    })
     return result
 
 
@@ -403,8 +412,9 @@ def _result_path(run_id: int, task_id: int, company: bool = False) -> Path:
 
 
 def _run_scraper(args: list, timeout: int, cdp_port: int,
-                 output_path: Path = None, detail_output: Path = None) -> str:
-    """跑 scraper 子进程；输出文件由本次调用显式指定。"""
+                 output_path: Path = None, detail_output: Path = None,
+                 on_output=None, on_snapshot=None) -> str:
+    """跑 scraper 子进程；需要实时进度时流式读取输出并监听结果文件。"""
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
     output = output_path or RESULT_DIR / (
         f"boss_jobs_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json")
@@ -414,13 +424,21 @@ def _run_scraper(args: list, timeout: int, cdp_port: int,
         command.extend(["--detail-output", str(detail_output)])
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    proc = subprocess.run(command, cwd=str(SCRAPER_DIR), capture_output=True,
-                          text=True, timeout=timeout, env=env)
-    stdout = (proc.stdout or "").strip().splitlines()
-    stderr = (proc.stderr or "").strip().splitlines()
-    if proc.returncode != 0:
-        tail = " / ".join((stderr + stdout)[-12:])
-        raise RuntimeError(f"scraper 退出码 {proc.returncode}: {tail}")
+    watch_path = Path(detail_output or output) if on_snapshot else None
+    if on_output is None and on_snapshot is None:
+        proc = subprocess.run(command, cwd=str(SCRAPER_DIR), capture_output=True,
+                              text=True, timeout=timeout, env=env)
+        stdout = (proc.stdout or "").strip().splitlines()
+        stderr = (proc.stderr or "").strip().splitlines()
+        returncode = proc.returncode
+        failure_lines = stderr + stdout
+    else:
+        stdout, returncode = _run_scraper_streamed(
+            command, timeout, env, watch_path, on_output, on_snapshot)
+        failure_lines = stdout
+    if returncode != 0:
+        tail = " / ".join(failure_lines[-12:])
+        raise RuntimeError(f"scraper 退出码 {returncode}: {tail}")
     # 外部脚本为保留部分列表，会捕获某些 RuntimeError 后以 0 退出；这类结果可导入，
     # 但绝不能被当作完整来源快照执行缺失 diff。
     warnings = [line.strip() for line in stdout
@@ -430,11 +448,92 @@ def _run_scraper(args: list, timeout: int, cdp_port: int,
     return " / ".join(stdout[-3:])
 
 
+def _file_signature(path: Path):
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+def _run_scraper_streamed(command: list, timeout: int, env: dict,
+                           watch_path: Path = None, on_output=None,
+                           on_snapshot=None) -> tuple[list[str], int]:
+    """持续消费子进程输出；原子结果文件每次变化后通知调用方即时入库。"""
+    proc = subprocess.Popen(
+        command, cwd=str(SCRAPER_DIR), stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+    lines = []
+    output_queue = queue.Queue()
+    finished = object()
+    initial_signature = _file_signature(watch_path) if watch_path else None
+
+    def read_output():
+        try:
+            for raw in proc.stdout:
+                output_queue.put(raw.rstrip())
+        finally:
+            output_queue.put(finished)
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    deadline = time.monotonic() + timeout
+    signature = initial_signature
+    stream_finished = False
+    try:
+        while not stream_finished:
+            if time.monotonic() >= deadline:
+                proc.kill()
+                proc.wait()
+                raise subprocess.TimeoutExpired(command, timeout,
+                                                output="\n".join(lines))
+            try:
+                line = output_queue.get(timeout=0.2)
+            except queue.Empty:
+                line = None
+            if line is finished:
+                stream_finished = True
+            elif line is not None:
+                lines.append(line)
+                if on_output:
+                    try:
+                        on_output(line)
+                    except Exception as error:
+                        raise RuntimeError(f"处理 scraper 实时输出失败: {error}") from error
+            if watch_path and on_snapshot:
+                current = _file_signature(watch_path)
+                if current is not None and current != signature:
+                    signature = current
+                    try:
+                        on_snapshot(watch_path)
+                    except Exception as error:
+                        raise RuntimeError(f"即时导入 scraper 结果失败: {error}") from error
+        returncode = proc.wait()
+        if watch_path and on_snapshot:
+            current = _file_signature(watch_path)
+            if current is not None and current != signature:
+                try:
+                    on_snapshot(watch_path)
+                except Exception as error:
+                    raise RuntimeError(f"即时导入 scraper 结果失败: {error}") from error
+        return lines, returncode
+    except Exception:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        raise
+    finally:
+        reader.join(timeout=1)
+        if proc.stdout:
+            proc.stdout.close()
+
+
 _RISK_PATTERNS = (
     "风控", "验证码", "访问异常", "账号异常", "请求过于频繁", "操作频繁",
     "安全验证", "异常流量", "稍后再试", "403", "429",
 )
 _LOGIN_PATTERNS = ("未登录", "登录失效", "login expired", "需要登录", "请登录")
+_DETAIL_ITEM_RE = re.compile(r"^\[(\d+)/(\d+)\]\s+(.+)$")
 
 
 def classify_failure(error) -> dict:
@@ -569,31 +668,57 @@ def _run_detail_phase(run_id: int, files: list[Path], task_ids: list[int],
     detail = RESULT_DIR / f"boss_details_run{run_id}.json"
     total, source_at = _merge_list_files(files, merged, missing)
     _log(f"详情阶段: 合并 {len(files)} 个列表，{total} 个岗位缺少 JD")
+    completed = 0
+
+    def stream_output(line: str) -> None:
+        match = _DETAIL_ITEM_RE.match(line.strip())
+        if not match:
+            return
+        current = f"JD {match.group(1)}/{match.group(2)}: {match.group(3)}"
+        with _state_lock:
+            if _state["run_id"] == run_id:
+                _state["current"] = current
+        _log(current)
+
+    def import_snapshot(path: Path) -> None:
+        nonlocal completed
+        importer.import_scraper_details(str(path))
+        current_completed = total - len(_all_missing_jd(missing))
+        if current_completed > completed:
+            completed = current_completed
+            _set_progress(detail_completed=completed)
+            _log(f"JD 已入库 {completed}/{total}，岗位列表可立即查看")
+
     try:
         out = _run_scraper(["--input", str(merged), "--detail"],
                            timeout=max(900, total * 90 + 300), cdp_port=cdp_port,
-                           output_path=merged, detail_output=detail)
+                           output_path=merged, detail_output=detail,
+                           on_output=stream_output, on_snapshot=import_snapshot)
         if out:
             _log(out)
         detail_stats = importer.import_scraper_details(str(detail))
-        _set_progress(detail_completed=detail_stats["updated"])
+        completed = total - len(_all_missing_jd(missing))
+        _set_progress(detail_completed=completed)
         for task_id in task_ids:
             sync.update_run_task(task_id, "succeeded",
-                                 stats={"detail_updated": detail_stats["updated"]},
+                                 stats={"detail_updated": completed},
                                  detail_file=str(detail), finished=True)
-        report["details"] = {"requested": total, **detail_stats}
+        report["details"] = {"requested": total, **detail_stats,
+                             "updated": completed}
         return source_at, ""
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as error:
         partial = importer.import_scraper_details(str(detail)) if detail.exists() else {
             "updated": 0}
+        completed = total - len(_all_missing_jd(missing))
+        _set_progress(detail_completed=completed)
         failure = classify_failure(error)
         for task_id in task_ids:
             sync.update_run_task(task_id, "partial",
-                                 stats={"detail_updated": partial.get("updated", 0)},
+                                 stats={"detail_updated": completed},
                                  error=failure["message"], detail_file=str(detail),
                                  finished=True)
         report["details"] = {"requested": total, "partial": partial,
-                             "error": failure["message"]}
+                             "updated": completed, "error": failure["message"]}
         _log(f"详情阶段失败，已保留部分结果: {failure['message']}")
         return source_at, failure["message"] if failure["risk"] else ""
 
@@ -628,10 +753,21 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
             _log(f"列表 {index + 1}/{len(tasks)}: {label}")
             sync.update_run_task(task_id, "running")
             list_file = _result_path(run_id, task_id, task["type"] == "company")
+            live_list_count = 0
+
+            def import_list_snapshot(path: Path) -> None:
+                nonlocal live_list_count
+                live_stats = importer.import_scraper_files([path], record_run=False)
+                current_count = len(live_stats.get("job_keys") or [])
+                if current_count > live_list_count:
+                    live_list_count = current_count
+                    _log(f"{label} 已即时入库 {live_list_count} 个岗位")
+
             try:
                 out = _run_scraper(_list_args(task),
                                    timeout=task["pages"] * 150 + 300,
-                                   cdp_port=cdp_port, output_path=list_file)
+                                   cdp_port=cdp_port, output_path=list_file,
+                                   on_snapshot=import_list_snapshot)
                 if out:
                     _log(out)
                 data = _read_list(list_file)

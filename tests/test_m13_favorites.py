@@ -29,7 +29,8 @@ class M13TestCase(unittest.TestCase):
         with favorites._state_lock:
             favorites._state.update({
                 "running": False, "run_id": None, "phase": "", "current": "",
-                "page": 0, "cancel": False, "log": []})
+                "page": 0, "cancel": False, "log": [],
+                "progress": {"detail_total": 0, "detail_completed": 0}})
 
     @staticmethod
     def card(key, title="收藏工程师", company="收藏科技", salary="25-45K·15薪"):
@@ -349,15 +350,23 @@ class DetailRetryTests(M13TestCase):
                        "account_a": [self.page([self.card("d1")])]})
         self.assertEqual(favorites.missing_jd_count(), 2)
 
-        def fake_scraper(args, timeout, cdp_port, output_path=None, detail_output=None):
+        def fake_scraper(args, timeout, cdp_port, output_path=None, detail_output=None,
+                         on_output=None, on_snapshot=None):
             self.assertIsNotNone(detail_output)
             details = [{"job_link": f"https://www.zhipin.com/job_detail/d{i}.html",
                         "title": "收藏工程师", "boss_name": "收藏科技",
                         "salary": "25-45K·15薪",
                         "jd": f"岗位 d{i} 的完整职责说明。", "skill_tags": ["C语言"]}
                        for i in (1, 2)]
-            Path(detail_output).write_text(json.dumps(details, ensure_ascii=False),
-                                            encoding="utf-8")
+            partial = []
+            for index, detail in enumerate(details, 1):
+                partial.append(detail)
+                Path(detail_output).write_text(json.dumps(partial, ensure_ascii=False),
+                                                encoding="utf-8")
+                if on_output:
+                    on_output(f"[{index}/2] 收藏科技 - 收藏工程师")
+                if on_snapshot:
+                    on_snapshot(Path(detail_output))
             return "补齐完成"
         with patch.object(favorites, "time"), \
                 patch.object(favorites.cdp, "launch", return_value={"ok": True}), \
@@ -371,6 +380,45 @@ class DetailRetryTests(M13TestCase):
         row = get_db().execute(
             "SELECT jd FROM job_details WHERE job_key='d1'").fetchone()
         self.assertIn("完整职责说明", row["jd"])
+        self.assertEqual(favorites.status()["progress"]["detail_completed"], 2)
+
+    def test_retry_only_submits_jobs_still_missing_in_database(self):
+        self.run_sync({"collect": [self.page([self.card("d1"), self.card("d2")])],
+                       "account_a": []})
+        detail = Path(self.tmp.name) / "existing-detail.json"
+        detail.write_text(json.dumps([{
+            "job_link": "https://www.zhipin.com/job_detail/d1.html",
+            "title": "收藏工程师", "company": "收藏科技",
+            "salary": "25-45K·15薪", "jd": "已经存在的完整 JD",
+        }], ensure_ascii=False), encoding="utf-8")
+        importer.import_scraper_details(str(detail))
+        submitted = []
+
+        def fake_scraper(args, timeout, cdp_port, output_path=None, detail_output=None,
+                         on_output=None, on_snapshot=None):
+            payload = json.loads(Path(args[args.index("--input") + 1]).read_text(
+                encoding="utf-8"))
+            submitted.extend(job["job_link"] for job in payload["jobs"])
+            result = [{"job_link": payload["jobs"][0]["job_link"],
+                       "title": "收藏工程师", "company": "收藏科技",
+                       "salary": "25-45K·15薪", "jd": "新补齐的完整 JD"}]
+            Path(detail_output).write_text(json.dumps(result, ensure_ascii=False),
+                                            encoding="utf-8")
+            if on_snapshot:
+                on_snapshot(Path(detail_output))
+            return "补齐完成"
+
+        with patch.object(favorites.cdp, "launch", return_value={"ok": True}), \
+                patch.object(favorites, "_run_scraper", side_effect=fake_scraper):
+            result = favorites.retry_details()
+            deadline = time.time() + 5
+            while favorites._state["running"] and time.time() < deadline:
+                time.sleep(0.01)
+
+        self.assertEqual(result["missing"], 1)
+        self.assertEqual(len(submitted), 1)
+        self.assertIn("/d2.html", submitted[0])
+        self.assertEqual(favorites.missing_jd_count(), 0)
 
     def test_retry_without_snapshot_is_rejected(self):
         result = favorites.retry_details()

@@ -373,7 +373,8 @@ class FavoritePageSession:
 
 _state_lock = threading.RLock()
 _state = {"running": False, "run_id": None, "phase": "", "current": "", "page": 0,
-          "cancel": False, "log": []}
+          "cancel": False, "log": [],
+          "progress": {"detail_total": 0, "detail_completed": 0}}
 
 
 def _log(message: str) -> None:
@@ -396,6 +397,7 @@ def _snapshot() -> dict:
         return {**{key: _state[key] for key in
                    ("running", "phase", "current", "page", "run_id", "log")},
                 "cancel_requested": bool(_state["cancel"]),
+                "progress": dict(_state["progress"]),
                 "log": list(_state["log"][-40:])}
 
 
@@ -546,7 +548,8 @@ def _begin_run(accounts: list, max_pages: int) -> int:
     conn.commit()
     with _state_lock:
         _state.update({"running": True, "run_id": run_id, "phase": "account",
-                       "current": "", "page": 0, "cancel": False, "log": []})
+                       "current": "", "page": 0, "cancel": False, "log": [],
+                       "progress": {"detail_total": 0, "detail_completed": 0}})
     return run_id
 
 
@@ -687,25 +690,50 @@ def _file_keys(paths: list) -> set:
     return keys
 
 
+def _missing_jd_keys(keys: set) -> set:
+    if not keys:
+        return set()
+    rows = get_db().execute(
+        "SELECT j.job_key, j.status, d.jd FROM jobs j LEFT JOIN job_details d "
+        "ON d.job_key=j.job_key").fetchall()
+    return {row["job_key"] for row in rows
+            if row["job_key"] in keys and row["status"] != "excluded"
+            and not str(row["jd"] or "").strip()}
+
+
 def missing_jd_count(paths: list = None) -> int:
     """最近一次收藏同步中、库里仍缺 JD 的岗位数（供「补齐缺失 JD」按钮判断）。"""
     latest = _latest_run()
     if paths is None:
         paths = [path for path in (latest.get("stats", {}).get("files") or {}).values()]
     keys = _file_keys(paths)
-    if not keys:
-        return 0
-    rows = get_db().execute(
-        "SELECT j.job_key, j.status, d.jd FROM jobs j LEFT JOIN job_details d "
-        "ON d.job_key=j.job_key").fetchall()
-    return sum(1 for row in rows
-               if row["job_key"] in keys and row["status"] != "excluded"
-               and not str(row["jd"] or "").strip())
+    return len(_missing_jd_keys(keys))
 
 
 def _detail_retry_worker(run_id: int, source_run_id: int, merged: Path,
                          detail: Path, total: int) -> None:
     report = {"source_run_id": source_run_id, "retry": True}
+    target_keys = _file_keys([merged])
+    completed = 0
+
+    def stream_output(line: str) -> None:
+        match = re.match(r"^\[(\d+)/(\d+)\]\s+(.+)$", line.strip())
+        if not match:
+            return
+        current = f"JD {match.group(1)}/{match.group(2)}: {match.group(3)}"
+        _set_state(current=current)
+        _log(current)
+
+    def import_snapshot(path: Path) -> None:
+        nonlocal completed
+        importer.import_scraper_details(str(path))
+        current_completed = total - len(_missing_jd_keys(target_keys))
+        if current_completed > completed:
+            completed = current_completed
+            _set_state(progress={"detail_total": total,
+                                 "detail_completed": completed})
+            _log(f"收藏 JD 已入库 {completed}/{total}，岗位可立即查看")
+
     try:
         account = cdp.account_for("collect")
         port = cdp.config.ACCOUNTS[account]["cdp_port"]
@@ -715,10 +743,14 @@ def _detail_retry_worker(run_id: int, source_run_id: int, merged: Path,
         _set_state(phase="details", current="补齐收藏 JD")
         out = _run_scraper(["--input", str(merged), "--detail"],
                            timeout=max(900, total * 90 + 300), cdp_port=port,
-                           output_path=merged, detail_output=detail)
+                           output_path=merged, detail_output=detail,
+                           on_output=stream_output, on_snapshot=import_snapshot)
         if out:
             _log(out)
         stats = importer.import_scraper_details(str(detail))
+        completed = total - len(_missing_jd_keys(target_keys))
+        _set_state(progress={"detail_total": total, "detail_completed": completed})
+        stats["updated"] = completed
         report["details"] = stats
         _log(f"收藏 JD 补齐完成: 更新 {stats['updated']} 个")
         _finish_run(run_id, report, "succeeded")
@@ -726,6 +758,9 @@ def _detail_retry_worker(run_id: int, source_run_id: int, merged: Path,
         failure = classify_failure(error)
         partial = importer.import_scraper_details(str(detail)) if detail.exists() \
             else {"updated": 0}
+        completed = total - len(_missing_jd_keys(target_keys))
+        _set_state(progress={"detail_total": total, "detail_completed": completed})
+        partial["updated"] = completed
         report["details"] = {"partial": partial, "error": failure["message"]}
         _finish_run(run_id, report,
                     "partial" if partial.get("updated") else "failed",
@@ -745,8 +780,8 @@ def retry_details(source_run_id: int = None) -> dict:
     if not files:
         return {"ok": False, "error": "没有可用的收藏同步快照文件"}
     keys = _file_keys(files)
-    missing = missing_jd_count(files)
-    if not missing:
+    missing_keys = _missing_jd_keys(keys)
+    if not missing_keys:
         return {"ok": False, "error": "收藏岗位没有缺失的 JD"}
     merged = Path(config.COLLECT_RESULT_DIR) / \
         f"boss_favorite_missing_run{latest['run_id']}.json"
@@ -759,7 +794,7 @@ def retry_details(source_run_id: int = None) -> dict:
             continue
         for raw in data.get("jobs") or []:
             key = _raw_key(raw)
-            if key in keys and key in seen:
+            if key not in missing_keys or key in seen:
                 continue
             seen.add(key)
             jobs.append(raw)
@@ -768,8 +803,6 @@ def retry_details(source_run_id: int = None) -> dict:
         {"keyword": "收藏补齐JD", "city": "", "filters": {}, "scraped_at": now_iso(),
          "total": len(jobs), "jobs": jobs}, ensure_ascii=False, indent=2),
         encoding="utf-8")
-    detail = Path(config.COLLECT_RESULT_DIR) / \
-        f"boss_favorite_details_run{latest['run_id']}.json"
     conn = get_db()
     run_id = conn.execute(
         "INSERT INTO collect_runs(kind,params,stats,started_at,status,phase) "
@@ -777,15 +810,18 @@ def retry_details(source_run_id: int = None) -> dict:
         (json.dumps({"source_run_id": latest["run_id"]}, ensure_ascii=False), "{}",
          now_iso())).lastrowid
     conn.commit()
+    detail = Path(config.COLLECT_RESULT_DIR) / \
+        f"boss_favorite_details_run{latest['run_id']}_retry{run_id}.json"
     with _state_lock:
         _state.update({"running": True, "run_id": run_id, "phase": "details",
                        "current": "补齐收藏 JD", "page": 0, "cancel": False,
-                       "log": []})
+                       "log": [], "progress": {"detail_total": len(jobs),
+                                                "detail_completed": 0}})
     threading.Thread(target=_detail_retry_worker,
-                     args=(run_id, latest["run_id"], merged, detail, missing),
+                     args=(run_id, latest["run_id"], merged, detail, len(jobs)),
                      daemon=True).start()
     return {"ok": True, "run_id": run_id, "source_run_id": latest["run_id"],
-            "missing": missing}
+            "missing": len(jobs)}
 
 
 def _run_files(run_id: int) -> dict:

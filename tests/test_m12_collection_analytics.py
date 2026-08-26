@@ -1,5 +1,7 @@
 """M12 测试：模块化采集、精确导入、来源关系、详情补齐与分析聚合。"""
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -294,7 +296,8 @@ class TwoPhaseCollectorTests(M12DatabaseTestCase):
         run_id = collector._begin_run("config", {"tasks": tasks}, tasks)
         calls = []
 
-        def fake_scraper(args, timeout, cdp_port, output_path=None, detail_output=None):
+        def fake_scraper(args, timeout, cdp_port, output_path=None, detail_output=None,
+                         on_output=None, on_snapshot=None):
             calls.append(list(args))
             if "--input" in args:
                 merged = json.loads(Path(args[args.index("--input") + 1]).read_text(
@@ -304,8 +307,17 @@ class TwoPhaseCollectorTests(M12DatabaseTestCase):
                             "company": job["boss_name"], "salary": job["salary"],
                             "jd": f"{job['title']} 的完整JD"}
                            for job in merged["jobs"]]
-                Path(detail_output).write_text(
-                    json.dumps(details, ensure_ascii=False), encoding="utf-8")
+                partial = []
+                for index, detail in enumerate(details, 1):
+                    partial.append(detail)
+                    Path(detail_output).write_text(
+                        json.dumps(partial, ensure_ascii=False), encoding="utf-8")
+                    if on_output:
+                        on_output(f"[{index}/{len(details)}] 公司 - {detail['title']}")
+                    if on_snapshot:
+                        on_snapshot(Path(detail_output))
+                    self.assertEqual(get_db().execute(
+                        "SELECT COUNT(*) count FROM job_details").fetchone()["count"], index)
             else:
                 keyword = args[args.index("--keyword") + 1]
                 unique = "one" if keyword == "AI" else "two"
@@ -314,6 +326,8 @@ class TwoPhaseCollectorTests(M12DatabaseTestCase):
                     "keyword": keyword, "city": "深圳", "filters": {},
                     "scraped_at": "2026-08-23T10:00:00+08:00", "jobs": jobs,
                 }, ensure_ascii=False), encoding="utf-8")
+                if on_snapshot:
+                    on_snapshot(Path(output_path))
             return "完成"
 
         with patch.object(collector.cdp, "account_for", return_value="collect"), \
@@ -334,6 +348,26 @@ class TwoPhaseCollectorTests(M12DatabaseTestCase):
         run = get_db().execute(
             "SELECT status FROM collect_runs WHERE id=?", (run_id,)).fetchone()
         self.assertEqual(run["status"], "succeeded")
+        self.assertEqual(collector.status()["progress"]["detail_completed"], 3)
+
+    def test_streamed_process_reports_lines_and_file_snapshots(self):
+        output = Path(self.tmp.name) / "stream.json"
+        lines = []
+        snapshots = []
+        code = (
+            "import pathlib,sys,time; "
+            "print('开始详情', flush=True); "
+            "pathlib.Path(sys.argv[1]).write_text('[1]', encoding='utf-8'); "
+            "print('完成一条', flush=True); time.sleep(0.3)"
+        )
+        result, returncode = collector._run_scraper_streamed(
+            [sys.executable, "-u", "-c", code, str(output)], 5,
+            os.environ.copy(), output, lines.append,
+            lambda path: snapshots.append(path.read_text(encoding="utf-8")))
+        self.assertEqual(returncode, 0)
+        self.assertEqual(result, ["开始详情", "完成一条"])
+        self.assertIn("完成一条", lines)
+        self.assertEqual(snapshots[-1], "[1]")
 
     def test_status_restores_missing_detail_retry_after_process_restart(self):
         self.insert_job("missing-jd")
