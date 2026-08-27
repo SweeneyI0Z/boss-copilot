@@ -1667,10 +1667,23 @@ const JobsView = {
       try {
         const result = await enqueueAi('jobs', kind === '岗位评分' ? 'job_score' : 'match_score', jobKeys)
         const skipped = Number(result.skipped_existing_count || 0)
-        const note = result.added
-          ? `已将 ${result.added} 个岗位加入评分队列${skipped ? `，跳过 ${skipped} 个已有评分` : ''}`
-          : skipped ? `所选 ${skipped} 个岗位均已有评分，无需重复生成` : '所选岗位已在评分队列中'
-        showToast(note, 'info')
+        const noJd = Number(result.skipped_no_jd_count || 0)
+        let note
+        if (result.added) {
+          // 无 JD 的岗位由后端直接剔除，这里把三类结果向用户讲清楚
+          const skips = [skipped ? `跳过 ${skipped} 个已有评分` : '',
+            noJd ? `${noJd} 个缺 JD` : ''].filter(Boolean).join('、')
+          note = `已将 ${result.added} 个岗位加入评分队列${skips ? `，${skips}` : ''}`
+        } else if (noJd && skipped) {
+          note = `所选岗位均不可评分：${skipped} 个已有评分、${noJd} 个缺 JD`
+        } else if (noJd) {
+          note = `所选 ${noJd} 个岗位均缺少职位描述（JD），补齐后才能参与评分`
+        } else if (skipped) {
+          note = `所选 ${skipped} 个岗位均已有评分，无需重复生成`
+        } else {
+          note = '所选岗位已在评分队列中'
+        }
+        showToast(note, result.added || !noJd ? 'info' : 'warn')
       } catch (error) {
         showToast(`${kind}任务创建失败：${error.message}`, 'bad')
       }

@@ -33,6 +33,10 @@ class PageTaskApiTests(unittest.TestCase):
         get_db().execute(
             "INSERT INTO jobs(job_key,title,company,status,first_seen_at,last_seen_at) "
             "VALUES('task-job','AI 应用工程师','示例科技','active',?,?)", (ts, ts))
+        # M23 起：无 JD 的岗位不进入评分队列，本用例夹具统一带 JD
+        get_db().execute(
+            "INSERT INTO job_details(job_key,jd,fetched_at) VALUES('task-job',?,?)",
+            ("负责核心业务模块开发", now_iso()))
         get_db().commit()
         if main._ai_scheduler is not None:
             main._ai_scheduler.close(wait=True)

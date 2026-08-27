@@ -54,12 +54,17 @@ class AiSkipCancelTests(unittest.TestCase):
 
     def add_job(self, job_key: str):
         ts = now_iso()
-        get_db().execute(
+        conn = get_db()
+        conn.execute(
             "INSERT INTO jobs(job_key,title,company,status,first_seen_at,last_seen_at) "
             "VALUES(?,?,?,'active',?,?)",
             (job_key, f"岗位 {job_key}", "示例科技", ts, ts),
         )
-        get_db().commit()
+        # M23 起：无 JD 的岗位不进入评分队列，幂等/取消语义测试统一带上 JD
+        conn.execute(
+            "INSERT INTO job_details(job_key,jd,fetched_at) VALUES(?,?,?)",
+            (job_key, f"{job_key} 职位描述：负责核心模块开发", ts))
+        conn.commit()
 
     def save_complete(self, job_key: str, *, source="llm", revision=None):
         resumes.save_job_score(

@@ -890,6 +890,15 @@ def ai_tasks_enqueue(page: str, body: dict):
                 accepted, resume["id"], resume["revision"]))
         skipped_existing = [key for key in accepted if key in completed]
         queued_keys = [key for key in accepted if key not in completed]
+    # 无 JD 的岗位缺少精评素材，不入队不耗 token；force 也绕不过（缺素材本身不可评）
+    skipped_no_jd = []
+    if kind == "score" and queued_keys:
+        jd_rows = get_db().execute(
+            "SELECT job_key, jd FROM job_details WHERE job_key IN (%s)" %
+            ",".join("?" for _ in queued_keys), queued_keys).fetchall()
+        jd_ok = {row["job_key"] for row in jd_rows if (row["jd"] or "").strip()}
+        skipped_no_jd = [key for key in queued_keys if key not in jd_ok]
+        queued_keys = [key for key in queued_keys if key in jd_ok]
     if queued_keys and kind in ("score", "analysis") and not llm_mod.configured():
         raise HTTPException(400, "LLM 未配置：请在「设置」页填写 BYOK 信息")
     result = _enqueue_ai(
@@ -897,6 +906,8 @@ def ai_tasks_enqueue(page: str, body: dict):
     return {**result, "page": page, "kind": kind, "missing": missing,
             "skipped_existing": skipped_existing,
             "skipped_existing_count": len(skipped_existing),
+            "skipped_no_jd": skipped_no_jd,
+            "skipped_no_jd_count": len(skipped_no_jd),
             "resume_id": resume["id"], "resume_revision": resume["revision"],
             "snapshot": _get_ai_scheduler().snapshot(page)}
 

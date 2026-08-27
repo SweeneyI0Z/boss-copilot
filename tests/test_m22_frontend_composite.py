@@ -35,8 +35,9 @@ class FrontendCompositeTests(unittest.TestCase):
         self.assertIn("return job[key]", self.app)
 
     def test_cache_version_is_advanced(self):
+        # M23 起版本号演进，本用例只约束不再驻留旧值，当前值由最新里程碑钉住
         self.assertNotIn("?v=m20-guide", self.index)
-        self.assertIn("app.js?v=m22-composite", self.index)
+        self.assertNotIn("?v=m22-composite", self.index)
 
 
 if __name__ == "__main__":
