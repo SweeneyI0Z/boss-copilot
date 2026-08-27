@@ -19,13 +19,15 @@ from pathlib import Path
 from . import config, importer, sync
 from .boss import cdp
 from .cities import resolve_city
-from .db import get_db, now_iso
+from .db import get_db, get_setting, now_iso
 
 SCRAPER_DIR = config.SCRAPER_DIR
 SCRAPER_PY = config.SCRAPER_PY
 SCRAPER_SCRIPT = config.SCRAPER_SCRIPT
 RESULT_DIR = config.COLLECT_RESULT_DIR
-ITEM_GAP_SEC = 120
+# 列表任务间隔秒数：None＝按设置 collect_pace 解析档位间隔（M20 默认均衡档 60s）；
+# 数值＝强制覆盖（测试用旧钩子 patch.object(collector, "ITEM_GAP_SEC", …)）。
+ITEM_GAP_SEC = None
 MAX_SEARCH_COMBINATIONS = 20
 MAX_COMPANY_PAGES = 30
 ETA_DEFAULT_LIST_SECONDS_PER_PAGE = 45.0
@@ -253,12 +255,12 @@ def _list_eta_locked(progress: dict, now: float, model: dict) -> float:
     if active_gap:
         gap_elapsed = _active_elapsed_locked(
             model.get("gap_started_at"), model.get("gap_pause_baseline", 0.0), now)
-        gap_remaining = max(0.0, float(ITEM_GAP_SEC) - gap_elapsed)
+        gap_remaining = max(0.0, task_gap_seconds() - gap_elapsed)
     gaps_total = max(0, total_tasks - 1)
     future_gaps = (0 if cancel_requested else max(
         0, gaps_total - int(model.get("gaps_completed") or 0)
         - (1 if active_gap else 0)))
-    remaining += gap_remaining + future_gaps * float(ITEM_GAP_SEC)
+    remaining += gap_remaining + future_gaps * task_gap_seconds()
 
     if _state.get("fetch_details") and not cancel_requested:
         all_pages = max(1, sum(pages))
@@ -1025,6 +1027,20 @@ def _finish_run(run_id: int, report: dict, run_status: str,
             _state_condition.notify_all()
 
 
+def resolve_collect_pace() -> dict:
+    """读设置 collect_pace 返回档位定义；未知值回退稳妥档。"""
+    default = config.DEFAULT_SETTINGS.get("collect_pace", "standard")
+    pace_key = str(get_setting("collect_pace", default))
+    return config.COLLECT_PACES.get(pace_key, config.COLLECT_PACES["standard"])
+
+
+def task_gap_seconds() -> float:
+    """列表任务间隔：显式覆盖优先（测试钩子），否则按当前档位。"""
+    if ITEM_GAP_SEC is not None:
+        return float(ITEM_GAP_SEC)
+    return float(resolve_collect_pace()["task_gap_sec"])
+
+
 def _result_path(run_id: int, task_id: int, company: bool = False) -> Path:
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
     prefix = "boss_company_jobs" if company else "boss_jobs"
@@ -1042,8 +1058,15 @@ def _run_scraper(args: list, timeout: int, cdp_port: int,
                "--cdp-port", str(cdp_port), "--output", str(output)]
     if detail_output is not None:
         command.extend(["--detail-output", str(detail_output)])
+    # 采集档位（M20）：均衡/快速档压缩 scraper 随机等待并开启重复内容早停；
+    # 稳妥档 env 为空字典、不传早停 flag＝外部脚本原生节奏。favorites 的
+    # JD 补齐复用本函数，自动跟随同一档位。
+    pace = resolve_collect_pace()
+    if pace.get("dup_stop_ratio"):
+        command.extend(["--dup-stop-ratio", f'{pace["dup_stop_ratio"]}'])
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env.update(pace["env"])
     watch_path = Path(detail_output or output) if on_snapshot else None
     if on_output is None and on_snapshot is None:
         proc = subprocess.run(command, cwd=str(SCRAPER_DIR), capture_output=True,
@@ -1235,6 +1258,7 @@ def _import_partial(path: Path) -> dict:
 def _wait_between_tasks(task_index: int = 0) -> bool:
     _eta_start_gap(task_index)
     started_at = time.monotonic()
+    gap_sec = task_gap_seconds()
     with _state_lock:
         pause_baseline = _paused_duration_locked(started_at)
     completed = False
@@ -1246,7 +1270,7 @@ def _wait_between_tasks(task_index: int = 0) -> bool:
             with _state_lock:
                 now = time.monotonic()
                 paused_delta = _paused_duration_locked(now) - pause_baseline
-                remaining = started_at + ITEM_GAP_SEC + paused_delta - now
+                remaining = started_at + gap_sec + paused_delta - now
             if remaining <= 0:
                 completed = True
                 return True
@@ -1502,7 +1526,7 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
                 _set_progress(list_completed=index + 1)
 
             if index < len(tasks) - 1 and not risk_signal and not _is_cancelled():
-                _log(f"任务间隔等待 {ITEM_GAP_SEC}s")
+                _log(f"任务间隔等待 {task_gap_seconds():.0f}s（采集节奏：{resolve_collect_pace()['label']}）")
                 if not _wait_between_tasks(index):
                     report["cancelled"] = True
 

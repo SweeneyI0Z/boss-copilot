@@ -122,6 +122,8 @@ DEFAULT_SETTINGS = {
     "llm_model": "",
     # 账号管理：关闭后，采集和沟通统一使用沟通号
     "dual_account_enabled": True,
+    # 采集节奏三档（M20）：只影响采集号只读抓取的随机等待与列表任务间隔
+    "collect_pace": "balanced",
     # 发送护栏
     "send_daily_limit": 40,        # 每日招呼语发送上限（人工确认模式下的软上限）
     "send_daily_hard_cap": 110,    # 硬顶（BOSS 120 软限制前必须停）
@@ -131,6 +133,51 @@ DEFAULT_SETTINGS = {
     "hr_inactive_days": 14,        # HR 活跃度早于 N 天 → 剔除出推荐池
     # 评分
     "l2_top_n": 60,                # L1 后取 Top N 进 L2
+}
+
+# ── 采集节奏三档（M20）──
+# 单一真相源：task_gap_sec 是列表子任务之间的强制间隔；env 会注入 scraper 子进程
+# （SCRAPER_*，外部仓库内置默认=原硬编码值）；dup_stop_ratio 为翻页重复早停阈值，
+# None 表示不传该 flag。standard 档不注入任何内容＝scraper 原生节奏。
+# 均衡/快速档会成倍提高请求频率、增加风控信号概率（命中后当日熔断），切换前知悉。
+COLLECT_PACES = {
+    "standard": {
+        "label": "稳妥",
+        "desc": "scraper 内置节奏 · 列表任务间隔 120s · 最保守",
+        "task_gap_sec": 120,
+        "env": {},
+        "dup_stop_ratio": None,
+    },
+    "balanced": {
+        "label": "均衡",
+        "desc": "整体时长约减半 · 任务间隔 60s · 推荐日常使用",
+        "task_gap_sec": 60,
+        "env": {
+            "SCRAPER_LIST_PAGE_GAP_MIN": "6",
+            "SCRAPER_LIST_PAGE_GAP_MAX": "11",
+            "SCRAPER_DETAIL_GAP_MIN": "5",
+            "SCRAPER_DETAIL_GAP_MAX": "12",
+            "SCRAPER_DETAIL_DWELL_MIN": "1.5",
+            "SCRAPER_DETAIL_DWELL_MAX": "2.5",
+            "SCRAPER_READ_PAUSE_SCALE": "0.6",
+        },
+        "dup_stop_ratio": 0.05,
+    },
+    "fast": {
+        "label": "快速",
+        "desc": "整体约再砍半 · 任务间隔 20s · 风控/熔断概率明显上升",
+        "task_gap_sec": 20,
+        "env": {
+            "SCRAPER_LIST_PAGE_GAP_MIN": "4",
+            "SCRAPER_LIST_PAGE_GAP_MAX": "7",
+            "SCRAPER_DETAIL_GAP_MIN": "3",
+            "SCRAPER_DETAIL_GAP_MAX": "6",
+            "SCRAPER_DETAIL_DWELL_MIN": "1.0",
+            "SCRAPER_DETAIL_DWELL_MAX": "1.8",
+            "SCRAPER_READ_PAUSE_SCALE": "0.35",
+        },
+        "dup_stop_ratio": 0.05,
+    },
 }
 
 DEFAULT_SKILL_DICTIONARY = {

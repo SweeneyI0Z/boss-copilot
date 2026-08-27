@@ -75,6 +75,9 @@ def write_settings(body: dict):
         if k in config.DEFAULT_SETTINGS:
             if k == "dual_account_enabled" and not isinstance(v, bool):
                 raise HTTPException(400, "dual_account_enabled 必须是布尔值")
+            if k == "collect_pace" and v not in config.COLLECT_PACES:
+                raise HTTPException(
+                    400, "collect_pace 必须是 standard/balanced/fast")
             set_setting(k, v)
     return {"ok": True}
 

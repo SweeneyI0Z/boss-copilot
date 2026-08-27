@@ -195,7 +195,7 @@ const apiClient = {
 const EMPTY_SETTINGS = {
   dualAccount: true, llmBaseUrl: '', llmApiKey: '', llmModel: '',
   sendDailyLimit: 40, sendDailyHardCap: 110, sendGapMin: 30, sendGapMax: 90,
-  matchScoreTopN: 60, inactiveDays: 14,
+  matchScoreTopN: 60, inactiveDays: 14, collectPace: 'balanced',
 }
 const EMPTY_ANALYTICS = {
   summary: {}, distributions: {}, meta: { keywords: [], cities: [] }, trends: [],
@@ -223,6 +223,7 @@ function settingsFromApi(raw = {}) {
     sendDailyLimit: Number(raw.send_daily_limit ?? 40), sendDailyHardCap: Number(raw.send_daily_hard_cap ?? 110),
     sendGapMin: Number(raw.send_gap_min_sec ?? 30), sendGapMax: Number(raw.send_gap_max_sec ?? 90),
     matchScoreTopN: Number(raw.l2_top_n ?? 60), inactiveDays: Number(raw.hr_inactive_days ?? 14),
+    collectPace: ['standard', 'balanced', 'fast'].includes(raw.collect_pace) ? raw.collect_pace : 'balanced',
   }
 }
 function settingsToApi(settings) {
@@ -234,6 +235,7 @@ function settingsToApi(settings) {
     send_daily_limit: Number(settings.sendDailyLimit), send_daily_hard_cap: Number(settings.sendDailyHardCap),
     send_gap_min_sec: Number(settings.sendGapMin), send_gap_max_sec: Number(settings.sendGapMax),
     l2_top_n: Number(settings.matchScoreTopN), hr_inactive_days: Number(settings.inactiveDays),
+    collect_pace: settings.collectPace,
   }
 }
 function normalizeResume(row = {}) {
@@ -2069,7 +2071,13 @@ const SettingsView = {
       } finally { testing.value = false }
     }
     watch(() => store.settings, value => Object.assign(draft, clone(value)), { deep: true })
-    return { draft, testing, testResult, save, testConnection, isLlmConfigured }
+    const paceOptions = [
+      { value: 'standard', label: '稳妥 · scraper 内置节奏，任务间隔 120s，最保守' },
+      { value: 'balanced', label: '均衡 · 整体时长约减半，任务间隔 60s（推荐）' },
+      { value: 'fast', label: '快速 · 约再砍半，任务间隔 20s，风控概率明显上升' },
+    ]
+    const paceHint = computed(() => (paceOptions.find(option => option.value === draft.collectPace) || paceOptions[1]).label)
+    return { draft, testing, testResult, save, testConnection, isLlmConfigured, paceOptions, paceHint }
   },
   template: `
   <div>
@@ -2101,6 +2109,7 @@ const App = {
     })
     const theme = ref(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark')
     function toggleTheme() {
+    <section class="settings-section"><div class="section-title"><div><h2>采集节奏</h2><p>采集号只读抓取的随机等待与列表任务间隔，切换后从下一次采集生效</p></div></div><div class="form-grid two"><label>节奏档位<select v-model="draft.collectPace"><option v-for="option in paceOptions" :key="option.value" :value="option.value">{{ option.label }}</option></select></label><p class="muted">{{ paceHint }}。越快越接近机器流量特征，命中风控信号当日熔断；重跑重复内容会自动提前停止翻页。</p></div></section>
       theme.value = theme.value === 'dark' ? 'light' : 'dark'
       document.documentElement.dataset.theme = theme.value
       localStorage.setItem('theme', theme.value)
