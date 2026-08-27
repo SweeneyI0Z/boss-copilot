@@ -1792,7 +1792,9 @@ const JobCardView = {
         const result = await enqueueAi('workbench', 'analysis', [job.job_key])
         job.actionError = ''
         job.actionErrorType = ''
-        if (!silent) showToast(result.added ? '岗位分析已加入生成队列' : '该岗位正在生成分析', 'info')
+        const noJd = Number(result.skipped_no_jd_count || 0)
+        if (!silent) showToast(noJd ? '该岗位缺少职位描述（JD），补齐后才能生成分析'
+          : result.added ? '岗位分析已加入生成队列' : '该岗位正在生成分析', noJd ? 'warn' : 'info')
         return result
       } catch (error) {
         job.actionError = error.message
@@ -1807,10 +1809,12 @@ const JobCardView = {
         job.actionError = ''
         job.actionErrorType = ''
         const skipped = Number(result.skipped_existing_count || 0)
+        const noJd = Number(result.skipped_no_jd_count || 0)
         if (skipped) await refreshGreetings()
-        if (!silent) showToast(result.added ? '招呼语已加入生成队列'
-          : skipped ? '该岗位已有招呼语，已保留原结果'
-            : '该岗位正在生成招呼语', 'info')
+        if (!silent) showToast(noJd ? '该岗位缺少职位描述（JD），补齐后才能生成招呼语'
+          : result.added ? '招呼语已加入生成队列'
+            : skipped ? '该岗位已有招呼语，已保留原结果'
+              : '该岗位正在生成招呼语', noJd ? 'warn' : 'info')
         return result
       } catch (error) {
         job.actionError = error.message
@@ -1867,10 +1871,16 @@ const JobCardView = {
         try {
           const result = await enqueueAi('workbench', type, targets.map(job => job.job_key))
           const skipped = Number(result.skipped_existing_count || 0)
+          const noJd = Number(result.skipped_no_jd_count || 0)
+          // 无 JD 的岗位由后端剔除，批量时把三类结果一次讲清楚
+          const skips = [skipped ? `${skipped} 个已有结果` : '',
+            noJd ? `${noJd} 个缺 JD` : ''].filter(Boolean).join('、')
           if (type === 'greeting' && skipped) await refreshGreetings()
           showToast(result.added
-            ? `${result.added} 个岗位已加入${labels[type]}队列${skipped ? `，跳过 ${skipped} 个已有结果` : ''}`
-            : skipped ? `所选 ${skipped} 个岗位已有结果，无需重复生成` : '所选岗位已在生成队列中', 'info')
+            ? `${result.added} 个岗位已加入${labels[type]}队列${skips ? `，${skips}` : ''}`
+            : noJd && !skipped ? `所选 ${noJd} 个岗位缺少职位描述（JD），补齐后才能${labels[type]}`
+              : skips ? `所选岗位均无需生成：${skips}` : '所选岗位已在生成队列中',
+            result.added ? 'info' : 'warn')
           if (!explicitKeys) selectedKeys.value = []
         } catch (error) { showToast(`${labels[type]}任务创建失败：${error.message}`, 'bad') }
         return

@@ -47,17 +47,23 @@ class GreetingIdempotencyTests(unittest.TestCase):
         # 避免线程本地连接仍指向即将删除的临时库时污染后续测试。
         conn = get_db()
         conn.execute("DELETE FROM greetings")
+        conn.execute("DELETE FROM job_details")
         conn.execute("DELETE FROM jobs")
         conn.commit()
         self.tmp.cleanup()
 
     def add_job(self, job_key: str):
         ts = now_iso()
-        get_db().execute(
+        conn = get_db()
+        conn.execute(
             "INSERT INTO jobs(job_key,title,company,status,first_seen_at,last_seen_at) "
             "VALUES(?,?,?,'active',?,?)",
             (job_key, f"岗位 {job_key}", "示例科技", ts, ts))
-        get_db().commit()
+        # M23/M24 起：无 JD 的岗位不进入评分、分析与招呼语队列，本用例夹具统一带 JD
+        conn.execute(
+            "INSERT INTO job_details(job_key,jd,fetched_at) VALUES(?,?,?)",
+            (job_key, f"{job_key} 职位描述：负责核心模块开发", ts))
+        conn.commit()
 
     def add_greeting(self, job_key: str, *, variants=None, chosen="", revision=None):
         ts = now_iso()

@@ -271,8 +271,13 @@ def _rescore_resume(resume: dict) -> dict:
         for page in ("jobs", "workbench"):
             _ai_scheduler.cancel(page=page, resume_id=resume["id"])
     l1_result = scoring_l1.run_l1(force=True, resume_id=resume["id"])
-    favorite_keys = [row["job_key"] for row in get_db().execute(
-        "SELECT job_key FROM jobs WHERE favorite_at IS NOT NULL AND status='active'")]
+    # 无 JD 的收藏岗位不进入自动分析队列（与工作台手动生成入口同一闸门）
+    favorite_rows = get_db().execute(
+        "SELECT j.job_key, d.jd FROM jobs j LEFT JOIN job_details d "
+        "ON d.job_key=j.job_key WHERE j.favorite_at IS NOT NULL AND j.status='active'"
+    ).fetchall()
+    favorite_keys = [row["job_key"] for row in favorite_rows
+                     if (row["jd"] or "").strip()]
     background = bool(favorite_keys and llm_mod.configured())
     if background:
         scheduler = _get_ai_scheduler()
@@ -890,9 +895,10 @@ def ai_tasks_enqueue(page: str, body: dict):
                 accepted, resume["id"], resume["revision"]))
         skipped_existing = [key for key in accepted if key in completed]
         queued_keys = [key for key in accepted if key not in completed]
-    # 无 JD 的岗位缺少精评素材，不入队不耗 token；force 也绕不过（缺素材本身不可评）
+    # 无 JD 的岗位缺少精评、分析与招呼语素材，不入队不耗 token；
+    # force 也绕不过（缺素材本身不可评）；已有可用结果仍记入 skipped_existing，优先于本闸门
     skipped_no_jd = []
-    if kind == "score" and queued_keys:
+    if kind in ("score", "analysis", "greeting") and queued_keys:
         jd_rows = get_db().execute(
             "SELECT job_key, jd FROM job_details WHERE job_key IN (%s)" %
             ",".join("?" for _ in queued_keys), queued_keys).fetchall()
@@ -1196,14 +1202,23 @@ def greeting_generate(body: dict):
     from . import greeting, llm as llm_mod
     from . import resumes
     try:
-        resume_id = body.get("resume_id") or resumes.get_default_resume()["id"]
-        job_key = body.get("job_key", "")
+        resume_id = int(body.get("resume_id") or
+                        resumes.get_default_resume()["id"])
+        resume = resumes.get_resume(resume_id)
+        job_key = str(body.get("job_key") or "")
+        # 与队列同规则：已有可用招呼语照常复用；新生成则必须有 JD
+        reusable = job_key in greeting.completed_job_keys(
+            [job_key], resume_id, resume["revision"])
+        jd_row = get_db().execute(
+            "SELECT jd FROM job_details WHERE job_key=?", (job_key,)).fetchone()
+        if not reusable and not ((jd_row["jd"] if jd_row else None) or "").strip():
+            raise ValueError("该岗位缺少职位描述（JD），补齐后才能生成招呼语")
         result = greeting.generate(
             job_key, resume_id=resume_id, force=bool(body.get("force", False)))
         skipped_existing = [job_key] if result.get("reused_existing") else []
         return {**result, "skipped_existing": skipped_existing,
                 "skipped_existing_count": len(skipped_existing)}
-    except llm_mod.LLMError as e:
+    except (llm_mod.LLMError, ValueError) as e:
         raise HTTPException(400, str(e))
 
 

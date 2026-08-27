@@ -126,20 +126,19 @@ class NoJdGateTests(unittest.TestCase):
         self.assertEqual([task["job_key"] for task in forced["tasks"]], ["done"])
         self.assertTrue(forced["tasks"][0]["payload"]["force"])
 
-    def test_analysis_kind_keeps_old_behavior(self):
-        # 竞争力分析与评分共用精评产物但不走本闸门（是否评分析另行约定）
+    def test_analysis_kind_gated_too_since_m24(self):
+        # M24 起：工作台分析与招呼语同受本闸门约束（本用例原断言「不受影响」的契约作废）
         self.add_job("favorite-njd")
         main._ai_scheduler = AITaskScheduler(
             lambda task, cancelled: {"ok": True}, max_concurrency=1)
 
-        with patch.object(llm, "configured", return_value=True):
-            result = main.ai_tasks_enqueue("workbench", {
-                "kind": "analysis", "job_keys": ["favorite-njd"],
-                "resume_id": self.resume["id"],
-            })
+        result = main.ai_tasks_enqueue("workbench", {
+            "kind": "analysis", "job_keys": ["favorite-njd"],
+            "resume_id": self.resume["id"],
+        })
 
-        self.assertEqual(result["added"], 1)
-        self.assertEqual(result["skipped_no_jd"], [])
+        self.assertEqual(result["added"], 0)
+        self.assertEqual(result["skipped_no_jd"], ["favorite-njd"])
 
 
 class FrontendJdGateContracts(unittest.TestCase):
@@ -155,9 +154,10 @@ class FrontendJdGateContracts(unittest.TestCase):
         # M18 既有提示文案必须保留
         self.assertIn("已有评分，无需重复生成", self.app)
 
-    def test_cache_version_pins_m23(self):
+    def test_cache_version_pins_m24(self):
+        # M24 起版本号演进，本用例只约束不再驻留旧值，当前值由最新里程碑钉住
         self.assertNotIn("?v=m22-composite", self.index)
-        self.assertIn("app.js?v=m23-jd-gate", self.index)
+        self.assertNotIn("?v=m23-jd-gate", self.index)
 
 
 if __name__ == "__main__":
