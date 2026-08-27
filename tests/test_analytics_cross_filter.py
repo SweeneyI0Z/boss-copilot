@@ -370,6 +370,11 @@ class AnalyticsFrontendContractTests(unittest.TestCase):
         self.assertIn("keyword: filters.keywords.join(',')", self.app)
         self.assertIn("city_code: filters.cities.join(',')", self.app)
 
+    def test_keyword_city_fallback_for_legacy_payload(self):
+        # 旧后端返回体缺 keyword_options 时回退 meta.keywords/cities（不显示计数）。
+        self.assertIn("const legacyKeywords = meta.value.keywords || []", self.app)
+        self.assertIn('v-if="option.count != null"', self.app)
+
     def test_empty_state_contains_new_payload_keys(self):
         start = self.app.index("const EMPTY_ANALYTICS")
         block = self.app[start: self.app.index("\n}", start)]

@@ -1574,8 +1574,23 @@ const AnalyticsView = {
     const loading = ref(false)
     const meta = computed(() => store.analytics.meta
       || { keywords: [], cities: [], options: {}, keyword_options: [], city_options: [] })
-    const keywordOptions = computed(() => (meta.value.keyword_options || []))
-    const cityOptions = computed(() => (meta.value.city_options || []))
+    const keywordOptions = computed(() => {
+      // 兼容回退：旧后端返回体只有 meta.keywords（此时无法区分版本与数据缺失），
+      // 用候选列表兜底展示但不显示计数；重启后端后自动回到带计数的互斥刻面。
+      if ((meta.value.keyword_options || []).length) return meta.value.keyword_options
+      const legacyKeywords = meta.value.keywords || []
+      return legacyKeywords.map(label => ({
+        label, code: label, count: null,
+        selected: filters.keywords.includes(label),
+      }))
+    })
+    const cityOptions = computed(() => {
+      if ((meta.value.city_options || []).length) return meta.value.city_options
+      return (meta.value.cities || []).map(city => ({
+        label: city.name, code: city.code, count: null,
+        selected: filters.cities.includes(city.code),
+      }))
+    })
     const summary = computed(() => {
       const value = store.analytics.summary || {}
       const min = value.avg_salary_min
@@ -1742,9 +1757,9 @@ const AnalyticsView = {
                   class="chip" :class="{on: option.selected}" type="button"
                   :title="option.label + '：' + option.count + ' 个岗位'"
                   @click="toggleDimValue('keywords', option.label)">
-            {{option.label}}<i>{{option.count}}</i>
+            {{option.label}}<i v-if="option.count != null">{{option.count}}</i>
           </button>
-          <span v-if="!keywordOptions.length" class="dim-empty">暂无可选项（采集命中后出现）</span>
+          <span v-if="!keywordOptions.length" class="dim-empty">暂无候选：候选仅统计启用采集来源的命中，可到采集中心跑一轮关键词采集</span>
         </div>
       </div>
       <div class="dim-row">
@@ -1754,9 +1769,9 @@ const AnalyticsView = {
                   class="chip" :class="{on: option.selected}" type="button"
                   :title="option.label + '：' + option.count + ' 个岗位'"
                   @click="toggleDimValue('cities', option.code)">
-            {{option.label}}<i>{{option.count}}</i>
+            {{option.label}}<i v-if="option.count != null">{{option.count}}</i>
           </button>
-          <span v-if="!cityOptions.length" class="dim-empty">暂无可选项（采集命中后出现）</span>
+          <span v-if="!cityOptions.length" class="dim-empty">暂无候选：候选仅统计启用采集来源的命中，可到采集中心跑一轮关键词采集</span>
         </div>
       </div>
       <div class="dim-row" v-for="dim in dimensions" :key="dim.key">
@@ -1766,7 +1781,7 @@ const AnalyticsView = {
                   class="chip" :class="{on: option.selected}" type="button"
                   :title="option.label + '：' + option.count + ' 个岗位'"
                   @click="toggleDimValue(dim.key, option.label)">
-            {{option.label}}<i>{{option.count}}</i>
+            {{option.label}}<i v-if="option.count != null">{{option.count}}</i>
           </button>
           <span v-if="!(meta.options[dim.key] || []).length" class="dim-empty">暂无可选项</span>
         </div>
