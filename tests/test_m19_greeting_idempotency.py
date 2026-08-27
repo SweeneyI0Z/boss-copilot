@@ -59,7 +59,7 @@ class GreetingIdempotencyTests(unittest.TestCase):
             "INSERT INTO jobs(job_key,title,company,status,first_seen_at,last_seen_at) "
             "VALUES(?,?,?,'active',?,?)",
             (job_key, f"岗位 {job_key}", "示例科技", ts, ts))
-        # M23/M24 起：无 JD 的岗位不进入评分、分析与招呼语队列，本用例夹具统一带 JD
+        # JD 闸门上线后：无 JD 的岗位不进入评分、分析与招呼语队列，本用例夹具统一带 JD
         conn.execute(
             "INSERT INTO job_details(job_key,jd,fetched_at) VALUES(?,?,?)",
             (job_key, f"{job_key} 职位描述：负责核心模块开发", ts))

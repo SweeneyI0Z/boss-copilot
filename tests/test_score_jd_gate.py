@@ -1,7 +1,7 @@
-"""M23 无 JD 岗位不参与岗位评分/匹配度评分：入队过滤与提示契约。
+"""无 JD 岗位不参与岗位评分/匹配度评分：入队过滤与提示契约。
 
 无 JD 的岗位缺少精评素材，批量评分时由后端直接剔除（skipped_no_jd 单独回报），
-force 也绕不过；工作台「竞争力分析」是另一功能，不受此闸门影响。
+force 也绕不过；工作台分析/招呼语闸门在后续「工作台生成治理」中另行扩展。
 """
 import os
 import tempfile
@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-_TEST_HOME = tempfile.mkdtemp(prefix="boss-copilot-m23-jd-gate-")
+_TEST_HOME = tempfile.mkdtemp(prefix="boss-copilot-score-jd-gate-")
 os.environ["BOSS_COPILOT_HOME"] = _TEST_HOME
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,7 +24,7 @@ from backend.scoring import l2  # noqa: E402
 
 class NoJdGateTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="boss-copilot-m23-case-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="boss-copilot-score-jd-case-")
         root = Path(self.tmp.name)
         config.DATA_DIR = root
         config.DB_PATH = root / "copilot.db"
@@ -126,8 +126,8 @@ class NoJdGateTests(unittest.TestCase):
         self.assertEqual([task["job_key"] for task in forced["tasks"]], ["done"])
         self.assertTrue(forced["tasks"][0]["payload"]["force"])
 
-    def test_analysis_kind_gated_too_since_m24(self):
-        # M24 起：工作台分析与招呼语同受本闸门约束（本用例原断言「不受影响」的契约作废）
+    def test_analysis_kind_gated_too(self):
+        # 工作台分析与招呼语也受本闸门约束（早先「分析不受影响」的断言随闸门扩展作废）
         self.add_job("favorite-njd")
         main._ai_scheduler = AITaskScheduler(
             lambda task, cancelled: {"ok": True}, max_concurrency=1)
@@ -154,8 +154,8 @@ class FrontendJdGateContracts(unittest.TestCase):
         # M18 既有提示文案必须保留
         self.assertIn("已有评分，无需重复生成", self.app)
 
-    def test_cache_version_pins_m24(self):
-        # M24 起版本号演进，本用例只约束不再驻留旧值，当前值由最新里程碑钉住
+    def test_cache_version_does_not_hold_stale_values(self):
+        # 静态缓存版本演进后，本用例只约束不再驻留旧值，当前值由最新前端改动钉住
         self.assertNotIn("?v=m22-composite", self.index)
         self.assertNotIn("?v=m23-jd-gate", self.index)
 

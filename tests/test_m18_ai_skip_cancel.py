@@ -60,7 +60,7 @@ class AiSkipCancelTests(unittest.TestCase):
             "VALUES(?,?,?,'active',?,?)",
             (job_key, f"岗位 {job_key}", "示例科技", ts, ts),
         )
-        # M23 起：无 JD 的岗位不进入评分队列，幂等/取消语义测试统一带上 JD
+        # JD 闸门上线后：无 JD 的岗位不进入评分队列，幂等/取消语义测试统一带上 JD
         conn.execute(
             "INSERT INTO job_details(job_key,jd,fetched_at) VALUES(?,?,?)",
             (job_key, f"{job_key} 职位描述：负责核心模块开发", ts))

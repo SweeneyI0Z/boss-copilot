@@ -1,6 +1,6 @@
-"""M24 无 JD 岗位不参与收藏工作台分析与招呼语：队列闸门、自动重算与提示契约。
+"""无 JD 岗位不参与收藏工作台分析与招呼语：队列闸门、自动重算与提示契约。
 
-与 M23 评分同规则：缺素材不入队不耗 token，force 绕不过；
+与岗位评分同规则：缺素材不入队不耗 token，force 绕不过；
 已有可用结果优先记入 skipped_existing；简历保存触发的自动分析同样过滤；
 直连招呼语接口对「新生成」拒单、对既有结果照常复用。
 """
@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 from fastapi import HTTPException
 
 
-_TEST_HOME = tempfile.mkdtemp(prefix="boss-copilot-m24-workbench-gate-")
+_TEST_HOME = tempfile.mkdtemp(prefix="boss-copilot-workbench-jd-gate-")
 os.environ["BOSS_COPILOT_HOME"] = _TEST_HOME
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,7 +26,7 @@ from backend.db import get_db, init_db, now_iso  # noqa: E402
 
 class NoJdWorkbenchGateTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="boss-copilot-m24-case-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="boss-copilot-workbench-jd-case-")
         root = Path(self.tmp.name)
         config.DATA_DIR = root
         config.DB_PATH = root / "copilot.db"
@@ -168,7 +168,7 @@ class FrontendWorkbenchGateContracts(unittest.TestCase):
         cls.index = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
 
     def test_single_and_batch_generation_report_missing_jd(self):
-        # 岗位列表批量评分(M23) + 工作台单岗分析/招呼语与批量入口(M24)
+        # 岗位列表批量评分 + 工作台单岗分析/招呼语与批量入口，共四处消费该字段
         self.assertGreaterEqual(self.app.count("result.skipped_no_jd_count"), 4)
         self.assertIn("'该岗位缺少职位描述（JD），补齐后才能生成分析'", self.app)
         self.assertIn("'该岗位缺少职位描述（JD），补齐后才能生成招呼语'", self.app)
@@ -178,7 +178,7 @@ class FrontendWorkbenchGateContracts(unittest.TestCase):
     def test_legacy_copy_still_present(self):
         self.assertIn("该岗位已有招呼语，已保留原结果", self.app)
 
-    def test_cache_version_pins_m24(self):
+    def test_cache_version_pins_current_tag(self):
         self.assertNotIn("?v=m23-jd-gate", self.index)
         self.assertIn("app.js?v=m24-workbench-gate", self.index)
 

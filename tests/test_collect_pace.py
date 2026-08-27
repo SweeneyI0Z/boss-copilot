@@ -1,4 +1,4 @@
-"""M21 测试：采集节奏三档（collect_pace）与提速参数注入。
+"""采集节奏三档（collect_pace）与提速参数注入契约。
 
 覆盖：档位解析与回退、任务间隔按档位生效且旧测试钩子 ITEM_GAP_SEC 覆盖仍优先、
 _run_scraper 按档位注入 SCRAPER_* 环境变量与 --dup-stop-ratio、
@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-_TEST_HOME = tempfile.mkdtemp(prefix="boss-copilot-m20-collect-")
+_TEST_HOME = tempfile.mkdtemp(prefix="boss-copilot-collect-pace-")
 os.environ["BOSS_COPILOT_HOME"] = _TEST_HOME
 
 from fastapi import HTTPException  # noqa: E402
@@ -29,7 +29,7 @@ class PaceResolveTests(unittest.TestCase):
     """档位映射表与 task_gap_seconds 解析。"""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="boss-copilot-m20-pace-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="boss-copilot-pace-")
         config.DATA_DIR = Path(self.tmp.name)
         config.DB_PATH = self.tmp.name + "/copilot.db"
         init_db()
@@ -85,7 +85,7 @@ class ScraperEnvInjectionTests(unittest.TestCase):
     """_run_scraper 按档位改写命令与环境变量；favorites 复用同函数自动生效。"""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="boss-copilot-m20-env-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="boss-copilot-scraper-env-")
         config.DATA_DIR = Path(self.tmp.name)
         config.DB_PATH = self.tmp.name + "/copilot.db"
         config.COLLECT_RESULT_DIR = Path(self.tmp.name) / "job-result"
@@ -144,7 +144,7 @@ class SettingsApiTests(unittest.TestCase):
     """设置接口接受并持久化 collect_pace，拒绝非法档位。"""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="boss-copilot-m20-api-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="boss-copilot-pace-api-")
         config.DATA_DIR = Path(self.tmp.name)
         config.DB_PATH = self.tmp.name + "/copilot.db"
         init_db()

@@ -1,6 +1,6 @@
-"""M22 岗位列表综合评分契约：列表列 + 展开详情展示 composite（0.6×匹配 + 0.4×岗位）。
+"""岗位列表综合评分列契约：列表列 + 展开详情展示 composite（0.6×匹配 + 0.4×岗位）。
 
-后端 /api/jobs 早已按简历返回 composite 并默认按其排序，本里程碑只补前端展示。
+后端 /api/jobs 早已按简历返回 composite 并默认按其排序，本组契约只补前端展示。
 """
 from pathlib import Path
 import unittest
@@ -35,7 +35,7 @@ class FrontendCompositeTests(unittest.TestCase):
         self.assertIn("return job[key]", self.app)
 
     def test_cache_version_is_advanced(self):
-        # M23 起版本号演进，本用例只约束不再驻留旧值，当前值由最新里程碑钉住
+        # 静态缓存版本演进后，本用例只约束不再驻留旧值，当前值由最新前端改动钉住
         self.assertNotIn("?v=m20-guide", self.index)
         self.assertNotIn("?v=m22-composite", self.index)
 

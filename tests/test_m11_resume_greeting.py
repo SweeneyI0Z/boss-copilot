@@ -29,6 +29,10 @@ def _fake_client(content):
 
 
 def _reset():
+    # 隔离加固：其余测试模块可能在导入期/用例中改写全局数据目录，
+    # 本模块夹具按隔离模板在每个用例前重新锚定到自己的临时目录
+    config.DATA_DIR = Path(_TEST_HOME)
+    config.DB_PATH = Path(_TEST_HOME) / "copilot.db"
     init_db()
     conn = get_db()
     for table in ("applications", "job_resume_scores", "job_score_baselines",

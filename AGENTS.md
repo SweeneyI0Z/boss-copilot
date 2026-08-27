@@ -5,7 +5,7 @@
 ## 常用命令
 
 ```bash
-# 回归测试（316 例，任何 backend/ 或 frontend/ 改动后必须全绿才可提交）
+# 回归测试（356 例，任何 backend/ 或 frontend/ 改动后必须全绿才可提交）
 .venv/bin/python -m unittest discover tests -v
 
 # 启动（浏览器打开 http://127.0.0.1:8787）
@@ -23,12 +23,12 @@
 - `backend/sender.py` 发送器 / `chatpoll.py` 消息中心 / `interview.py` 模拟面试 / `collector.py` 采集执行器（subprocess 调外部仓库）/ `favorites.py` 双账号BOSS收藏同步（推荐页感兴趣Tab只读 + 增量合并）。
 - `backend/boss/cdp.py`：双账号 Chrome CDP 管理。
 - `frontend/`：无构建 Vue3，`app.js` 单文件（hash 路由）+ vendored `vue.esm-browser.prod.js`，不引入 npm/构建链。
-- `tests/`：`test_m*_*.py` 单测（可跑回归）；`spike_*.py` 是只读探针脚本（需真实登录态，不进回归）。
+- `tests/`：单测（可跑回归；存量按里程碑 `test_m*_*.py` 命名，新增一律 `test_功能描述.py`，见硬约束 2）；`spike_*.py` 是只读探针脚本（需真实登录态，不进回归）。
 
 ## 硬约束（违反即返工）
 
 1. **每个功能必须带测试**；提交前全量回归通过。
-2. 里程碑 = 一次 git commit，Conventional Commits（如 `feat(M8): …`）。
+2. 里程碑 = 一次 git commit，Conventional Commits。**自「使用指南」里程碑完成后停用里程碑编号**：新提交不得再用 `feat(Mxx)` 形式（写 `feat: 描述`），新增测试文件与类/用例名也不得以 Mxx 命名（文件用 `test_功能描述.py`，如 `test_collect_pace.py`）；存量 ≤M20 的 Mxx 命名保持原样不改写。
 3. 导入的评分是基线，引擎评分不得覆盖（`keep_imported` 语义）。
 4. BOSS 写操作只走账号A（CDP 9223）、只走 UI 级点击、必须过护栏；护栏不可关闭（每日上限 40/硬顶 110、随机 30-90s 间隔、同公司 30 天去重、命中风控信号当日熔断）。
 5. 采集/公司页等读操作只走采集号（CDP 9222），风控风险集中在该号。唯一例外：「同步BOSS收藏」（`favorites.py`）会按用户明确要求只读访问沟通号的推荐页感兴趣 Tab（仅 Page.navigate + DOM 读取，零点击）；除此以外沟通号仍只做受护栏保护的写操作。
