@@ -94,20 +94,32 @@ def launch(account: str, wait_sec: float = 15) -> dict:
     return {"ok": False, "error": f"CDP {conf['cdp_port']} 未就绪", "port": conf["cdp_port"]}
 
 
+def _chrome_process_lines() -> str:
+    """列出本机 chrome 进程行（pid\\t命令行），供按 profile 目录精准过滤。
+
+    Windows 必须先强制 PowerShell 输出 UTF-8：profile 目录含中文用户名时，
+    默认 GBK 输出会导致 marker 匹配失败，stop() 静默关不掉任何进程。
+    """
+    if os.name == "nt":
+        command = ("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+                   "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                   "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }")
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", command],
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+    else:
+        r = subprocess.run(["ps", "-axo", "pid=,command="],
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+    return r.stdout
+
+
 def stop(account: str) -> dict:
     """按 user-data-dir 精准关闭该账号的 Chrome，不碰其他 Chrome。"""
     conf = config.ACCOUNTS[account]
     marker = str(conf["profile_dir"])
-    if os.name == "nt":
-        command = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
-                   "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }")
-        r = subprocess.run(["powershell", "-NoProfile", "-Command", command],
-                           capture_output=True, text=True)
-    else:
-        r = subprocess.run(["ps", "-axo", "pid=,command="],
-                           capture_output=True, text=True)
     killed = 0
-    for line in r.stdout.splitlines():
+    for line in _chrome_process_lines().splitlines():
         line = line.strip()
         if marker not in line or "chrome" not in line.lower():
             continue

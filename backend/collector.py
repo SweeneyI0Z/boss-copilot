@@ -3,6 +3,7 @@
 列表文件始终按子任务精确导入；一次成功列表对应一个稳定来源快照。详情阶段
 失败不会撤销已导入列表，也不会触发错误的下架 diff，可稍后单独重试缺失 JD。
 """
+import ctypes
 import json
 import math
 import os
@@ -550,13 +551,44 @@ def _wait_for_resume() -> bool:
         return not bool(_state.get("cancel"))
 
 
+# 暂停/恢复动作统一入口：POSIX 是真正的 SIGSTOP/SIGCONT；Windows 无此信号
+# （getattr 退化为占位语义值），由 _signal_process 映射到进程挂起/恢复 API。
+_SIG_PAUSE = getattr(signal, "SIGSTOP", "suspend")
+_SIG_RESUME = getattr(signal, "SIGCONT", "resume")
+
+
+def _windows_suspend_process(process, suspend: bool) -> bool:
+    """Windows 下挂起或恢复整个 scraper 子进程（等价 SIGSTOP/SIGCONT）。
+
+    走 ntdll 的 NtSuspendProcess/NtResumeProcess，属 stdlib ctypes 可达的
+    唯一官方级挂起原语；API 缺失（如 Wine）或打不开句柄时返回 False 降级。
+    """
+    try:
+        kernel32 = ctypes.windll.kernel32
+        ntdll = ctypes.windll.ntdll
+        # PROCESS_SUSPEND_RESUME：NtSuspendProcess/NtResumeProcess 所需最小权限。
+        handle = kernel32.OpenProcess(0x0800, False, process.pid)
+        if not handle:
+            return False
+        try:
+            suspend_or_resume = (ntdll.NtSuspendProcess if suspend
+                                 else ntdll.NtResumeProcess)
+            return suspend_or_resume(handle) == 0  # NTSTATUS SUCCESS == 0
+        finally:
+            kernel32.CloseHandle(handle)
+    except (OSError, AttributeError):
+        return False
+
+
 def _signal_process(process, process_signal) -> bool:
-    """仅在 Unix 向仍存活的 scraper 子进程发送暂停或恢复信号。"""
-    if os.name != "posix" or process is None or process_signal is None:
+    """向仍存活的 scraper 子进程发送暂停或恢复信号，跨平台语义一致。"""
+    if process is None or process_signal is None:
         return False
     try:
         if process.poll() is not None:
             return False
+        if os.name == "nt":
+            return _windows_suspend_process(process, process_signal == _SIG_PAUSE)
         process.send_signal(process_signal)
         return True
     except OSError:
@@ -570,7 +602,7 @@ def _register_process(process) -> bool:
             return False
         _state["process"] = process
         if _state.get("paused"):
-            _signal_process(process, getattr(signal, "SIGSTOP", None))
+            _signal_process(process, _SIG_PAUSE)
         return True
 
 
@@ -586,7 +618,7 @@ def _cleanup_worker_control(run_id: int) -> None:
         if _state.get("run_id") != run_id:
             return
         if _state.get("paused"):
-            _signal_process(_state.get("process"), getattr(signal, "SIGCONT", None))
+            _signal_process(_state.get("process"), _SIG_RESUME)
         _state["paused"] = False
         _state["process"] = None
         _state["pause_started_at"] = None
@@ -1066,11 +1098,14 @@ def _run_scraper(args: list, timeout: int, cdp_port: int,
         command.extend(["--dup-stop-ratio", f'{pace["dup_stop_ratio"]}'])
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    # Windows 控制台默认 GBK：强制 scraper 子进程按 UTF-8 读写流，与父进程读取端对齐。
+    env["PYTHONIOENCODING"] = "utf-8"
     env.update(pace["env"])
     watch_path = Path(detail_output or output) if on_snapshot else None
     if on_output is None and on_snapshot is None:
         proc = subprocess.run(command, cwd=str(SCRAPER_DIR), capture_output=True,
-                              text=True, timeout=timeout, env=env)
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, env=env)
         stdout = (proc.stdout or "").strip().splitlines()
         stderr = (proc.stderr or "").strip().splitlines()
         returncode = proc.returncode
@@ -1105,7 +1140,8 @@ def _run_scraper_streamed(command: list, timeout: int, env: dict,
     """持续消费子进程输出；原子结果文件每次变化后通知调用方即时入库。"""
     proc = subprocess.Popen(
         command, cwd=str(SCRAPER_DIR), stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+        stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+        bufsize=1, env=env)
     controlled = _register_process(proc)
     lines = []
     output_queue = queue.Queue()
@@ -1128,7 +1164,7 @@ def _run_scraper_streamed(command: list, timeout: int, env: dict,
     stream_finished = False
     try:
         while not stream_finished:
-            # SIGSTOP 期间不消费 scraper 超时预算；取消只在当前子进程结束后生效。
+            # 子进程被挂起期间不消费 scraper 超时预算；取消只在当前子进程结束后生效。
             if controlled:
                 _wait_for_resume()
             with _state_lock:
@@ -1675,7 +1711,7 @@ def cancel() -> dict:
             if started_at is not None:
                 _state["paused_seconds"] = float(
                     _state.get("paused_seconds") or 0.0) + now - started_at
-            _signal_process(_state.get("process"), getattr(signal, "SIGCONT", None))
+            _signal_process(_state.get("process"), _SIG_RESUME)
             _state["paused"] = False
             _state["pause_started_at"] = None
         _state["cancel"] = True
@@ -1691,7 +1727,7 @@ def cancel() -> dict:
 
 
 def pause() -> dict:
-    """暂停当前采集，并在 Unix 上真实挂起正在运行的 scraper 子进程。"""
+    """暂停当前采集，并真实挂起正在运行的 scraper 子进程（Windows 同样生效）。"""
     with _state_condition:
         if not _state["running"]:
             return {"ok": True, "running": False, "paused": False}
@@ -1706,7 +1742,7 @@ def pause() -> dict:
         if not _state.get("paused"):
             _state["paused"] = True
             _state["pause_started_at"] = time.monotonic()
-            _signal_process(_state.get("process"), getattr(signal, "SIGSTOP", None))
+            _signal_process(_state.get("process"), _SIG_PAUSE)
             get_db().execute("UPDATE collect_runs SET paused=1 WHERE id=?", (run_id,))
             get_db().commit()
             changed = True
@@ -1718,7 +1754,7 @@ def pause() -> dict:
 
 
 def resume() -> dict:
-    """继续当前采集，并在 Unix 上恢复被挂起的 scraper 子进程。"""
+    """继续当前采集，并恢复被挂起的 scraper 子进程（Windows 同样生效）。"""
     with _state_condition:
         if not _state["running"]:
             return {"ok": True, "running": False, "paused": False}
@@ -1732,7 +1768,7 @@ def resume() -> dict:
             if started_at is not None:
                 _state["paused_seconds"] = float(
                     _state.get("paused_seconds") or 0.0) + now - started_at
-            _signal_process(_state.get("process"), getattr(signal, "SIGCONT", None))
+            _signal_process(_state.get("process"), _SIG_RESUME)
             _state["paused"] = False
             _state["pause_started_at"] = None
             get_db().execute("UPDATE collect_runs SET paused=0 WHERE id=?", (run_id,))

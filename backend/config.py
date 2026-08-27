@@ -45,8 +45,15 @@ def default_chrome_path(system=None, environ=None) -> str:
 CHROME_PATH = default_chrome_path()
 SCRAPER_DIR = Path(os.environ.get(
     "BOSS_ZHIPIN_SCRAPER_HOME", str(BASE_DIR.parent / "boss-zhipin-scraper"))).expanduser()
-SCRAPER_PY = SCRAPER_DIR / ".venv" / ("Scripts/python.exe" if os.name == "nt"
-                                      else "bin/python")
+
+
+def default_scraper_python(scraper_dir, is_nt=None) -> Path:
+    """外部采集仓库 venv 解释器路径；Windows 布局为 Scripts/python.exe。"""
+    nt = (os.name == "nt") if is_nt is None else is_nt
+    return Path(scraper_dir) / ".venv" / ("Scripts/python.exe" if nt else "bin/python")
+
+
+SCRAPER_PY = default_scraper_python(SCRAPER_DIR)
 SCRAPER_SCRIPT = SCRAPER_DIR / "scripts" / "boss_cdp_raw.py"
 
 
