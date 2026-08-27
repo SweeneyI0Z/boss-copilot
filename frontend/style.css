@@ -388,6 +388,38 @@ td p { margin-top: 2px; color: var(--muted); font-size: 10px; }
 .bar-row svg { width: 100%; height: 12px; }
 .bar-row svg .bar-bg { fill: var(--bar-bg); }
 .bar-row b { text-align: right; font-variant-numeric: tabular-nums; }
+.chart-panel h2 small { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; font-weight: 400; }
+
+/* 数据分析：多标签交叉筛选与高阶面板 */
+.dimension-filters { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; margin-bottom: 14px; }
+.dim-row { display: grid; grid-template-columns: 64px minmax(0, 1fr); align-items: start; gap: 10px; }
+.dim-label { padding-top: 5px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.chip-group { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.dim-empty { color: var(--muted); font-size: 11px; }
+.chip { display: inline-flex; align-items: center; gap: 5px; min-height: 26px; padding: 2px 10px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--surface-2); color: var(--muted); font-size: 11px; white-space: nowrap; }
+.chip i { font-style: normal; font-size: 10px; opacity: .75; font-variant-numeric: tabular-nums; }
+.chip:hover { border-color: color-mix(in srgb, var(--accent) 45%, transparent); color: var(--ink); }
+.chip.on { border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: var(--accent-soft); color: var(--accent-strong); }
+.chip.removable i { width: 15px; height: 15px; display: inline-grid; place-items: center; border-radius: 50%; background: color-mix(in srgb, var(--accent) 28%, transparent); opacity: 1; font-size: 11px; line-height: 1; }
+.active-chips { display: grid; grid-template-columns: 64px minmax(0, 1fr); align-items: start; gap: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.salary-custom { display: inline-flex; align-items: center; gap: 5px; min-height: 26px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.salary-custom input { width: 72px; min-height: 24px; margin: 0; padding: 1px 7px; font-size: 11px; }
+.metric.tone-cyan::before { background: var(--chart-2); }
+.funnel-panel { margin-bottom: 12px; }
+.funnel-panel h2 small { font-weight: 400; }
+.funnel { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 13px; }
+.funnel-stage { min-width: 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); }
+.funnel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.funnel-head span { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.funnel-head b { font-size: 19px; font-variant-numeric: tabular-nums; }
+.funnel-track { height: 6px; margin-top: 8px; overflow: hidden; border-radius: 3px; background: var(--surface-3); }
+.funnel-track i { display: block; height: 100%; min-width: 2px; border-radius: 3px; background: var(--accent); transition: width .25s ease; }
+.funnel-stage > small { display: block; margin-top: 6px; color: var(--muted); font-size: 10px; }
+@media (max-width: 720px) {
+  .dim-row, .active-chips { grid-template-columns: 1fr; gap: 5px; }
+  .dim-label { padding-top: 0; }
+  .funnel { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 
 /* 岗位列表 */
 .jobs-table { min-width: 1120px; table-layout: fixed; }

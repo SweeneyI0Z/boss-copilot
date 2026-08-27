@@ -198,7 +198,9 @@ const EMPTY_SETTINGS = {
   matchScoreTopN: 60, inactiveDays: 14, collectPace: 'balanced',
 }
 const EMPTY_ANALYTICS = {
-  summary: {}, distributions: {}, meta: { keywords: [], cities: [] }, trends: [],
+  summary: {}, distributions: {},
+  meta: { keywords: [], cities: [], options: { experience: [], degree: [], industry: [], scale: [] } },
+  trends: [], cross: {}, funnel: { stages: [] }, top_companies: [], top_skills: [],
 }
 const EMPTY_AI_PAGE = page => ({
   page, tasks: [], active: 0, effective_concurrency: 5, max_concurrency: 5,
@@ -733,16 +735,23 @@ function markOnboardingDone() {
 
 // -- 通用图表 -----------------------------------------------------------
 const SvgBars = {
-  props: ['items', 'color'],
-  setup(props) {
+  // clickable 时整行可点：用于分析页「点击条目加入/移除筛选」的下钻联动。
+  props: { items: Array, color: String, clickable: Boolean },
+  emits: ['pick'],
+  setup(props, { emit }) {
     const rows = computed(() => (props.items || []).slice(0, 10))
     const max = computed(() => Math.max(1, ...rows.value.map(item => Number(item.value || 0))))
-    return { rows, max }
+    function pick(item) {
+      if (props.clickable) emit('pick', item)
+    }
+    return { rows, max, pick }
   },
   template: `
     <div class="bar-chart">
-      <div v-for="item in rows" :key="item.label" class="bar-row">
-        <span :title="item.label">{{item.label}}</span>
+      <div v-for="item in rows" :key="item.label" class="bar-row" :class="{clickable}"
+           :role="clickable ? 'button' : null" :tabindex="clickable ? 0 : null"
+           @click="pick(item)" @keydown.enter.prevent="pick(item)" @keydown.space.prevent="pick(item)">
+        <span :title="clickable ? item.label + '（点击筛选）' : item.label">{{item.label}}</span>
         <svg viewBox="0 0 100 12" preserveAspectRatio="none" role="img" :aria-label="item.label + ' ' + item.value">
           <rect class="bar-bg" width="100" height="12" rx="2"></rect>
           <rect :width="item.value > 0 ? Math.max(1,item.value/max*100) : 0" height="12" rx="2" :style="{fill:color || 'var(--accent)'}"></rect>
@@ -1530,54 +1539,240 @@ const CollectView = {
 function apiChartRows(items) {
   return (items || []).map(item => ({ label: item.label || item.day || '未标注', value: Number(item.count || 0) }))
 }
+const ANALYTICS_DIMENSIONS = [
+  { key: 'experience', label: '经验要求' },
+  { key: 'degree', label: '学历要求' },
+  { key: 'industry', label: '行业' },
+  { key: 'scale', label: '公司规模' },
+]
+// 与后端月薪分桶一致的快捷档；min/max 为空表示不设该边界。
+const ANALYTICS_SALARY_PRESETS = [
+  { label: '10K以下', min: '', max: '10' },
+  { label: '10-20K', min: '10', max: '20' },
+  { label: '20-30K', min: '20', max: '30' },
+  { label: '30-50K', min: '30', max: '50' },
+  { label: '50K以上', min: '50', max: '' },
+]
+// 图表配色固定走 CSS 变量，随明暗主题切换（主题回归静态断言依赖这些字面量）。
+const CHART_PALETTE = [
+  'var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)', 'var(--chart-4)',
+  'var(--chart-5)', 'var(--chart-6)', 'var(--chart-7)', 'var(--chart-8)',
+]
 const AnalyticsView = {
   components: { SvgBars },
   setup() {
-    const filters = reactive({ keyword: '', cityCode: '', dateFrom: '', dateTo: '' })
+    // 多标签交叉筛选：维度内多值 OR、维度间 AND；后端候选刻面按互斥语义返回计数。
+    const filters = reactive({
+      keyword: '', cityCode: '', dateFrom: '', dateTo: '',
+      experience: [], degree: [], industry: [], scale: [],
+      salaryMin: '', salaryMax: '', headhunter: '',
+    })
     const loading = ref(false)
-    const meta = computed(() => store.analytics.meta || { keywords: [], cities: [] })
+    const meta = computed(() => store.analytics.meta
+      || { keywords: [], cities: [], options: {} })
     const summary = computed(() => {
       const value = store.analytics.summary || {}
       const min = value.avg_salary_min
       const max = value.avg_salary_max
+      const band = value.p25_monthly_salary_k != null && value.p75_monthly_salary_k != null
+        ? `${value.p25_monthly_salary_k}–${value.p75_monthly_salary_k}K` : '待数据'
       return {
         total: Number(value.jobs || 0), avg: min != null && max != null ? `${min}-${max}K` : '—',
+        median: value.median_monthly_salary_k != null ? `${value.median_monthly_salary_k}K` : '—',
+        quartileBand: band,
         headhunterRate: Number(value.headhunter_rate || 0), sourceCoverage: Number(value.source_coverage_rate || 0),
       }
     })
+    const funnelStages = computed(() => (store.analytics.funnel && store.analytics.funnel.stages) || [])
+    const activePreset = computed(() => {
+      const found = ANALYTICS_SALARY_PRESETS.find(item =>
+        item.min === filters.salaryMin && item.max === filters.salaryMax)
+      return found ? found.label : ''
+    })
+    const activeChips = computed(() => {
+      const chips = []
+      if (filters.keyword) chips.push({ kind: 'keyword', label: `关键词：${filters.keyword}` })
+      if (filters.cityCode) {
+        const city = (meta.value.cities || []).find(item => item.code === filters.cityCode)
+        chips.push({ kind: 'cityCode', label: `城市：${city ? city.name : filters.cityCode}` })
+      }
+      if (filters.dateFrom) chips.push({ kind: 'dateFrom', label: `起始 ${filters.dateFrom}` })
+      if (filters.dateTo) chips.push({ kind: 'dateTo', label: `截止 ${filters.dateTo}` })
+      for (const dim of ANALYTICS_DIMENSIONS)
+        for (const value of filters[dim.key]) chips.push({ kind: 'dim', field: dim.key, value, label: `${dim.label}：${value}` })
+      if (filters.salaryMin !== '' || filters.salaryMax !== '') {
+        chips.push({ kind: 'salary', label: `月薪 ${filters.salaryMin === '' ? '不限' : filters.salaryMin + 'K'} – ${filters.salaryMax === '' ? '不限' : filters.salaryMax + 'K'}` })
+      }
+      if (filters.headhunter === '1') chips.push({ kind: 'headhunter', label: '仅猎头岗位' })
+      if (filters.headhunter === '0') chips.push({ kind: 'headhunter', label: '排除猎头岗位' })
+      return chips
+    })
     const charts = computed(() => {
       const distributions = store.analytics.distributions || {}
-      return [
-        { title: '月薪分布', rows: apiChartRows(distributions.salary), color: 'var(--chart-1)' },
-        { title: '经验要求', rows: apiChartRows(distributions.experience), color: 'var(--chart-2)' },
-        { title: '学历要求', rows: apiChartRows(distributions.degree), color: 'var(--chart-3)' },
-        { title: '行业分布', rows: apiChartRows(distributions.industry), color: 'var(--chart-4)' },
-        { title: '公司规模', rows: apiChartRows(distributions.scale), color: 'var(--chart-5)' },
-        { title: '岗位评分', rows: apiChartRows(distributions.job_score), color: 'var(--chart-6)' },
-        { title: '城市分布', rows: apiChartRows(store.analytics.by_city), color: 'var(--chart-7)' },
-        { title: '采集趋势', rows: apiChartRows(store.analytics.trends || store.analytics.trend), color: 'var(--chart-8)' },
+      const cross = store.analytics.cross || {}
+      const crossRows = items => (items || []).map(item => ({ label: item.label, value: Number(item.value || 0) }))
+      const result = [
+        { title: '月薪分布', rows: apiChartRows(distributions.salary), id: 'salary', clickable: true, hint: '点击档位按月薪区间筛选' },
+        { title: '经验要求', rows: apiChartRows(distributions.experience), id: 'experience', clickable: true, hint: '点击类别加入经验筛选' },
+        { title: '学历要求', rows: apiChartRows(distributions.degree), id: 'degree', clickable: true, hint: '点击类别加入学历筛选' },
+        { title: '行业分布', rows: apiChartRows(distributions.industry), id: 'industry', clickable: true, hint: '点击行业加入行业筛选' },
+        { title: '公司规模', rows: apiChartRows(distributions.scale), id: 'scale', clickable: true, hint: '点击规模加入规模筛选' },
+        { title: '岗位评分', rows: apiChartRows(distributions.job_score) },
+        { title: '城市分布', rows: apiChartRows(store.analytics.by_city), id: 'city', clickable: true, hint: '点击城市切换城市筛选' },
+        { title: '关键词命中', rows: apiChartRows(store.analytics.by_keyword), id: 'keyword', clickable: true, hint: '点击关键词切换来源筛选' },
+        { title: '采集趋势', rows: apiChartRows(store.analytics.trends || store.analytics.trend) },
+        { title: '经验 × 平均月薪', rows: crossRows(cross.experience_avg_salary) },
+        { title: '学历 × 平均月薪', rows: crossRows(cross.degree_avg_salary) },
+        { title: '行业 × 平均月薪', rows: crossRows(cross.industry_avg_salary) },
+        { title: '公司岗位数 Top10', rows: crossRows(store.analytics.top_companies) },
+        { title: '技能需求 Top10', rows: crossRows(store.analytics.top_skills) },
       ]
+      result.forEach((chart, index) => { chart.color = chart.color || CHART_PALETTE[index % CHART_PALETTE.length] })
+      return result
     })
     async function loadAnalytics() {
       loading.value = true
       try {
-        await refreshAnalytics({ keyword: filters.keyword, city_code: filters.cityCode, date_from: filters.dateFrom, date_to: filters.dateTo })
+        await refreshAnalytics({
+          keyword: filters.keyword, city_code: filters.cityCode,
+          date_from: filters.dateFrom, date_to: filters.dateTo,
+          experience: filters.experience.join(','), degree: filters.degree.join(','),
+          industry: filters.industry.join(','), scale: filters.scale.join(','),
+          headhunter: filters.headhunter,
+          salary_min: filters.salaryMin, salary_max: filters.salaryMax,
+        })
       } catch (error) {
         showToast(`数据分析加载失败：${error.message}`, 'bad')
       } finally { loading.value = false }
     }
+    function toggleDimValue(field, value) {
+      const list = filters[field]
+      const index = list.indexOf(value)
+      if (index >= 0) list.splice(index, 1)
+      else list.push(value)
+      loadAnalytics()
+    }
+    function applySalaryBounds(min, max) {
+      filters.salaryMin = min
+      filters.salaryMax = max
+      loadAnalytics()
+    }
+    function applySalaryPreset(preset) {
+      // 再次点击当前档位视为取消；「自定义」输入框改动即时生效。
+      if (preset.min === filters.salaryMin && preset.max === filters.salaryMax) applySalaryBounds('', '')
+      else applySalaryBounds(preset.min, preset.max)
+    }
+    function clearSalary() { applySalaryBounds('', '') }
+    function pickChart(chart, item) {
+      if (!chart.clickable) return
+      if (['experience', 'degree', 'industry', 'scale'].includes(chart.id)) {
+        toggleDimValue(chart.id, item.label)
+        return
+      }
+      if (chart.id === 'salary') {
+        const preset = ANALYTICS_SALARY_PRESETS.find(row => row.label === item.label)
+        if (preset) applySalaryPreset(preset)
+        return
+      }
+      if (chart.id === 'city') {
+        const city = (meta.value.cities || []).find(row => row.name === item.label)
+        if (!city) return
+        filters.cityCode = filters.cityCode === city.code ? '' : city.code
+      } else if (chart.id === 'keyword') {
+        filters.keyword = filters.keyword === item.label ? '' : item.label
+      }
+      loadAnalytics()
+    }
+    function removeChip(chip) {
+      if (chip.kind === 'dim') {
+        const index = filters[chip.field].indexOf(chip.value)
+        if (index >= 0) filters[chip.field].splice(index, 1)
+      } else if (chip.kind === 'salary') {
+        filters.salaryMin = ''
+        filters.salaryMax = ''
+      } else {
+        filters[chip.kind] = ''
+      }
+      loadAnalytics()
+    }
     async function resetFilters() {
-      Object.assign(filters, { keyword: '', cityCode: '', dateFrom: '', dateTo: '' })
+      Object.assign(filters, {
+        keyword: '', cityCode: '', dateFrom: '', dateTo: '',
+        experience: [], degree: [], industry: [], scale: [],
+        salaryMin: '', salaryMax: '', headhunter: '',
+      })
       await loadAnalytics()
     }
-    return { filters, meta, summary, charts, loading, loadAnalytics, resetFilters }
+    return {
+      filters, dimensions: ANALYTICS_DIMENSIONS, salaryPresets: ANALYTICS_SALARY_PRESETS,
+      meta, summary, charts, funnelStages, activeChips, activePreset, loading,
+      loadAnalytics, resetFilters, clearSalary, applySalaryPreset, toggleDimValue,
+      pickChart, removeChip,
+    }
   },
   template: `
   <div>
-    <header class="page-head"><div><div class="eyebrow">市场洞察</div><h1>数据分析</h1><p>观察当前已应用采集数据的机会分布</p></div><button :disabled="loading" @click="resetFilters">{{loading?'加载中…':'重置筛选'}}</button></header>
-    <div class="filterbar analytics-filter"><select v-model="filters.keyword" @change="loadAnalytics"><option value="">全部关键词</option><option v-for="value in meta.keywords" :key="value">{{value}}</option></select><select v-model="filters.cityCode" @change="loadAnalytics"><option value="">全部城市</option><option v-for="city in meta.cities" :key="city.code" :value="city.code">{{city.name}}</option></select><label>起始日期<input type="date" v-model="filters.dateFrom" @change="loadAnalytics"></label><label>结束日期<input type="date" v-model="filters.dateTo" @change="loadAnalytics"></label></div>
-    <div class="metric-grid compact"><div class="metric tone-blue"><span>分析样本</span><strong>{{summary.total}}</strong><small>当前筛选内岗位</small></div><div class="metric tone-green"><span>平均月薪</span><strong>{{summary.avg}}</strong><small>按薪资上下限估算</small></div><div class="metric tone-amber"><span>猎头岗位占比</span><strong>{{summary.headhunterRate}}%</strong><small>按后端识别结果统计</small></div><div class="metric tone-red"><span>来源覆盖率</span><strong>{{summary.sourceCoverage}}%</strong><small>具备可靠采集归因</small></div></div>
-    <div class="chart-grid"><section v-for="chart in charts" :key="chart.title" class="chart-panel"><h2>{{chart.title}}</h2><SvgBars :items="chart.rows" :color="chart.color" /></section></div>
+    <header class="page-head"><div><div class="eyebrow">市场洞察</div><h1>数据分析</h1><p>多标签交叉下钻，点击图表条目即可加入或移除筛选</p></div><button :disabled="loading" @click="resetFilters">{{loading?'加载中…':'重置筛选'}}</button></header>
+    <div class="filterbar analytics-filter">
+      <select v-model="filters.keyword" @change="loadAnalytics"><option value="">全部关键词</option><option v-for="value in meta.keywords" :key="value">{{value}}</option></select>
+      <select v-model="filters.cityCode" @change="loadAnalytics"><option value="">全部城市</option><option v-for="city in meta.cities" :key="city.code" :value="city.code">{{city.name}}</option></select>
+      <label>起始日期<input type="date" v-model="filters.dateFrom" @change="loadAnalytics"></label>
+      <label>结束日期<input type="date" v-model="filters.dateTo" @change="loadAnalytics"></label>
+      <select v-model="filters.headhunter" @change="loadAnalytics"><option value="">含/不含猎头</option><option value="1">仅猎头岗位</option><option value="0">排除猎头岗位</option></select>
+    </div>
+    <section class="surface-panel dimension-filters">
+      <div class="dim-row" v-for="dim in dimensions" :key="dim.key">
+        <span class="dim-label">{{dim.label}}</span>
+        <div class="chip-group">
+          <button v-for="option in (meta.options[dim.key] || [])" :key="option.label"
+                  class="chip" :class="{on: option.selected}" type="button"
+                  :title="option.label + '：' + option.count + ' 个岗位'"
+                  @click="toggleDimValue(dim.key, option.label)">
+            {{option.label}}<i>{{option.count}}</i>
+          </button>
+          <span v-if="!(meta.options[dim.key] || []).length" class="dim-empty">暂无可选项</span>
+        </div>
+      </div>
+      <div class="dim-row">
+        <span class="dim-label">月薪区间</span>
+        <div class="chip-group">
+          <button class="chip" :class="{on: !filters.salaryMin && !filters.salaryMax}" type="button" @click="clearSalary">不限</button>
+          <button v-for="preset in salaryPresets" :key="preset.label" class="chip"
+                  :class="{on: activePreset === preset.label}" type="button"
+                  @click="applySalaryPreset(preset)">{{preset.label}}</button>
+          <label class="salary-custom">自定义<input type="number" min="0" step="1" v-model="filters.salaryMin" @change="loadAnalytics" placeholder="最低K"><span>–</span><input type="number" min="0" step="1" v-model="filters.salaryMax" @change="loadAnalytics" placeholder="最高K"></label>
+        </div>
+      </div>
+      <div class="active-chips" v-if="activeChips.length">
+        <span class="dim-label">已选条件</span>
+        <button v-for="chip in activeChips" :key="chip.label" class="chip on removable" type="button"
+                :title="'移除：' + chip.label" @click="removeChip(chip)">{{chip.label}}<i>×</i></button>
+      </div>
+    </section>
+    <div class="metric-grid compact">
+      <div class="metric tone-blue"><span>分析样本</span><strong>{{summary.total}}</strong><small>当前筛选内岗位</small></div>
+      <div class="metric tone-green"><span>平均月薪</span><strong>{{summary.avg}}</strong><small>按薪资上下限估算</small></div>
+      <div class="metric tone-cyan"><span>中位数月薪</span><strong>{{summary.median}}</strong><small>P25–P75：{{summary.quartileBand}}</small></div>
+      <div class="metric tone-amber"><span>猎头岗位占比</span><strong>{{summary.headhunterRate}}%</strong><small>按后端识别结果统计</small></div>
+      <div class="metric tone-red"><span>来源覆盖率</span><strong>{{summary.sourceCoverage}}%</strong><small>具备可靠采集归因</small></div>
+    </div>
+    <section class="surface-panel funnel-panel" v-if="funnelStages.length">
+      <h2>投递转化漏斗<small>当前筛选范围 · 按简历工作流标记与 HR 回复事实统计</small></h2>
+      <div class="funnel">
+        <div v-for="(stage,index) in funnelStages" :key="stage.key" class="funnel-stage">
+          <div class="funnel-head"><span>{{index + 1}}. {{stage.label}}</span><b>{{stage.count}}</b></div>
+          <div class="funnel-track"><i :style="{width: stage.pool_rate + '%'}"></i></div>
+          <small v-if="stage.step_rate != null">较上一级转化 {{stage.step_rate}}%</small>
+          <small v-else>样本池基准</small>
+        </div>
+      </div>
+    </section>
+    <div class="chart-grid">
+      <section v-for="chart in charts" :key="chart.title" class="chart-panel">
+        <h2>{{chart.title}}<small v-if="chart.hint">{{chart.hint}}</small></h2>
+        <SvgBars :items="chart.rows" :color="chart.color" :clickable="!!chart.clickable" @pick="item => pickChart(chart, item)" />
+      </section>
+    </div>
   </div>`,
 }
 

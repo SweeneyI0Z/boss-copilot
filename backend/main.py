@@ -1176,12 +1176,23 @@ def sync_refresh(body: dict = None):
 
 @app.get("/api/analytics")
 def analytics_read(keyword: str = "", city_code: str = "", date_from: str = "",
-                   date_to: str = "", resume_id: Optional[int] = None):
+                   date_to: str = "", experience: str = "", degree: str = "",
+                   industry: str = "", scale: str = "", headhunter: str = "",
+                   salary_min: Optional[float] = None,
+                   salary_max: Optional[float] = None,
+                   resume_id: Optional[int] = None):
     from . import analytics
     filters = {key: value for key, value in {
         "keyword": keyword, "city_code": city_code,
         "date_from": date_from, "date_to": date_to,
+        # 多维交叉筛选：多值逗号分隔，区间按月薪中点(K)，headhunter 取 1/0。
+        "experience": experience, "degree": degree, "industry": industry,
+        "scale": scale, "headhunter": headhunter,
     }.items() if value}
+    if salary_min is not None:
+        filters["salary_min"] = salary_min
+    if salary_max is not None:
+        filters["salary_max"] = salary_max
     return analytics.aggregate(filters, _default_resume_id(resume_id))
 
 
