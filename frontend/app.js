@@ -199,8 +199,12 @@ const EMPTY_SETTINGS = {
 }
 const EMPTY_ANALYTICS = {
   summary: {}, distributions: {},
-  meta: { keywords: [], cities: [], options: { experience: [], degree: [], industry: [], scale: [] } },
-  trends: [], cross: {}, funnel: { stages: [] }, top_companies: [], top_skills: [], job_rows: [],
+  meta: {
+    keywords: [], cities: [], keyword_options: [], city_options: [],
+    options: { experience: [], degree: [], industry: [], scale: [] },
+  },
+  trends: [], cross: {}, funnel: { stages: [] }, top_companies: [], top_skills: [],
+  job_rows: [],
 }
 const EMPTY_AI_PAGE = page => ({
   page, tasks: [], active: 0, effective_concurrency: 5, max_concurrency: 5,
@@ -1563,13 +1567,15 @@ const AnalyticsView = {
   setup() {
     // 多标签交叉筛选：维度内多值 OR、维度间 AND；后端候选刻面按互斥语义返回计数。
     const filters = reactive({
-      keyword: '', cityCode: '', dateFrom: '', dateTo: '',
+      keywords: [], cities: [], dateFrom: '', dateTo: '',
       experience: [], degree: [], industry: [], scale: [],
       salaryMin: '', salaryMax: '', headhunter: '',
     })
     const loading = ref(false)
     const meta = computed(() => store.analytics.meta
-      || { keywords: [], cities: [], options: {} })
+      || { keywords: [], cities: [], options: {}, keyword_options: [], city_options: [] })
+    const keywordOptions = computed(() => (meta.value.keyword_options || []))
+    const cityOptions = computed(() => (meta.value.city_options || []))
     const summary = computed(() => {
       const value = store.analytics.summary || {}
       const min = value.avg_salary_min
@@ -1598,10 +1604,10 @@ const AnalyticsView = {
     })
     const activeChips = computed(() => {
       const chips = []
-      if (filters.keyword) chips.push({ kind: 'keyword', label: `关键词：${filters.keyword}` })
-      if (filters.cityCode) {
-        const city = (meta.value.cities || []).find(item => item.code === filters.cityCode)
-        chips.push({ kind: 'cityCode', label: `城市：${city ? city.name : filters.cityCode}` })
+      for (const value of filters.keywords) chips.push({ kind: 'keywords', value, label: `关键词：${value}` })
+      for (const code of filters.cities) {
+        const city = cityOptions.value.find(item => item.code === code)
+        chips.push({ kind: 'cities', value: code, label: `城市：${city ? city.label : code}` })
       }
       if (filters.dateFrom) chips.push({ kind: 'dateFrom', label: `起始 ${filters.dateFrom}` })
       if (filters.dateTo) chips.push({ kind: 'dateTo', label: `截止 ${filters.dateTo}` })
@@ -1625,8 +1631,8 @@ const AnalyticsView = {
         { title: '行业分布', rows: apiChartRows(distributions.industry), id: 'industry', clickable: true, hint: '点击行业加入行业筛选' },
         { title: '公司规模', rows: apiChartRows(distributions.scale), id: 'scale', clickable: true, hint: '点击规模加入规模筛选' },
         { title: '岗位评分', rows: apiChartRows(distributions.job_score) },
-        { title: '城市分布', rows: apiChartRows(store.analytics.by_city), id: 'city', clickable: true, hint: '点击城市切换城市筛选' },
-        { title: '关键词命中', rows: apiChartRows(store.analytics.by_keyword), id: 'keyword', clickable: true, hint: '点击关键词切换来源筛选' },
+        { title: '城市分布', rows: apiChartRows(store.analytics.by_city), id: 'city', clickable: true, hint: '点击条目加入/移除城市筛选' },
+        { title: '关键词命中', rows: apiChartRows(store.analytics.by_keyword), id: 'keyword', clickable: true, hint: '点击条目加入/移除关键词筛选' },
         { title: '采集趋势', rows: apiChartRows(store.analytics.trends || store.analytics.trend) },
         { title: '经验 × 平均月薪', rows: crossRows(cross.experience_avg_salary) },
         { title: '学历 × 平均月薪', rows: crossRows(cross.degree_avg_salary) },
@@ -1641,7 +1647,7 @@ const AnalyticsView = {
       loading.value = true
       try {
         await refreshAnalytics({
-          keyword: filters.keyword, city_code: filters.cityCode,
+          keyword: filters.keywords.join(','), city_code: filters.cities.join(','),
           date_from: filters.dateFrom, date_to: filters.dateTo,
           experience: filters.experience.join(','), degree: filters.degree.join(','),
           industry: filters.industry.join(','), scale: filters.scale.join(','),
@@ -1682,18 +1688,20 @@ const AnalyticsView = {
         return
       }
       if (chart.id === 'city') {
-        const city = (meta.value.cities || []).find(row => row.name === item.label)
-        if (!city) return
-        filters.cityCode = filters.cityCode === city.code ? '' : city.code
-      } else if (chart.id === 'keyword') {
-        filters.keyword = filters.keyword === item.label ? '' : item.label
+        const option = cityOptions.value.find(row => row.label === item.label)
+        if (!option) return
+        toggleDimValue('cities', option.code)
+        return
       }
-      loadAnalytics()
+      if (chart.id === 'keyword') {
+        toggleDimValue('keywords', item.label)
+      }
     }
     function removeChip(chip) {
-      if (chip.kind === 'dim') {
-        const index = filters[chip.field].indexOf(chip.value)
-        if (index >= 0) filters[chip.field].splice(index, 1)
+      if (chip.kind === 'dim' || chip.kind === 'keywords' || chip.kind === 'cities') {
+        const list = filters[chip.kind === 'dim' ? chip.field : chip.kind]
+        const index = list.indexOf(chip.value)
+        if (index >= 0) list.splice(index, 1)
       } else if (chip.kind === 'salary') {
         filters.salaryMin = ''
         filters.salaryMax = ''
@@ -1704,7 +1712,7 @@ const AnalyticsView = {
     }
     async function resetFilters() {
       Object.assign(filters, {
-        keyword: '', cityCode: '', dateFrom: '', dateTo: '',
+        keywords: [], cities: [], dateFrom: '', dateTo: '',
         experience: [], degree: [], industry: [], scale: [],
         salaryMin: '', salaryMax: '', headhunter: '',
       })
@@ -1713,7 +1721,7 @@ const AnalyticsView = {
     return {
       filters, dimensions: ANALYTICS_DIMENSIONS, salaryPresets: ANALYTICS_SALARY_PRESETS,
       meta, summary, charts, funnelStages, activeChips, activePreset, loading,
-      jobRows, dimText, salaryText,
+      keywordOptions, cityOptions, jobRows, dimText, salaryText,
       loadAnalytics, resetFilters, clearSalary, applySalaryPreset, toggleDimValue,
       pickChart, removeChip,
     }
@@ -1722,13 +1730,35 @@ const AnalyticsView = {
   <div>
     <header class="page-head"><div><div class="eyebrow">市场洞察</div><h1>数据分析</h1><p>多标签交叉下钻，点击图表条目即可加入或移除筛选</p></div><button :disabled="loading" @click="resetFilters">{{loading?'加载中…':'重置筛选'}}</button></header>
     <div class="filterbar analytics-filter">
-      <select v-model="filters.keyword" @change="loadAnalytics"><option value="">全部关键词</option><option v-for="value in meta.keywords" :key="value">{{value}}</option></select>
-      <select v-model="filters.cityCode" @change="loadAnalytics"><option value="">全部城市</option><option v-for="city in meta.cities" :key="city.code" :value="city.code">{{city.name}}</option></select>
       <label>起始日期<input type="date" v-model="filters.dateFrom" @change="loadAnalytics"></label>
       <label>结束日期<input type="date" v-model="filters.dateTo" @change="loadAnalytics"></label>
       <select v-model="filters.headhunter" @change="loadAnalytics"><option value="">含/不含猎头</option><option value="1">仅猎头岗位</option><option value="0">排除猎头岗位</option></select>
     </div>
     <section class="surface-panel dimension-filters">
+      <div class="dim-row">
+        <span class="dim-label">岗位关键词</span>
+        <div class="chip-group">
+          <button v-for="option in keywordOptions" :key="'kw-' + option.label"
+                  class="chip" :class="{on: option.selected}" type="button"
+                  :title="option.label + '：' + option.count + ' 个岗位'"
+                  @click="toggleDimValue('keywords', option.label)">
+            {{option.label}}<i>{{option.count}}</i>
+          </button>
+          <span v-if="!keywordOptions.length" class="dim-empty">暂无可选项（采集命中后出现）</span>
+        </div>
+      </div>
+      <div class="dim-row">
+        <span class="dim-label">城市</span>
+        <div class="chip-group">
+          <button v-for="option in cityOptions" :key="'city-' + option.code"
+                  class="chip" :class="{on: option.selected}" type="button"
+                  :title="option.label + '：' + option.count + ' 个岗位'"
+                  @click="toggleDimValue('cities', option.code)">
+            {{option.label}}<i>{{option.count}}</i>
+          </button>
+          <span v-if="!cityOptions.length" class="dim-empty">暂无可选项（采集命中后出现）</span>
+        </div>
+      </div>
       <div class="dim-row" v-for="dim in dimensions" :key="dim.key">
         <span class="dim-label">{{dim.label}}</span>
         <div class="chip-group">

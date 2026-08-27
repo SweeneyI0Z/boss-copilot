@@ -1182,13 +1182,20 @@ def analytics_read(keyword: str = "", city_code: str = "", date_from: str = "",
                    salary_max: Optional[float] = None,
                    resume_id: Optional[int] = None):
     from . import analytics
-    filters = {key: value for key, value in {
-        "keyword": keyword, "city_code": city_code,
-        "date_from": date_from, "date_to": date_to,
-        # 多维交叉筛选：多值逗号分隔，区间按月薪中点(K)，headhunter 取 1/0。
-        "experience": experience, "degree": degree, "industry": industry,
-        "scale": scale, "headhunter": headhunter,
-    }.items() if value}
+    filters = {}
+    # 关键词/城市与四个维度一致支持多选：查询参数内以英文逗号分隔。
+    multi_params = {
+        "keyword": keyword, "city_code": city_code, "experience": experience,
+        "degree": degree, "industry": industry, "scale": scale,
+    }
+    for key, raw in multi_params.items():
+        values = [part.strip() for part in (raw or "").split(",") if part.strip()]
+        if values:
+            filters[key] = values
+    for key, value in {"date_from": date_from, "date_to": date_to,
+                       "headhunter": headhunter}.items():
+        if value:
+            filters[key] = value
     if salary_min is not None:
         filters["salary_min"] = salary_min
     if salary_max is not None:

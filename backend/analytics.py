@@ -178,7 +178,42 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
     source_filters_active = any(
         _as_list(filters.get(field)) for field in ("keyword", "city_code", "city")
     ) or bool(filters.get("date_from") or filters.get("date_to"))
-    base_clauses, base_args = _where(filters)
+    # 可靠命中查询的来源条件分组：按名排除即可支撑关键词/城市的互斥候选刻面。
+    def _source_groups() -> dict[str, tuple[list[str], list]]:
+        current_only = not (filters.get("date_from") or filters.get("date_to"))
+        groups: dict[str, tuple[list[str], list]] = {
+            "active": ([f"h.is_active=1"], []) if current_only else ([], []),
+            "keyword": ([], []), "city_code": ([], []), "date": ([], []),
+        }
+        for field in ("keyword", "city_code"):
+            values = _as_list(filters.get(field))
+            if values:
+                groups[field] = (
+                    [f"h.{field} IN ({','.join('?' for _ in values)})"],
+                    list(values))
+        date_clauses, date_args = [], []
+        if filters.get("date_from"):
+            date_clauses.append("substr(h.last_seen_at,1,10)>=?")
+            date_args.append(str(filters["date_from"])[:10])
+        if filters.get("date_to"):
+            date_clauses.append("substr(h.last_seen_at,1,10)<=?")
+            date_args.append(str(filters["date_to"])[:10])
+        groups["date"] = (date_clauses, date_args)
+        return groups
+
+    source_groups = _source_groups()
+    source_order = ("active", "keyword", "city_code", "date")
+
+    def assemble_source(keep=frozenset()) -> tuple[list[str], list]:
+        clauses, args = [], []
+        for name in source_order:
+            if name not in keep:
+                continue
+            clauses.extend(source_groups[name][0])
+            args.extend(source_groups[name][1])
+        return clauses, args
+
+    base_clauses, base_args = assemble_source(set(source_order))
     score_join, score_args = _score_join(resume_id)
     score_select = (
         "COALESCE(s.job_score,s.l1_score) job_score,"
@@ -199,8 +234,6 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
         return clauses, args
 
     # 岗位属性列统一从 jobs 表取（别名 j），供分布/榜单/漏斗复用。
-    # 岗位属性列统一从 jobs 表取（别名 j），供分布/榜单/漏斗复用。
-    # 占位符顺序：score_join 在先，随后是维度附加条件。
     reliable_base = (
         f"SELECT h.job_key,h.keyword,h.province,h.city,h.city_code,h.last_seen_at,"
         "j.title,j.company,j.salary,j.skills,j.salary_min,j.salary_max,j.salary_months,"
@@ -209,17 +242,22 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
         f"{score_select} FROM job_collection_hits h "
         "JOIN collect_runs cr ON cr.id=h.run_id AND cr.enabled=1 "
         "JOIN jobs j ON j.job_key=h.job_key "
-        f"{score_join} WHERE {' AND '.join(base_clauses)} AND j.status<>'excluded'"
+        f"{score_join}"
     )
 
-    def fetch_reliable(exclude_dims=frozenset()) -> list[dict]:
-        extra_clauses, extra_args = dim_conditions(exclude_dims)
-        sql = reliable_base
-        if extra_clauses:
-            sql += " AND " + " AND ".join(extra_clauses)
+    # exclude 除维度名外也接受来源条件名 keyword / city_code：
+    # 关键词或城市自身的候选列表不收窄，其余条件（含另一来源与维度）照常生效。
+    def fetch_reliable(exclude=frozenset()) -> list[dict]:
+        keep = frozenset(name for name in source_order
+                         if name not in ("keyword", "city_code")
+                         or name not in exclude)
+        src_clauses, src_args = assemble_source(keep)
+        extra_clauses, extra_args = dim_conditions(exclude)
+        where_parts = [*src_clauses, "j.status<>'excluded'", *extra_clauses]
+        sql = f"{reliable_base} WHERE {' AND '.join(where_parts)}"
         # 占位符顺序与 SQL 文本一致：评分 join 在先，随后来源筛选与维度筛选。
         return [dict(row) for row in get_db().execute(
-            sql, [*score_args, *base_args, *extra_args]).fetchall()]
+            sql, [*score_args, *src_args, *extra_args]).fetchall()]
 
     # 命中级行不去重：来源覆盖、by_keyword、by_city 都依赖多命中关系。
     reliable_rows = fetch_reliable()
@@ -380,6 +418,37 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
     job_rows = [{field: row.get(field) for field in row_fields}
                 for row in sorted(unique, key=_job_sort_key, reverse=True)[:JOB_ROWS_LIMIT]]
 
+    # 关键词/城市候选刻面：排除自身来源条件（其余来源、日期、维度全部生效）。
+    def _pair_options(rows, label_of, code_of, selected_values):
+        buckets: dict[str, dict] = {}
+        for row in rows:
+            code = str(code_of(row) or "").strip()
+            if not code:
+                continue
+            bucket = buckets.setdefault(
+                code, {"label": str(label_of(row) or "").strip() or code, "keys": set()})
+            bucket["keys"].add(row["job_key"])
+        return [{"label": item["label"], "code": code,
+                 "count": len(item["keys"]), "selected": code in selected_values}
+                for code, item in sorted(
+                    buckets.items(),
+                    key=lambda kv: (-len(kv[1]["keys"]), kv[1]["label"]))]
+
+    sel_keywords = set(_multi(filters.get("keyword")))
+    keyword_buckets: dict[str, set] = defaultdict(set)
+    for row in fetch_reliable(frozenset({"keyword"})):
+        if row["keyword"]:
+            keyword_buckets[row["keyword"]].add(row["job_key"])
+    keyword_options = [{"label": label, "code": label, "count": len(keys),
+                        "selected": label in sel_keywords}
+                       for label, keys in sorted(
+                           keyword_buckets.items(),
+                           key=lambda item: (-len(item[1]), item[0]))]
+    city_sel = set(_multi(filters.get("city_code")))
+    city_options = _pair_options(
+        fetch_reliable(frozenset({"city_code"})),
+        lambda row: row["city"], lambda row: row["city_code"], city_sel)
+
     summary = {
         "jobs": len(unique), "active_relations": len(reliable_rows),
         "reliable_jobs": reliable_jobs, "unattributed_jobs": unattributed_jobs,
@@ -407,7 +476,9 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
         "meta": {"keywords": keywords,
                  "cities": [{"name": item["city"], "code": item["city_code"]}
                             for item in city_values],
-                 "options": options},
+                 "options": options,
+                 "keyword_options": keyword_options,
+                 "city_options": city_options},
         "trends": [{"label": item["day"], "count": item["count"]} for item in trend],
         # 同时保留语义更明确的字段，便于 API 使用方按需读取。
         "salary_monthly": salary_monthly, "salary_annual": salary_annual,

@@ -363,11 +363,18 @@ class AnalyticsFrontendContractTests(unittest.TestCase):
         self.assertIn("rows: crossRows(store.analytics.top_companies)", self.app)
         self.assertIn("rows: crossRows(store.analytics.top_skills)", self.app)
 
+    def test_keyword_and_city_chips_support_multi_select(self):
+        # 关键词/城市与维度一致走 chip 多选：序列化为逗号串、候选带计数与选中态。
+        self.assertIn("toggleDimValue('keywords', option.label)", self.app)
+        self.assertIn("toggleDimValue('cities', option.code)", self.app)
+        self.assertIn("keyword: filters.keywords.join(',')", self.app)
+        self.assertIn("city_code: filters.cities.join(',')", self.app)
+
     def test_empty_state_contains_new_payload_keys(self):
-        block = self.app.split("const EMPTY_ANALYTICS")[1]
-        block = block[block.index("{"): block.index("\n}")]
+        start = self.app.index("const EMPTY_ANALYTICS")
+        block = self.app[start: self.app.index("\n}", start)]
         for key in ("options", "cross", "funnel", "top_companies", "top_skills",
-                    "job_rows"):
+                    "job_rows", "keyword_options", "city_options"):
             self.assertIn(key, block)
 
     def test_filtered_job_table_contract(self):
@@ -376,6 +383,71 @@ class AnalyticsFrontendContractTests(unittest.TestCase):
         self.assertIn('v-for="row in jobRows" :key="row.job_key"', self.app)
         self.assertIn("{{salaryText(row)}}", self.app)
         self.assertIn("{{dimText(row.experience)}}", self.app)
+
+
+class SourceOptionTests(AnalyticsCrossTestCase):
+    """岗位关键词/城市多选筛选及其互斥候选刻面。"""
+
+    def seed_hits(self):
+        run_id = self.add_run(True)
+        self.add_job("kj1", degree="本科")
+        self.add_job("kp1", degree="博士")
+        self.add_job("kz1", degree="本科")
+        self.attach(run_id, "kj1", "Java后端", city="深圳", city_code="101280600")
+        self.attach(run_id, "kp1", "Python数据", city="广州", city_code="101280100")
+        self.attach(run_id, "kz1", "Java后端", city="深圳", city_code="101280600")
+
+    def test_keyword_candidates_exclude_own_selection(self):
+        self.seed_hits()
+
+        result = analytics.aggregate({"keyword": ["Java后端"]})
+
+        # 主统计按关键词收窄到 2 个岗位。
+        self.assertEqual(result["summary"]["jobs"], 2)
+        self.assertEqual(result["meta"]["keywords"], ["Java后端"])
+        # 候选刻面对自身免疫：两条关键词都在列且标出选中态。
+        options = {item["label"]: item for item in result["meta"]["keyword_options"]}
+        self.assertEqual(options["Java后端"]["count"], 2)
+        self.assertTrue(options["Java后端"]["selected"])
+        self.assertEqual(options["Python数据"]["count"], 1)
+        self.assertFalse(options["Python数据"]["selected"])
+
+    def test_city_candidates_respect_other_conditions(self):
+        self.seed_hits()
+
+        result = analytics.aggregate({"city_code": ["101280600"]})
+
+        cities = {item["code"]: item for item in result["meta"]["city_options"]}
+        self.assertTrue(cities["101280600"]["selected"])
+        self.assertFalse(cities["101280100"]["selected"])
+        # 关键词候选吃到城市条件：只剩深圳命中的 Java后端。
+        self.assertEqual([item["label"] for item in result["meta"]["keyword_options"]],
+                         ["Java后端"])
+
+    def test_multi_value_keyword_and_city_via_endpoint(self):
+        from backend import main
+        self.seed_hits()
+
+        result = main.analytics_read(keyword="Java后端,Python数据",
+                                     city_code="101280600,101280100")
+
+        self.assertEqual(result["summary"]["jobs"], 3)
+        selected = {item["label"] for item in result["meta"]["keyword_options"]
+                    if item["selected"]}
+        self.assertEqual(selected, {"Java后端", "Python数据"})
+        selected_cities = {item["code"] for item in result["meta"]["city_options"]
+                           if item["selected"]}
+        self.assertEqual(selected_cities, {"101280600", "101280100"})
+
+    def test_unfiltered_meta_still_lists_all(self):
+        self.seed_hits()
+
+        result = analytics.aggregate()
+
+        self.assertEqual(result["meta"]["keywords"], ["Java后端", "Python数据"])
+        self.assertEqual(len(result["meta"]["cities"]), 2)
+        self.assertFalse(any(item["selected"]
+                             for item in result["meta"]["keyword_options"]))
 
 
 class JobRowsTests(AnalyticsCrossTestCase):
