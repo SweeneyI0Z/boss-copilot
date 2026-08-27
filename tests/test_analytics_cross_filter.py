@@ -366,8 +366,60 @@ class AnalyticsFrontendContractTests(unittest.TestCase):
     def test_empty_state_contains_new_payload_keys(self):
         block = self.app.split("const EMPTY_ANALYTICS")[1]
         block = block[block.index("{"): block.index("\n}")]
-        for key in ("options", "cross", "funnel", "top_companies", "top_skills"):
+        for key in ("options", "cross", "funnel", "top_companies", "top_skills",
+                    "job_rows"):
             self.assertIn(key, block)
+
+    def test_filtered_job_table_contract(self):
+        # 末尾筛选结果清单：六列明细表走 jobRows 渲染，空值回落「未标注」。
+        self.assertIn("筛选结果岗位", self.app)
+        self.assertIn('v-for="row in jobRows" :key="row.job_key"', self.app)
+        self.assertIn("{{salaryText(row)}}", self.app)
+        self.assertIn("{{dimText(row.experience)}}", self.app)
+
+
+class JobRowsTests(AnalyticsCrossTestCase):
+    def test_job_rows_follow_filters_and_field_mapping(self):
+        self.add_job("m1", title="后端工程师", company="星尘科技", industry="人工智能",
+                     salary="25-45K·14薪", experience="3-5年", degree="本科")
+        self.add_job("m2", title="硬件工程师", company="南枝生物", industry="消费电子")
+
+        rows = analytics.aggregate({"industry": ["人工智能"]})["job_rows"]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0], {
+            "job_key": "m1", "title": "后端工程师", "company": "星尘科技",
+            "salary": "25-45K·14薪", "experience": "3-5年", "degree": "本科",
+            "industry": "人工智能"})
+
+    def test_job_rows_sorted_by_composite_then_salary(self):
+        conn = get_db()
+        self.add_job("low", salary_min=10, salary_max=12)
+        self.add_job("high", salary_min=50, salary_max=60)
+        self.add_job("scored", salary_min=1, salary_max=2)
+        conn.execute(
+            "INSERT INTO job_resume_scores(job_key,resume_id,resume_revision,"
+            "l1_detail,created_at,updated_at,composite) VALUES(?,?,?,?,?,?,88.0)",
+            ("scored", self.resume["id"], self.resume["revision"], "{}",
+             now_iso(), now_iso()))
+        conn.commit()
+
+        keys = [row["job_key"] for row in analytics.aggregate()["job_rows"]]
+
+        # 综合评分优先点亮，无评分岗位按月薪中点降序。
+        self.assertEqual(keys, ["scored", "high", "low"])
+
+    def test_job_rows_respect_limit(self):
+        from unittest.mock import patch
+        for index in range(4):
+            self.add_job(f"cap{index}", salary_min=10 + index,
+                         salary_max=20 + index)
+
+        with patch.object(analytics, "JOB_ROWS_LIMIT", 2):
+            rows = analytics.aggregate()["job_rows"]
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["job_key"] for row in rows], ["cap3", "cap2"])
 
 
 class EndpointParamTests(AnalyticsCrossTestCase):

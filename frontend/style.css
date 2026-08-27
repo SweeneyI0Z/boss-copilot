@@ -415,6 +415,17 @@ td p { margin-top: 2px; color: var(--muted); font-size: 10px; }
 .funnel-track { height: 6px; margin-top: 8px; overflow: hidden; border-radius: 3px; background: var(--surface-3); }
 .funnel-track i { display: block; height: 100%; min-width: 2px; border-radius: 3px; background: var(--accent); transition: width .25s ease; }
 .funnel-stage > small { display: block; margin-top: 6px; color: var(--muted); font-size: 10px; }
+.analytics-jobs { margin-top: 12px; }
+.analytics-jobs h2 { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.analytics-jobs h2 small { color: var(--muted); font-size: 11px; font-weight: 400; }
+.analytics-jobs .table-wrap { margin-top: 4px; }
+.analytics-jobs table { min-width: 760px; table-layout: fixed; }
+.analytics-jobs th:nth-child(1) { width: 24%; }
+.analytics-jobs th:nth-child(2) { width: 18%; }
+.analytics-jobs th:nth-child(3) { width: 16%; }
+.analytics-jobs th:nth-child(4), .analytics-jobs th:nth-child(5) { width: 13%; }
+.analytics-jobs th:nth-child(6) { width: 16%; }
+.analytics-jobs td, .analytics-jobs th { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 720px) {
   .dim-row, .active-chips { grid-template-columns: 1fr; gap: 5px; }
   .dim-label { padding-top: 0; }

@@ -16,6 +16,9 @@ from .db import get_db
 # 可多选交叉筛选的岗位属性维度（列名与 jobs 表一致）。
 DIMENSION_FIELDS = ("experience", "degree", "industry", "scale")
 
+# 筛选结果岗位清单的最大返回条数：分布覆盖全量，明细表只回传排名靠前的样本。
+JOB_ROWS_LIMIT = 200
+
 
 def _as_list(value) -> list[str]:
     if value is None or value == "":
@@ -200,8 +203,8 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
     # 占位符顺序：score_join 在先，随后是维度附加条件。
     reliable_base = (
         f"SELECT h.job_key,h.keyword,h.province,h.city,h.city_code,h.last_seen_at,"
-        "j.company,j.skills,j.salary_min,j.salary_max,j.salary_months,j.experience,"
-        "j.degree,j.industry,j.scale,j.status,"
+        "j.title,j.company,j.salary,j.skills,j.salary_min,j.salary_max,j.salary_months,"
+        "j.experience,j.degree,j.industry,j.scale,j.status,"
         "COALESCE(j.headhunter_override,j.is_headhunter,0) headhunter,"
         f"{score_select} FROM job_collection_hits h "
         "JOIN collect_runs cr ON cr.id=h.run_id AND cr.enabled=1 "
@@ -224,8 +227,9 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
     def fetch_current(exclude_dims=frozenset()) -> list[dict]:
         current_base = (
             "SELECT j.job_key,'' keyword,'' province,j.location city,'' city_code,"
-            "j.last_seen_at,j.company,j.skills,j.salary_min,j.salary_max,"
-            "j.salary_months,j.experience,j.degree,j.industry,j.scale,j.status,"
+            "j.last_seen_at,j.title,j.company,j.salary,j.skills,j.salary_min,"
+            "j.salary_max,j.salary_months,j.experience,j.degree,j.industry,"
+            "j.scale,j.status,"
             "COALESCE(j.headhunter_override,j.is_headhunter,0) headhunter,"
             f"{score_select} FROM jobs j {score_join} "
             "WHERE j.status NOT IN ('excluded','delisted') AND "
@@ -364,6 +368,18 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
 
     funnel = _funnel_report(filters, resume_id, unique)
 
+    # 筛选结果岗位明细：综合评分优先、无评分按月薪中点降序；只回传前 JOB_ROWS_LIMIT 条。
+    def _job_sort_key(row):
+        score = row.get("composite")
+        score_value = float(score) if score is not None else float("-inf")
+        midpoint = monthly_of(row)
+        return score_value, midpoint if midpoint is not None else float("-inf")
+
+    row_fields = ("job_key", "title", "company", "salary",
+                  "experience", "degree", "industry")
+    job_rows = [{field: row.get(field) for field in row_fields}
+                for row in sorted(unique, key=_job_sort_key, reverse=True)[:JOB_ROWS_LIMIT]]
+
     summary = {
         "jobs": len(unique), "active_relations": len(reliable_rows),
         "reliable_jobs": reliable_jobs, "unattributed_jobs": unattributed_jobs,
@@ -400,7 +416,7 @@ def aggregate(filters: dict = None, resume_id=None) -> dict:
         "job_score": distributions["job_score"], "priority": distributions["priority"],
         "by_keyword": _group_distinct(reliable_rows, "keyword", "公司定向"),
         "by_city": _group_distinct(reliable_rows, "city"), "trend": trend,
-        "cross": cross, "funnel": funnel,
+        "cross": cross, "funnel": funnel, "job_rows": job_rows,
         "top_companies": top_companies, "top_skills": top_skills,
         "filters": {"keywords": keywords, "cities": city_values},
     }

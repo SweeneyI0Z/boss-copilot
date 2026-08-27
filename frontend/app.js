@@ -200,7 +200,7 @@ const EMPTY_SETTINGS = {
 const EMPTY_ANALYTICS = {
   summary: {}, distributions: {},
   meta: { keywords: [], cities: [], options: { experience: [], degree: [], industry: [], scale: [] } },
-  trends: [], cross: {}, funnel: { stages: [] }, top_companies: [], top_skills: [],
+  trends: [], cross: {}, funnel: { stages: [] }, top_companies: [], top_skills: [], job_rows: [],
 }
 const EMPTY_AI_PAGE = page => ({
   page, tasks: [], active: 0, effective_concurrency: 5, max_concurrency: 5,
@@ -1584,6 +1584,13 @@ const AnalyticsView = {
       }
     })
     const funnelStages = computed(() => (store.analytics.funnel && store.analytics.funnel.stages) || [])
+    const jobRows = computed(() => store.analytics.job_rows || [])
+    const dimText = value => (value && String(value).trim() ? String(value) : '未标注')
+    const salaryText = row => {
+      if (row.salary && String(row.salary).trim()) return row.salary
+      if (row.salary_min != null && row.salary_max != null) return `${row.salary_min}-${row.salary_max}K`
+      return '未标注'
+    }
     const activePreset = computed(() => {
       const found = ANALYTICS_SALARY_PRESETS.find(item =>
         item.min === filters.salaryMin && item.max === filters.salaryMax)
@@ -1706,6 +1713,7 @@ const AnalyticsView = {
     return {
       filters, dimensions: ANALYTICS_DIMENSIONS, salaryPresets: ANALYTICS_SALARY_PRESETS,
       meta, summary, charts, funnelStages, activeChips, activePreset, loading,
+      jobRows, dimText, salaryText,
       loadAnalytics, resetFilters, clearSalary, applySalaryPreset, toggleDimValue,
       pickChart, removeChip,
     }
@@ -1773,6 +1781,23 @@ const AnalyticsView = {
         <SvgBars :items="chart.rows" :color="chart.color" :clickable="!!chart.clickable" @pick="item => pickChart(chart, item)" />
       </section>
     </div>
+    <section class="surface-panel analytics-jobs">
+      <h2>筛选结果岗位<small>共 {{summary.total}} 个 · 按综合评分与薪资排序，最多展示 {{jobRows.length}} 条</small></h2>
+      <div class="table-wrap" v-if="jobRows.length"><table>
+        <thead><tr><th>岗位</th><th>公司</th><th>薪资</th><th>经验</th><th>学历</th><th>行业</th></tr></thead>
+        <tbody>
+          <tr v-for="row in jobRows" :key="row.job_key">
+            <td>{{row.title}}</td>
+            <td>{{dimText(row.company)}}</td>
+            <td>{{salaryText(row)}}</td>
+            <td>{{dimText(row.experience)}}</td>
+            <td>{{dimText(row.degree)}}</td>
+            <td>{{dimText(row.industry)}}</td>
+          </tr>
+        </tbody>
+      </table></div>
+      <div v-else class="empty compact">当前筛选条件下暂无岗位</div>
+    </section>
   </div>`,
 }
 
