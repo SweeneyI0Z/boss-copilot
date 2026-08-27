@@ -8,7 +8,7 @@
 
 ```bash
 cd ~/project/boss-copilot
-.venv/bin/python -m unittest discover tests -v   # 回归（336 例，必须全绿）
+.venv/bin/python -m unittest discover tests -v   # 回归（341 例，必须全绿）
 .venv/bin/uvicorn backend.main:app --port 8787
 # 浏览器打开 http://127.0.0.1:8787
 # 新人请先读下方「注意事项」，并在应用左侧导航打开「使用指南」跟随向导操作
@@ -89,6 +89,7 @@ cd ~/project/boss-copilot
 | M18 | 双账号向导/流式采集策略/岗位级进度/标签增强/工作台深链 | 本次改动 |
 | M19 | 招呼语幂等生成/采集 ETA 学习/评分分析招呼语剩余时间 | 本次改动 |
 | M20 | 使用指南页（注意事项+顺序教程）/首访引导弹窗/向导跨视图触发 | 本次改动 |
+| M22 | 岗位列表综合评分列（0.6×匹配 + 0.4×岗位，可排序） | 本次改动 |
 
 ## 发送护栏（不可关闭）
 
@@ -129,7 +130,7 @@ backend/
   interview.py   模拟面试 agent
   boss/cdp.py    账号 CDP 管理（单/双账号切换 + 代理绕过）
 frontend/        无构建 Vue3（app.js 单文件 + vendored vue.esm）
-tests/           336 个单测 + 真实登录态只读 spike 脚本
+tests/           341 个单测 + 真实登录态只读 spike 脚本
 ```
 
 ## 已知边界

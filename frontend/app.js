@@ -1596,7 +1596,8 @@ const JobsView = {
     const columns = [
       { key: 'title', label: '岗位' }, { key: 'company', label: '公司' }, { key: 'salary_max', label: '薪资' },
       { key: 'experience', label: '经验 / 学历' }, { key: 'job_score', label: '岗位评分' },
-      { key: 'match_score', label: '匹配度评分' }, { key: 'priority', label: 'P级' }, { key: 'active_ts', label: '活跃时间' },
+      { key: 'match_score', label: '匹配度评分' }, { key: 'composite', label: '综合评分' },
+      { key: 'priority', label: 'P级' }, { key: 'active_ts', label: '活跃时间' },
     ]
     const filtered = computed(() => jobsFromEnabledRuns().filter(job => {
       const query = q.value.trim().toLowerCase()
@@ -1695,10 +1696,11 @@ const JobsView = {
               <td data-label="经验 / 学历"><b>{{job.experience}}</b><p>{{job.degree}}</p></td>
               <td data-label="岗位评分" class="score" :class="{'score-pending':scoreLabel(job,'job_score','jobs')==='评分中'}">{{scoreLabel(job,'job_score','jobs')}}</td>
               <td data-label="匹配度评分" class="score accent-score" :class="{'score-pending':scoreLabel(job,'match_score','jobs')==='评分中'}">{{scoreLabel(job,'match_score','jobs')}}</td>
+              <td data-label="综合评分" class="score" :class="{'score-pending':scoreLabel(job,'composite','jobs')==='评分中'}">{{scoreLabel(job,'composite','jobs')}}</td>
               <td data-label="P级"><span class="priority" :class="String(job.priority||'').toLowerCase()">{{job.priority}}</span></td>
               <td data-label="活跃时间"><b>{{job.active}}</b><p>{{(job.active_ts||'').slice(0,10) || '—'}}</p></td>
             </tr>
-            <tr v-if="expanded===job.job_key" class="detail-row"><td colspan="8"><div class="job-detail"><div class="detail-toolbar"><button :class="{primary:job.favorite}" @click.stop="toggleFavorite(job)">{{job.favorite?'取消收藏':'添加收藏'}}</button><a v-if="job.favorite" class="button" :href="jobCardHref(job)" @click.stop>岗位分析</a><button @click.stop="excludeJob(job)">不再显示</button></div><div class="detail-meta"><div><span>岗位评分</span><b>{{scoreLabel(job,'job_score','jobs')}}</b></div><div><span>匹配度</span><b>{{scoreLabel(job,'match_score','jobs')}}</b></div><div><span>优先级</span><b>{{job.priority || '—'}}</b></div><div><span>来源关键词</span><b>{{job.source_keyword}}</b></div></div><h3>职位描述（JD）</h3><p class="jd-copy">{{job.jd}}</p></div></td></tr>
+            <tr v-if="expanded===job.job_key" class="detail-row"><td colspan="9"><div class="job-detail"><div class="detail-toolbar"><button :class="{primary:job.favorite}" @click.stop="toggleFavorite(job)">{{job.favorite?'取消收藏':'添加收藏'}}</button><a v-if="job.favorite" class="button" :href="jobCardHref(job)" @click.stop>岗位分析</a><button @click.stop="excludeJob(job)">不再显示</button></div><div class="detail-meta"><div><span>岗位评分</span><b>{{scoreLabel(job,'job_score','jobs')}}</b></div><div><span>匹配度</span><b>{{scoreLabel(job,'match_score','jobs')}}</b></div><div><span>综合分</span><b>{{scoreLabel(job,'composite','jobs')}}</b></div><div><span>优先级</span><b>{{job.priority || '—'}}</b></div><div><span>来源关键词</span><b>{{job.source_keyword}}</b></div></div><h3>职位描述（JD）</h3><p class="jd-copy">{{job.jd}}</p></div></td></tr>
           </template>
         </tbody>
       </table>

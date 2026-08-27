@@ -14,9 +14,9 @@ class FrontendGuideTests(unittest.TestCase):
         cls.index = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
         cls.readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    def test_cache_version_bumped_to_m20(self):
-        self.assertIn("style.css?v=m20-guide", self.index)
-        self.assertIn("app.js?v=m20-guide", self.index)
+    def test_cache_version_bumped_from_m20(self):
+        # M22 起版本号演进，本用例只约束不再停留于 M20 旧值，当前值由最新里程碑钉住
+        self.assertNotIn("?v=m20-guide", self.index)
         self.assertNotIn("?v=m19-eta", self.index)
 
     def test_guide_route_and_nav_entry_registered(self):
