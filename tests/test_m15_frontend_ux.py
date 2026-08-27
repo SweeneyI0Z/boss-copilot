@@ -29,8 +29,10 @@ class FrontendUxTests(unittest.TestCase):
         for symbol in ("INITIAL_RESUMES", "INITIAL_JOBS", "INITIAL_RUNS",
                        "INITIAL_RUN_JOB_KEYS", "demo-anker-fw"):
             self.assertNotIn(symbol, self.app)
-        self.assertEqual(self.app.count("localStorage."), 1)
+        # M20 起新增首访引导标记键，持久化仍保持最小集合
         self.assertIn("localStorage.setItem('theme'", self.app)
+        self.assertIn("localStorage.getItem(ONBOARDING_KEY)", self.app)
+        self.assertIn("'bc-onboarding-v1'", self.app)
 
     def test_api_client_and_global_bootstrap_cover_read_models(self):
         self.assertIn("async function apiRequest", self.app)

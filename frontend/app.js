@@ -690,6 +690,7 @@ const nav = [
   ['/jobcard', '收藏工作台'],
   ['/accounts', '账号管理'],
   ['/settings', '设置'],
+  ['/guide', '使用指南'],
 ]
 const ROUTE_ALIASES = { '/greetings': '/jobcard', '/interview': '/jobcard' }
 const VALID_ROUTES = new Set(nav.map(([path]) => path))
@@ -712,6 +713,22 @@ window.addEventListener('hashchange', () => {
 })
 function jobCardHref(job) {
   return `#/jobcard?job=${encodeURIComponent(job && job.job_key || '')}`
+}
+
+// -- 新手引导共享状态 -----------------------------------------------------
+// 使用指南页 / 首访弹窗跨视图请求打开求职作战向导：先跳转到总览看板，
+// DashboardView 挂载时消费挂起意图，避免路由切换后 watch 错过自增信号
+const wizardRequest = ref(0)
+const wizardIntentPending = { value: false }
+function requestWizardOpen() {
+  wizardIntentPending.value = true
+  wizardRequest.value++
+  location.hash = '#/dashboard'
+}
+// 启动须知弹窗：每次启动默认显示；用户勾选「不再显示」并确认后才永久关闭
+const ONBOARDING_KEY = 'bc-onboarding-v1'
+function markOnboardingDone() {
+  localStorage.setItem(ONBOARDING_KEY, '1')
 }
 
 // -- 通用图表 -----------------------------------------------------------
@@ -798,6 +815,14 @@ const DashboardView = {
       guide.busy = ''
       guide.open = false
     }
+    function consumeWizardRequest() {
+      if (!wizardIntentPending.value || guide.open) return
+      wizardIntentPending.value = false
+      openGuide()
+    }
+    watch(wizardRequest, consumeWizardRequest)
+    // 使用指南等页面跨视图跳转过来时，组件刚挂载，需主动消费一次挂起的打开请求
+    consumeWizardRequest()
     async function finishResumeStep() {
       if (guide.resumeMode === 'new') {
         if (!guide.resumeName.trim() || !guide.resumeBody.trim()) {
@@ -974,7 +999,7 @@ const DashboardView = {
   <div>
     <header class="page-head">
       <div><div class="eyebrow">工作概览</div><h1>总览看板</h1><p>求职进度、采集状态与优先岗位</p></div>
-      <div class="row"><button @click="openGuide">向导</button><a class="button primary" href="#/collect">新建采集计划</a></div>
+      <div class="row"><a class="button" href="#/guide">使用指南</a><button @click="openGuide">向导</button><a class="button primary" href="#/collect">新建采集计划</a></div>
     </header>
     <div v-if="staleJobs.length" class="freshness-warning"><div><b>采集数据需要更新</b><span>{{staleJobs.length}} 个岗位已超过 3 天没有更新，建议重新采集以确认岗位状态。</span></div><a class="button" href="#/collect">更新采集数据</a></div>
     <div class="metric-grid">
@@ -2084,7 +2109,63 @@ const SettingsView = {
     <header class="page-head"><div><div class="eyebrow">系统偏好</div><h1>设置</h1><p>模型服务、发送护栏与评分参数</p></div><button class="primary" @click="save">保存设置</button></header>
     <section class="settings-section"><div class="section-title"><div><h2>LLM 服务</h2><p>用于采集计划、匹配度评分、招呼语和模拟面试</p></div><span class="status-badge" :class="isLlmConfigured(draft)?'completed':'paused'">{{isLlmConfigured(draft)?'已配置':'未配置'}}</span></div><div class="llm-token-warning"><b>请注意 Token 消耗</b><span>批量岗位评分、应聘分析和招呼语会按岗位分别调用模型；建议先筛选目标岗位，再按需加入生成队列。</span></div><div class="form-grid three"><label>Base URL<input v-model="draft.llmBaseUrl" placeholder="https://api.example.com/v1"></label><label>API Key<input v-model="draft.llmApiKey" type="password" placeholder="由本地后端保存"></label><label>模型<input v-model="draft.llmModel" placeholder="model-name"></label></div><div class="setting-actions"><button :disabled="testing" @click="testConnection">{{testing?'测试中…':'测试连通性'}}</button><span v-if="testResult" :class="testResult.ok?'ok':'bad'">{{testResult.text}}</span></div></section>
     <section class="settings-section"><div class="section-title"><div><h2>发送护栏</h2><p>自动打招呼始终遵守以下边界</p></div><span class="status-badge paused">不可关闭</span></div><div class="form-grid four"><label>每日上限<input type="number" v-model.number="draft.sendDailyLimit" min="1" max="110"></label><label>硬顶<input type="number" v-model.number="draft.sendDailyHardCap" min="1" max="110"></label><label>最小间隔（秒）<input type="number" v-model.number="draft.sendGapMin" min="30" max="90"></label><label>最大间隔（秒）<input type="number" v-model.number="draft.sendGapMax" min="30" max="90"></label></div><div class="guardrail-list"><span>每日上限 {{draft.sendDailyLimit}}</span><span>硬顶 {{draft.sendDailyHardCap}}</span><span>{{draft.sendGapMin}}-{{draft.sendGapMax}} 秒随机间隔</span><span>同公司 30 天去重</span><span>风控信号当日熔断</span></div></section>
+    <section class="settings-section"><div class="section-title"><div><h2>采集节奏</h2><p>采集号只读抓取的随机等待与列表任务间隔，切换后从下一次采集生效</p></div></div><div class="form-grid two"><label>节奏档位<select v-model="draft.collectPace"><option v-for="option in paceOptions" :key="option.value" :value="option.value">{{ option.label }}</option></select></label><p class="muted">{{ paceHint }}。越快越接近机器流量特征，命中风控信号当日熔断；重跑重复内容会自动提前停止翻页。</p></div></section>
     <section class="settings-section"><div class="section-title"><div><h2>评分与活跃度</h2><p>控制匹配度评分数量和岗位有效性判断</p></div></div><div class="form-grid two"><label>匹配度评分默认岗位数<input type="number" v-model.number="draft.matchScoreTopN" min="1" max="100"></label><label>HR 不活跃阈值（天）<input type="number" v-model.number="draft.inactiveDays" min="1" max="90"></label></div></section>
+  </div>`,
+}
+
+// -- 页面：使用指南（新人引导） ------------------------------------------
+// 注意事项内容与 README「注意事项」章节保持一致
+const GUIDE_NOTES = [
+  { tone: 'risk', title: '非官方工具，请先评估账号风控风险', detail:
+    '本项目是本地运行的辅助程序，与 BOSS 直聘官方无关。自动化访问无法完全避免被平台识别，因此强烈建议用非常用的备用账号担任采集号；万一因此触发风控、功能受限甚至封号，后果需要由您自行承担，本项目概不负责。开始使用即视为您已知晓并接受这一前提。' },
+  { tone: 'warn', title: '仅支持 Chrome 浏览器', detail:
+    '采集与发送全程通过独立的 Chrome 配置文件模拟真人点击完成，依赖本机安装的 Google Chrome。配置文件相互隔离，不会影响您日常浏览器中的登录状态和数据。' },
+  { tone: 'warn', title: '采集号与投递号建议分开两个账号', detail:
+    '更安全的分工方式：一个专用账号只负责浏览和采集岗位数据（风控风险集中于此），日常打招呼、投递沟通交给另一个常用账号。应用默认开启的双账号隔离模式正是为这套分工设计的。' },
+  { tone: 'warn', title: '首次采集耗时较久，建议一次采齐 JD', detail:
+    '首次采集要逐条打开岗位页面抓取完整职位描述（JD），关键词和城市越多越慢，通常需要数十分钟到数小时，请耐心等待。创建计划时选择「采集完整JD」可把列表和详情一次采齐；过程中随时可以暂停或恢复。' },
+  { tone: 'warn', title: '提前准备 API Key，并留意 token 消耗', detail:
+    '所有 AI 能力（岗位评分、竞争力分析、招呼语等）都调用您自己的模型服务：需在设置页填好 Base URL、API Key 与模型名。批量任务按岗位逐条消耗 token，建议先人工筛掉明显不合适的岗位再批量生成；暂未配置时，规则评分与手动流程不受影响。' },
+  { tone: 'ok', title: '简历直接粘贴即可，Markdown 或纯文本都能识别', detail:
+    '在「简历档案」新建简历时，既可以粘贴现成的 Markdown 文档，也可以把 Word / PDF 简历里的文字直接复制进正文框——AI 会自动识别整理结构，再用于评分与招呼语生成。' },
+  { tone: 'ok', title: '推荐与 BOSS 直聘原版分工搭配', detail:
+    '让本项目承担海量岗位的筛选排序、竞争力分析与招呼语初稿；确定目标岗位后，再回到 BOSS 直聘原版完成发送，后续沟通交流也使用其自带的消息机制，既省力也更贴近真人习惯。' },
+]
+// 推荐使用顺序：向导覆盖前四步，后续步骤在各页面完成
+const GUIDE_FLOW_STEPS = [
+  { title: '填写简历', detail: '按向导第 1 步或在「简历档案」建立本次求职使用的简历' },
+  { title: '配置 LLM', detail: '设置页填写 Base URL / API Key / 模型并测试连通性（可跳过，见注意事项）' },
+  { title: '登录账号', detail: '「账号管理」启动并登录采集号与沟通号，双账号模式保持默认开启即可' },
+  { title: '生成采集计划', detail: '向导第 4 步或「采集中心」新建计划：配置关键词、城市与每组页数' },
+  { title: '等待采集完成', detail: '首次较久，可暂停恢复；完成后在采集中心确认岗位与 JD 是否齐全，缺失可一键补齐' },
+  { title: '生成评分', detail: '「岗位列表」右上角确认当前简历无误后，点「匹配度评分」「岗位评分」，按这份简历批量评分' },
+  { title: '挑选岗位', detail: '在岗位列表按匹配度排序、展开 JD 阅读比较，把最匹配或最有优势的岗位加入收藏' },
+  { title: '工作台作战', detail: '「收藏工作台」里生成竞争力分析和招呼语，再「复制并打开 BOSS」人工发送，或交给受全部护栏保护的「自动打招呼」批量执行' },
+]
+
+const GuideView = {
+  setup() {
+    return { GUIDE_NOTES, GUIDE_FLOW_STEPS, requestWizardOpen }
+  },
+  template: `
+  <div>
+    <header class="page-head"><div><div class="eyebrow">新人引导</div><h1>使用指南</h1><p>注意事项与推荐使用顺序，随时可以回来查看</p></div><button class="primary" @click="requestWizardOpen">打开求职作战向导</button></header>
+    <section class="section-block guide-doc">
+      <div class="section-title"><div><h2>注意事项</h2><p>开始之前请先阅读以下内容</p></div></div>
+      <div class="guide-note-list">
+        <article v-for="note in GUIDE_NOTES" :key="note.title" class="guide-note" :class="'tone-' + note.tone">
+          <b>{{note.title}}</b><span>{{note.detail}}</span>
+        </article>
+      </div>
+      <p class="guide-doc-foot">发送频率与熔断等安全约束由系统护栏强制执行且不可关闭，详见 README 的「发送护栏（不可关闭）」章节。</p>
+    </section>
+    <section class="section-block guide-doc">
+      <div class="section-title"><div><h2>推荐使用顺序</h2><p>从简历到投递的完整流程，点击右上角按钮可跟随向导完成前四步</p></div></div>
+      <ol class="guide-flow">
+        <li v-for="step in GUIDE_FLOW_STEPS" :key="step.title"><b>{{step.title}}</b><span>{{step.detail}}</span></li>
+      </ol>
+    </section>
   </div>`,
 }
 
@@ -2094,7 +2175,7 @@ const App = {
     const view = computed(() => ({
       '/dashboard': DashboardView, '/profile': ProfileView, '/collect': CollectView,
       '/analytics': AnalyticsView, '/jobs': JobsView, '/jobcard': JobCardView,
-      '/accounts': AccountsView, '/settings': SettingsView,
+      '/accounts': AccountsView, '/settings': SettingsView, '/guide': GuideView,
     })[route.value] || DashboardView)
     const collectionSummary = computed(() => {
       const runs = store.runs.filter(run => run.status === 'running' || run.status === 'paused')
@@ -2109,16 +2190,31 @@ const App = {
     })
     const theme = ref(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark')
     function toggleTheme() {
-    <section class="settings-section"><div class="section-title"><div><h2>采集节奏</h2><p>采集号只读抓取的随机等待与列表任务间隔，切换后从下一次采集生效</p></div></div><div class="form-grid two"><label>节奏档位<select v-model="draft.collectPace"><option v-for="option in paceOptions" :key="option.value" :value="option.value">{{ option.label }}</option></select></label><p class="muted">{{ paceHint }}。越快越接近机器流量特征，命中风控信号当日熔断；重跑重复内容会自动提前停止翻页。</p></div></section>
       theme.value = theme.value === 'dark' ? 'light' : 'dark'
       document.documentElement.dataset.theme = theme.value
       localStorage.setItem('theme', theme.value)
+    }
+    // 启动须知弹窗：默认每次启动都显示；仅当用户勾选「不再显示」后确认关闭才持久化
+    const onboarding = reactive({ suppress: false })
+    const onboardingOpen = ref(false)
+    function tryStartOnboarding() {
+      if (localStorage.getItem(ONBOARDING_KEY)) return
+      onboarding.suppress = false
+      onboardingOpen.value = true
+    }
+    function dismissOnboarding(target) {
+      if (onboarding.suppress) markOnboardingDone()
+      onboardingOpen.value = false
+      if (target === 'wizard') requestWizardOpen()
+      else if (target === 'guide') location.hash = '#/guide'
     }
     let runtimeTimer = null
     onMounted(async () => {
       await bootstrap()
       connectAiStreams()
       runtimeTimer = window.setInterval(refreshRuntime, 5000)
+      // 后端连接异常时不弹引导，优先展示错误信息
+      if (!store.ui.bootstrapError) tryStartOnboarding()
     })
     onBeforeUnmount(() => {
       if (runtimeTimer) window.clearInterval(runtimeTimer)
@@ -2145,7 +2241,8 @@ const App = {
       store.ui.bootstrapError = errors.join('；')
       store.ui.refreshing = false
     })
-    return { store, route, nav, view, theme, collectionSummary, toggleTheme, settleConfirm, bootstrap }
+    return { store, route, nav, view, theme, collectionSummary, toggleTheme,
+      onboarding, onboardingOpen, dismissOnboarding, settleConfirm, bootstrap }
   },
   template: `
   <div class="layout">
@@ -2167,6 +2264,24 @@ const App = {
     <transition name="toast"><div v-if="store.ui.toast" class="toast" :class="store.ui.toast.tone" role="status">{{store.ui.toast.message}}</div></transition>
     <div v-if="store.ui.confirm" class="modal-backdrop" role="presentation" @click.self="settleConfirm(false)">
       <section class="confirm-dialog" role="dialog" aria-modal="true" :aria-label="store.ui.confirm.title"><h2>{{store.ui.confirm.title}}</h2><p>{{store.ui.confirm.message}}</p><div class="row end"><button @click="settleConfirm(false)">取消</button><button :class="store.ui.confirm.tone==='danger'?'danger':'primary'" @click="settleConfirm(true)">{{store.ui.confirm.confirmText}}</button></div></section>
+    </div>
+
+    <div v-if="onboardingOpen" class="modal-backdrop" role="presentation">
+      <section class="onboarding-dialog" role="dialog" aria-modal="true" aria-label="启动须知">
+        <h3>欢迎使用 boss-copilot · 求职作战室</h3>
+        <p class="onboarding-lead">每次启动都会先展示这份须知。完整教程与推荐使用顺序见左侧导航「使用指南」，也可从下方按钮直达。</p>
+        <div class="guide-note tone-risk onboarding-risk"><b>非官方工具 · 账号风控风险提示</b><span>本项目并非 BOSS 直聘官方程序，自动化访问无法完全避免被平台识别。建议用非常用的备用账号担任采集号；如因使用本项目触发风控、限制或封禁，后果由您自行承担，本项目概不负责。继续使用即代表您已知晓并接受上述内容。</span></div>
+        <ul class="onboarding-list">
+          <li>仅支持 <b>Chrome 浏览器</b>：采集与发送均通过独立的 Chrome 配置文件完成，不影响日常浏览器数据。</li>
+          <li>建议<b>采集号与投递号分开两个账号</b>：保持双账号隔离模式默认开启即可。</li>
+          <li><b>首次采集耗时较久</b>（可能数十分钟以上），创建计划时勾选「采集完整JD」一次采齐。</li>
+          <li>AI 功能需自备 <b>API Key</b>（BYOK），批量任务会逐岗位消耗 token，请留意开销。</li>
+          <li>简历粘贴 <b>Markdown 或纯文本</b>均可，AI 会自动识别整理。</li>
+          <li>分工建议：筛选分析交给本项目，<b>沟通交流回到 BOSS 直聘原版</b>的消息机制。</li>
+        </ul>
+        <label class="onboarding-check"><input type="checkbox" v-model="onboarding.suppress">下次启动不再显示</label>
+        <div class="row end onboarding-actions"><button @click="dismissOnboarding('guide')">查看完整指南</button><button @click="dismissOnboarding('wizard')">打开求职作战向导</button><button class="primary" @click="dismissOnboarding('close')">我已知晓</button></div>
+      </section>
     </div>
   </div>`,
 }

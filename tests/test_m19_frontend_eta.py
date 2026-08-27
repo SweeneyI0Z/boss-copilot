@@ -36,8 +36,10 @@ class FrontendEtaTests(unittest.TestCase):
         self.assertIn("该岗位已有招呼语，已保留原结果", self.app)
 
     def test_cache_version_is_advanced(self):
-        self.assertIn("style.css?v=m19-eta", self.index)
-        self.assertIn("app.js?v=m19-eta", self.index)
+        # M20 起版本号演进，M19 只要求前端缓存参数不再停留于旧值
+        self.assertNotIn("?v=m19-eta", self.index)
+        self.assertIn("style.css?v=", self.index)
+        self.assertIn("app.js?v=", self.index)
 
 
 if __name__ == "__main__":
