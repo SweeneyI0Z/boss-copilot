@@ -39,7 +39,7 @@
 
 - **测试隔离**：单测必须在 import backend 之前设 `os.environ["BOSS_COPILOT_HOME"] = 临时目录` 并改写 `config.DATA_DIR/DB_PATH`（见 `tests/test_m1_importer.py` 头部模板），绝不碰 `~/.boss-copilot` 真实数据。
 - **CDP 绝不走系统代理**：本机 127.0.0.1 CDP 请求用空 ProxyHandler（用户挂 Clash 会把 localhost 劫持成 502）。
-- `collector.py` 硬编码外部仓库路径 `~/project/boss-zhipin-scraper`（用其独立 venv 跑 `scripts/boss_cdp_raw.py`）；该仓库不存在时采集不可用。
+- `collector.py` 默认以同级目录 `../boss-zhipin-scraper` 作为外部采集仓库（可用 `BOSS_ZHIPIN_SCRAPER_HOME` 覆盖；用其独立 venv 跑 `scripts/boss_cdp_raw.py`）；该仓库不存在时采集不可用。
 - Chrome 路径硬编码 macOS `/Applications/Google Chrome.app/...`；只按隔离 user-data-dir 精准启停，**绝不触碰用户主 Chrome**。
 - 设置接口只接受 `config.DEFAULT_SETTINGS` 白名单内的 key。
 - 数据目录 `~/.boss-copilot/`（可用 `BOSS_COPILOT_HOME` 覆盖）；采集号 profile 复用 `~/.boss-zhipin-scraper/chrome-profile`。

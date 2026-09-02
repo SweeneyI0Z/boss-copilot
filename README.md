@@ -2,12 +2,23 @@
 
 简历驱动的 BOSS直聘求职作战室：**采集 → 多简历评分 → 收藏工作台 → 招呼语 → BOSS 平台确认 → 数据分析 → 模拟面试**。本地 Web 应用，数据全部在 `~/.boss-copilot/`。
 
-整合自：`boss-zhipin-scraper`（采集引擎，含 `--company` 公司定向）、`boss-helper`（发送/消息/护栏设计参考）、用户自有《岗位筛选评分规则》（L1/L2 全量落码）。
+整合自开源项目 [boss-zhipin-scraper](https://github.com/eatmoreduck/boss-zhipin-scraper)（采集引擎，含 `--company` 公司定向）与 [boss-helper](https://github.com/Ocyss/boss-helper)（发送/消息/护栏设计参考），两者均为 MIT License；另含用户自有《岗位筛选评分规则》（L1/L2 全量落码）。
+
+**开源协议**：MIT（见 [LICENSE](LICENSE)）。使用前请完整阅读下方「免责声明」与「注意事项」。
+
+## 免责声明
+
+- **用途限制**：本项目仅供个人学习、研究与求职辅助使用，严禁用于任何商业用途，严禁规模化批量采集、转售或再分发采集所得数据。
+- **非官方声明**：本项目为独立个人项目，与 BOSS 直聘及其运营方（北京华品博睿网络技术有限公司）无任何关联，未获得其任何形式的授权、许可或认可；「BOSS直聘」及相关名称、商标的权利归其运营方所有，本文仅作描述性使用。
+- **法律合规**：您应在遵守所在地区法律法规及 BOSS 直聘用户协议、服务条款的前提下，自行评估并决定是否使用本项目。因安装、配置或使用本项目引发的账号风控、功能受限、封号、数据或法律纠纷，均由使用者自行承担，项目作者不承担任何责任。
+- **按现状提供**：本项目按「现状」开源，不提供任何明示或默示的适销性、准确性或特定用途适用性担保；平台页面改版可能导致部分功能随时失效。
+- **采集引擎不在本仓库内**：本项目通过子进程调用外部采集仓库，本仓库不分发任何采集引擎代码与登录凭证；采集能力需按上游仓库说明自行部署。
+- **使用即同意**：下载、复制或以任何方式使用本项目代码，即表示您已阅读、理解并同意本声明及 [LICENSE](LICENSE) 的全部内容。
 
 ## 快速开始
 
 ```bash
-cd ~/project/boss-copilot
+cd boss-copilot
 .venv/bin/python -m unittest discover tests -v   # 回归（356 例，必须全绿）
 .venv/bin/uvicorn backend.main:app --port 8787
 # 浏览器打开 http://127.0.0.1:8787
@@ -63,7 +74,7 @@ cd ~/project/boss-copilot
 
 ## 数据目录与迁移
 
-运行数据统一放在用户主目录的 `.boss-copilot` 下：macOS 当前为 `~/.boss-copilot`，Windows 自动使用 `%USERPROFILE%\.boss-copilot`。可用 `BOSS_COPILOT_HOME` 覆盖数据根目录，用 `BOSS_CHROME_PATH` 覆盖 Chrome，用 `BOSS_ZHIPIN_SCRAPER_HOME` 指定外部采集仓库。
+运行数据统一放在用户主目录的 `.boss-copilot` 下：macOS 即 `~/.boss-copilot`，Windows 自动使用 `%USERPROFILE%\.boss-copilot`。可用 `BOSS_COPILOT_HOME` 覆盖数据根目录，用 `BOSS_CHROME_PATH` 覆盖 Chrome，用 `BOSS_ZHIPIN_SCRAPER_HOME` 指定外部采集仓库。
 
 启动时会把旧版的 `~/.boss-zhipin-scraper/chrome-profile`、`~/.boss-zhipin-scraper/job-result` 和 `~/.boss-copilot/chrome-profile-a` 迁入统一目录。迁移是幂等的：旧 profile 正在使用或目标已经存在时会跳过，绝不覆盖目标数据。
 
@@ -71,19 +82,19 @@ cd ~/project/boss-copilot
 
 | 里程碑 | 功能 | 提交 |
 |--------|------|------|
-| M1 | SQLite 底座 + xlsx/JSON 导入 + 账号管理 | 2e59d1d |
-| M2 | L1 电算评分（Gate/行业/薪资/E1/词典，黄金测试 4 岗位） | ecd16a9 |
-| M3 | BYOK LLM + AI 采集策略 + L2 精评 + 作战卡 | 0b1f2fb |
-| M4 | 按计划采集执行器 + 同步刷新（下架/HR 活跃度剔除）+ 简历变更重算 | 51cde89 |
-| M5 | 招呼语生成/队列/发送（沟通号 UI 级操作 + 全护栏） | 847a127 |
-| M6 | 消息中心（DOM 快照轮询 + AI 草稿 + 人工点发） | cdd9c82 |
-| M7 | 模拟面试（出题/追问点评/报告） | 0de7372 |
-| M9 | 多简历/不可变评分基线/收藏排除/可靠状态模型 | b7aa1fc |
-| M10 | 总览看板/行内 JD/收藏工作台/新前端 | 0caf997 |
-| M11 | 多简历评分/三版招呼语/平台协同投递 | 2ab779b |
-| M12 | 模块化采集/精确来源归因/数据分析 | bced668 |
+| M1 | SQLite 底座 + xlsx/JSON 导入 + 账号管理 | 8d9057e |
+| M2 | L1 电算评分（Gate/行业/薪资/E1/词典，黄金测试 4 岗位） | b139523 |
+| M3 | BYOK LLM + AI 采集策略 + L2 精评 + 作战卡 | 829a6c9 |
+| M4 | 按计划采集执行器 + 同步刷新（下架/HR 活跃度剔除）+ 简历变更重算 | f576a4f |
+| M5 | 招呼语生成/队列/发送（沟通号 UI 级操作 + 全护栏） | 09ed92e |
+| M6 | 消息中心（DOM 快照轮询 + AI 草稿 + 人工点发） | 3c5af39 |
+| M7 | 模拟面试（出题/追问点评/报告） | e83ebc3 |
+| M9 | 多简历/不可变评分基线/收藏排除/可靠状态模型 | 92171b5 |
+| M10 | 总览看板/行内 JD/收藏工作台/新前端 | 54139b3 |
+| M11 | 多简历评分/三版招呼语/平台协同投递 | 9e0ed59 |
+| M12 | 模块化采集/精确来源归因/数据分析 | 57a2d4b |
 | M13 | 双账号BOSS收藏同步/增量合并/JD补齐 | 本次提交 |
-| M15 | 全模拟前端体验重构/向导/采集工作台/响应式布局 | 7fc0e4a |
+| M15 | 全模拟前端体验重构/向导/采集工作台/响应式布局 | 6d236f9 |
 | M16 | 前后端真实接入/采集暂停恢复与来源启停/岗位求职阶段 | 本次改动 |
 | M17 | 采集数据确认删除/页面级 AI 任务队列/流式进度/OFFER 工作流 | 本次改动 |
 | M18 | 双账号向导/流式采集策略/岗位级进度/标签增强/工作台深链 | 本次改动 |
