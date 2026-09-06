@@ -15,7 +15,7 @@
 
 ## 开发流程
 
-- 全项目中文注释 / 中文 UI，新代码沿用现有惯例（纯标准库 + fastapi/openai/openpyxl，4 空格缩进）。
+- 全项目中文注释 / 中文 UI，新代码沿用现有惯例（纯标准库 + fastapi/openai/openpyxl/websocket-client/requests，4 空格缩进）。
 - 每个功能必须带单测；改动 `backend/` 或 `frontend/` 后必须全量回归：
 
   ```bash

@@ -12,18 +12,21 @@
 - **非官方声明**：本项目为独立个人项目，与 BOSS 直聘及其运营方（北京华品博睿网络技术有限公司）无任何关联，未获得其任何形式的授权、许可或认可；「BOSS直聘」及相关名称、商标的权利归其运营方所有，本文仅作描述性使用。
 - **法律合规**：您应在遵守所在地区法律法规及 BOSS 直聘用户协议、服务条款的前提下，自行评估并决定是否使用本项目。因安装、配置或使用本项目引发的账号风控、功能受限、封号、数据或法律纠纷，均由使用者自行承担，项目作者不承担任何责任。
 - **按现状提供**：本项目按「现状」开源，不提供任何明示或默示的适销性、准确性或特定用途适用性担保；平台页面改版可能导致部分功能随时失效。
-- **采集引擎不在本仓库内**：本项目通过子进程调用外部采集仓库，本仓库不分发任何采集引擎代码与登录凭证；采集能力需按上游仓库说明自行部署。
+- **采集引擎已内置**：引擎 vendor 在 `vendor/boss-zhipin-scraper/`（源自上游 v2.2.0，MIT，含 `SCRAPER_*` 节奏注入、`--company` 公司定向与 `--dup-stop-ratio` 翻页早停补丁），以本项目虚拟环境直接运行，无需部署外部仓库或独立虚拟环境。引擎通过 CDP 驱动本机已登录的 Chrome 完成采集，本仓库不分发任何登录凭证。
 - **使用即同意**：下载、复制或以任何方式使用本项目代码，即表示您已阅读、理解并同意本声明及 [LICENSE](LICENSE) 的全部内容。
 
 ## 快速开始
 
 ```bash
 cd boss-copilot
-.venv/bin/python -m unittest discover tests -v   # 回归（356 例，必须全绿）
+.venv/bin/python -m pip install fastapi uvicorn openai openpyxl websocket-client requests
+.venv/bin/python -m unittest discover tests -v   # 回归（417 例，必须全绿）
 .venv/bin/uvicorn backend.main:app --port 8787
 # 浏览器打开 http://127.0.0.1:8787
 # 新人请先读下方「注意事项」，并在应用左侧导航打开「使用指南」跟随向导操作
 ```
+
+Windows 下可一键启动：双击项目根目录的 `start.bat`（或命令行 `start.bat [端口]`，默认 8787），会自动启动服务并打开浏览器，关闭窗口即停止服务。
 
 ## 注意事项
 
@@ -74,7 +77,7 @@ cd boss-copilot
 
 ## 数据目录与迁移
 
-运行数据统一放在用户主目录的 `.boss-copilot` 下：macOS 即 `~/.boss-copilot`，Windows 自动使用 `%USERPROFILE%\.boss-copilot`。可用 `BOSS_COPILOT_HOME` 覆盖数据根目录，用 `BOSS_CHROME_PATH` 覆盖 Chrome，用 `BOSS_ZHIPIN_SCRAPER_HOME` 指定外部采集仓库。
+运行数据统一放在用户主目录的 `.boss-copilot` 下：macOS 即 `~/.boss-copilot`，Windows 自动使用 `%USERPROFILE%\.boss-copilot`。可用 `BOSS_COPILOT_HOME` 覆盖数据根目录，用 `BOSS_CHROME_PATH` 覆盖 Chrome；`BOSS_ZHIPIN_SCRAPER_HOME` 可把采集引擎指向其他副本（默认使用仓库内 `vendor/boss-zhipin-scraper/`，无需配置）。
 
 启动时会把旧版的 `~/.boss-zhipin-scraper/chrome-profile`、`~/.boss-zhipin-scraper/job-result` 和 `~/.boss-copilot/chrome-profile-a` 迁入统一目录。迁移是幂等的：旧 profile 正在使用或目标已经存在时会跳过，绝不覆盖目标数据。
 
@@ -142,7 +145,8 @@ backend/
   interview.py   模拟面试 agent
   boss/cdp.py    账号 CDP 管理（单/双账号切换 + 代理绕过）
 frontend/        无构建 Vue3（app.js 单文件 + vendored vue.esm）
-tests/           384 个单测 + 真实登录态只读 spike 脚本
+tests/           417 个单测 + 真实登录态只读 spike 脚本
+vendor/          内置采集引擎（boss-zhipin-scraper v2.2.0 + 补丁，MIT）
 ```
 
 ## 已知边界
