@@ -1155,10 +1155,11 @@ def collect_resume():
 
 @app.post("/api/collect/retry-details")
 def collect_retry_details(body: dict = None):
+    """继续已结束的采集计划：不新建记录，在原有进度上补齐缺失 JD。"""
     from . import collector
-    result = collector.retry_missing((body or {}).get("source_run_id"))
+    result = collector.resume_missing((body or {}).get("source_run_id"))
     if not result.get("ok"):
-        raise HTTPException(400, result.get("error", "没有可重试的详情"))
+        raise HTTPException(400, result.get("error", "没有可继续的采集计划"))
     return result
 
 

@@ -1,9 +1,12 @@
-"""看板采集新鲜度与采集记录续采：中断采集的数据不被误报过期，缺 JD 可继续补齐。"""
+"""看板采集新鲜度与采集记录续采：中断采集的数据不被误报过期，缺 JD 可在原计划上继续。"""
+import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 
 _TEST_HOME = tempfile.mkdtemp(prefix="boss-copilot-fresh-")
@@ -173,6 +176,121 @@ class StalePausedRunTests(unittest.TestCase):
         self.assertEqual(row["status"], "succeeded")
         self.assertEqual(row["paused"], 0)
         self.assertIsNotNone(row["finished_at"])
+
+
+class ResumeMissingTests(unittest.TestCase):
+    """继续采集：不新建计划，在原记录上恢复运行并沿原进度补齐缺失 JD。"""
+
+    def setUp(self):
+        _clear_data()
+        with collector._state_condition:
+            collector._state.update({
+                "running": False, "run_id": None, "cancel": False, "paused": False,
+                "process": None, "worker_ident": None,
+            })
+
+    def tearDown(self):
+        with collector._state_condition:
+            collector._state.update({"running": False, "run_id": None,
+                                     "cancel": False, "paused": False,
+                                     "process": None})
+            collector._state_condition.notify_all()
+
+    def _seed_resumable_run(self):
+        run_id = _run(status="interrupted")
+        _job("j1")
+        _job("j2")
+        _jd("j2", "已有描述")
+        _own(run_id, "j1")
+        _own(run_id, "j2")
+        list_file = Path(_TEST_HOME) / "boss_jobs_resume.json"
+        list_file.write_text(json.dumps({"jobs": []}), encoding="utf-8")
+        cur = get_db().execute(
+            "INSERT INTO collect_run_tasks(run_id,task_key,kind,keyword,status,list_file) "
+            "VALUES(?,?,?,?,?,?)",
+            (run_id, "search:t1", "search", "kw", "list_succeeded", str(list_file)))
+        get_db().commit()
+        return run_id, cur.lastrowid
+
+    def _wait_worker_done(self, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with collector._state_condition:
+                if not collector._state["running"]:
+                    return True
+            time.sleep(0.02)
+        return False
+
+    def test_resume_continues_original_plan_without_new_record(self):
+        run_id, task_id = self._seed_resumable_run()
+        with patch.object(collector.cdp, "account_for", return_value="collect"), \
+                patch.object(collector.cdp, "launch", return_value={"ok": True}), \
+                patch.object(collector, "_run_detail_phase",
+                             return_value=("", "")) as phase:
+            result = collector.resume_missing(run_id)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["run_id"], run_id)
+            # 未新建采集计划，原计划进入运行中的详情阶段
+            self.assertEqual(get_db().execute(
+                "SELECT COUNT(*) c FROM collect_runs").fetchone()["c"], 1)
+            row = get_db().execute(
+                "SELECT status,phase,finished_at FROM collect_runs WHERE id=?",
+                (run_id,)).fetchone()
+            self.assertEqual(row["status"], "running")
+            self.assertEqual(row["phase"], "details")
+            self.assertIsNone(row["finished_at"])
+            self.assertTrue(collector._state["running"])
+            self.assertEqual(collector._state["run_id"], run_id)
+            # 进度条沿原计划继续：1/2 已有 JD → 75%
+            with collector._state_condition:
+                progress = collector._progress_snapshot_locked()
+            self.assertEqual(progress["percent"], 75)
+            self.assertTrue(self._wait_worker_done())
+            # 续跑任务复用原计划的任务与列表文件（异步线程完成后才可断言）
+            args, _ = phase.call_args
+            self.assertEqual(args[0], run_id)
+            self.assertEqual(args[2], [task_id])
+        row = get_db().execute(
+            "SELECT status,finished_at FROM collect_runs WHERE id=?",
+            (run_id,)).fetchone()
+        self.assertEqual(row["status"], "succeeded")
+        self.assertIsNotNone(row["finished_at"])
+        self.assertFalse(collector._state["running"])
+
+    def test_resume_rejects_when_nothing_missing(self):
+        run_id = _run(status="interrupted")
+        _job("j1")
+        _jd("j1", "完整描述")
+        _own(run_id, "j1")
+        result = collector.resume_missing(run_id)
+        self.assertFalse(result["ok"])
+        row = get_db().execute(
+            "SELECT status,finished_at FROM collect_runs WHERE id=?",
+            (run_id,)).fetchone()
+        self.assertEqual(row["status"], "interrupted")
+        self.assertIsNotNone(row["finished_at"])
+        self.assertFalse(collector._state["running"])
+
+    def test_resume_rejects_while_another_task_running(self):
+        run_id, _ = self._seed_resumable_run()
+        with collector._state_condition:
+            collector._state["running"] = True
+        try:
+            result = collector.resume_missing(run_id)
+        finally:
+            with collector._state_condition:
+                collector._state["running"] = False
+        self.assertFalse(result["ok"])
+        self.assertIn("已有采集任务在运行", result["error"])
+
+    def test_resume_rejects_unfinished_run(self):
+        run_id = _run(status="running", paused=0, finished=False)
+        result = collector.resume_missing(run_id)
+        self.assertFalse(result["ok"])
+        self.assertFalse(collector._state["running"])
+        row = get_db().execute(
+            "SELECT status FROM collect_runs WHERE id=?", (run_id,)).fetchone()
+        self.assertEqual(row["status"], "running")
 
 
 if __name__ == "__main__":

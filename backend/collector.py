@@ -1817,8 +1817,9 @@ def resume() -> dict:
     return {"ok": True, "running": True, "paused": False, "run_id": run_id}
 
 
-def _retry_worker(run_id: int, source_run_id: int, task: dict) -> None:
-    report = {"source_run_id": source_run_id, "retry": True}
+def _resume_worker(run_id: int, task_ids: list, files: list) -> None:
+    """在原采集计划上继续详情阶段；结束时仍写回该计划自己的状态。"""
+    report = {"resume": True}
     account = ""
     try:
         with _state_condition:
@@ -1829,18 +1830,16 @@ def _retry_worker(run_id: int, source_run_id: int, task: dict) -> None:
         launched = cdp.launch(account, headless=True)
         if not launched.get("ok"):
             raise RuntimeError("采集 Chrome 无法启动（CDP 未就绪）")
-        rows = get_db().execute(
-            "SELECT list_file FROM collect_run_tasks WHERE run_id=? AND list_file<>''",
-            (source_run_id,)).fetchall()
-        files = [Path(row["list_file"]) for row in rows if Path(row["list_file"]).exists()]
-        if not files:
-            raise ValueError("原采集任务没有可用列表文件")
         if not _set_phase(run_id, "details"):
             report["cancelled"] = True
-            sync.update_run_task(task["_task_id"], "cancelled", finished=True)
             _finish_run(run_id, report, "cancelled")
             return
-        _, risk = _run_detail_phase(run_id, files, [task["_task_id"]], port, report)
+        _, risk = _run_detail_phase(run_id, files, task_ids, port, report)
+        if _is_cancelled():
+            report["cancelled"] = True
+            gained = int((report.get("details") or {}).get("updated") or 0)
+            _finish_run(run_id, report, "partial" if gained else "cancelled", "", risk)
+            return
         status_value = "partial" if report.get("details", {}).get("error") else "succeeded"
         _finish_run(run_id, report, status_value, "", risk)
     except Exception as error:
@@ -1848,66 +1847,99 @@ def _retry_worker(run_id: int, source_run_id: int, task: dict) -> None:
         if account:
             _mark_account_failure(account, failure)
         report["error"] = failure["message"]
-        sync.update_run_task(task["_task_id"], "failed", error=failure["message"],
-                             finished=True)
         _finish_run(run_id, report, "failed", "",
                     failure["message"] if failure["risk"] else "")
     finally:
         _cleanup_worker_control(run_id)
 
 
-def retry_missing(source_run_id: int = None) -> dict:
-    """只重试历史成功列表中仍缺失的 JD，不重复搜索或来源 diff。"""
+def _prepare_resume_plan(source_run_id: int = None) -> dict:
+    """校验并准备“继续采集”：进度快照、任务与列表文件都取自原计划。"""
+    if source_run_id is None:
+        row = get_db().execute(
+            "SELECT t.run_id FROM collect_run_tasks t JOIN collect_runs r "
+            "ON r.id=t.run_id WHERE t.list_file<>'' AND r.kind<>'detail_retry' "
+            "ORDER BY t.run_id DESC LIMIT 1").fetchone()
+        source_run_id = int(row["run_id"]) if row else 0
+    source_run_id = int(source_run_id or 0)
+    run = get_db().execute(
+        "SELECT id,kind,status,stats,params,paused,finished_at FROM collect_runs "
+        "WHERE id=?", (source_run_id,)).fetchone()
+    if run is None:
+        raise ValueError("没有可继续的采集计划")
+    if run["finished_at"] is None or str(run["status"] or "") in ("running", "paused"):
+        raise ValueError("该采集计划仍在运行或尚未结束，不能重复继续")
+    tasks = [dict(row) for row in get_db().execute(
+        "SELECT id,status,list_file FROM collect_run_tasks "
+        "WHERE run_id=? ORDER BY id", (source_run_id,)).fetchall()]
+    files = [Path(task["list_file"]) for task in tasks
+             if task["list_file"] and Path(task["list_file"]).exists()]
+    if not files:
+        raise ValueError("该采集计划没有可用的列表文件，无法继续")
+    eligible, complete = _job_completeness(_run_job_keys(source_run_id))
+    if not eligible - complete:
+        raise ValueError("该采集计划没有缺失的职位描述，无需继续")
+    progress, _ = _finished_progress(run, tasks, source_run_id)
+    try:
+        params = json.loads(run["params"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        params = {}
+    label = str(params.get("name") or f"{run['kind']} #{source_run_id}")
+    return {"run_id": source_run_id, "task_ids": [task["id"] for task in tasks],
+            "files": files, "progress": progress,
+            "missing": len(eligible - complete), "label": label}
+
+
+def resume_missing(source_run_id: int = None) -> dict:
+    """继续一条已结束的采集计划：不新建记录，在原有进度上只补齐缺失的 JD。"""
     if not SCRAPER_PY.exists() or not SCRAPER_SCRIPT.exists():
         return {"ok": False, "error": f"未找到 scraper: {SCRAPER_PY}"}
     with _state_lock:
         if _state["running"]:
             return {"ok": False, "error": "已有采集任务在运行",
                     "status": _state_snapshot()}
-        _state.update({"running": True, "current": "启动中", "phase": "starting",
-                       "run_id": None, "cancel": False, "paused": False,
-                       "process": None, "pause_started_at": None,
+    try:
+        plan = _prepare_resume_plan(source_run_id)
+    except ValueError as error:
+        return {"ok": False, "error": str(error)}
+    run_id = plan["run_id"]
+    with _state_condition:
+        _state.update({"running": True, "current": plan["label"], "phase": "details",
+                       "run_id": run_id, "cancel": False, "risk_signal": "",
+                       "paused": False, "process": None, "pause_started_at": None,
                        "paused_seconds": 0.0, "worker_ident": None,
-                       "phase_started_at": None, "phase_pause_baseline": 0.0,
-                       "eta_model": None, "progress": _new_progress()})
-    if source_run_id is None:
-        row = get_db().execute(
-            "SELECT run_id FROM collect_run_tasks WHERE list_file<>'' "
-            "ORDER BY run_id DESC LIMIT 1").fetchone()
-        source_run_id = row["run_id"] if row else None
-    if not source_run_id:
-        with _state_condition:
-            _state.update({"running": False, "current": "", "phase": "",
-                           "run_id": None, "paused": False, "process": None,
-                           "pause_started_at": None, "paused_seconds": 0.0,
-                           "worker_ident": None, "phase_started_at": None,
-                           "phase_pause_baseline": 0.0, "eta_model": None})
-            _state_condition.notify_all()
-        return {"ok": False, "error": "没有可重试的采集记录"}
+                       "fetch_details": True, "log": [],
+                       "phase_started_at": time.monotonic(),
+                       "phase_pause_baseline": 0.0,
+                       "eta_model": _new_eta_model([]),
+                       "progress": plan["progress"]})
+        _state_condition.notify_all()
+    conn = get_db()
     try:
-        task = _normalize_task({"type": "company", "brand_id": f"retry-{source_run_id}",
-                                "name": "仅补缺失JD", "pages": 1})
-        task["kind"] = "detail_retry"
-        task["task_key"] = f"detail-retry:{source_run_id}"
-        run_id = _begin_run("detail_retry", {"source_run_id": source_run_id}, [task])
-    except Exception:
-        with _state_condition:
-            _state.update({"running": False, "current": "", "phase": "",
-                           "run_id": None, "paused": False, "process": None,
-                           "pause_started_at": None, "paused_seconds": 0.0,
-                           "worker_ident": None, "phase_started_at": None,
-                           "phase_pause_baseline": 0.0, "eta_model": None})
-            _state_condition.notify_all()
-        raise
-    thread = threading.Thread(target=_retry_worker,
-                              args=(run_id, int(source_run_id), task), daemon=True)
-    try:
+        conn.execute(
+            "UPDATE collect_runs SET status='running',phase='details',finished_at=NULL,"
+            "paused=0,cancel_requested=0 WHERE id=?", (run_id,))
+        conn.commit()
+        thread = threading.Thread(target=_resume_worker,
+                                  args=(run_id, plan["task_ids"], plan["files"]),
+                                  daemon=True)
         thread.start()
-    except Exception as error:
-        _finish_run(run_id, {"source_run_id": source_run_id,
-                             "error": f"后台线程启动失败: {error}"}, "failed")
+    except Exception:
+        # 回滚内存占位与记录状态，避免启动位被一次失败的继续动作占用。
+        with _state_condition:
+            _state.update({"running": False, "current": "", "phase": "finished",
+                           "run_id": None, "paused": False, "process": None,
+                           "pause_started_at": None, "paused_seconds": 0.0,
+                           "worker_ident": None, "phase_started_at": None,
+                           "phase_pause_baseline": 0.0, "eta_model": None})
+            _state_condition.notify_all()
+        conn.execute(
+            "UPDATE collect_runs SET status='interrupted',phase='finished',"
+            "finished_at=?,paused=0 WHERE id=? AND status='running'",
+            (now_iso(), run_id))
+        conn.commit()
         raise
-    return {"ok": True, "run_id": run_id, "source_run_id": int(source_run_id)}
+    return {"ok": True, "run_id": run_id, "missing": plan["missing"]}
 
 
 def plan_tasks(resume_id=None) -> list:

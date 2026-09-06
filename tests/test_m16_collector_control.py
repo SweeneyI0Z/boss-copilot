@@ -206,22 +206,59 @@ class CollectorControlTests(unittest.TestCase):
         self.assertTrue(current["running"])
         self.assertIsNone(current["run_id"])
 
-    def test_retry_creation_failure_releases_starting_reservation(self):
+    def test_resume_thread_start_failure_rolls_back_run_and_state(self):
         scraper_python = self.root / "python"
         scraper_script = self.root / "scraper.py"
         scraper_python.touch()
         scraper_script.touch()
 
+        task = collector._normalize_task({
+            "type": "search", "keyword": "AI", "city": "深圳", "pages": 1,
+        })
+        run_id = collector._begin_run("config", {"tasks": [task]}, [task])
+        # _begin_run 会把内存置为运行中；这里模拟该计划早已被中断、工作线程已退出。
+        with collector._state_condition:
+            collector._state.update({"running": False, "current": "", "phase": "",
+                                     "run_id": None})
+            collector._state_condition.notify_all()
+        list_file = self.root / "boss_jobs_list.json"
+        list_file.write_text('{"jobs": []}', encoding="utf-8")
+        conn = get_db()
+        conn.execute("UPDATE collect_run_tasks SET status='list_succeeded',list_file=? "
+                     "WHERE run_id=?", (str(list_file), run_id))
+        conn.execute("UPDATE collect_runs SET status='interrupted',finished_at=?,paused=0 "
+                     "WHERE id=?", (collector.now_iso(), run_id))
+        conn.commit()
+        conn.execute(
+            "INSERT INTO jobs(job_key,title,company,status,first_seen_at,last_seen_at) "
+            "VALUES('missing-jd','岗位','公司','active',?,?)",
+            (collector.now_iso(), collector.now_iso()))
+        conn.execute(
+            "INSERT INTO job_run_items(run_id,job_key,source,created_at) "
+            "VALUES(?,?,?,?)", (run_id, "missing-jd", "test", collector.now_iso()))
+        conn.commit()
+
         with patch.object(collector, "SCRAPER_PY", scraper_python), \
                 patch.object(collector, "SCRAPER_SCRIPT", scraper_script), \
-                patch.object(collector, "_begin_run", side_effect=RuntimeError("db error")):
-            with self.assertRaisesRegex(RuntimeError, "db error"):
-                collector.retry_missing(source_run_id=7)
+                patch.object(collector.threading, "Thread",
+                             side_effect=RuntimeError("boom")):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                collector.resume_missing(source_run_id=run_id)
 
         self.assertFalse(collector._state["running"])
         self.assertIsNone(collector._state["run_id"])
         self.assertFalse(collector._state["paused"])
         self.assertIsNone(collector._state["process"])
+        row = get_db().execute(
+            "SELECT status,phase,finished_at,paused FROM collect_runs WHERE id=?",
+            (run_id,)).fetchone()
+        self.assertEqual(row["status"], "interrupted")
+        self.assertEqual(row["phase"], "finished")
+        self.assertIsNotNone(row["finished_at"])
+        self.assertEqual(row["paused"], 0)
+        # 没有新建采集计划
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) c FROM collect_runs").fetchone()["c"], 1)
 
     def test_external_stream_thread_cannot_replace_collector_process(self):
         self._begin_run()

@@ -1463,18 +1463,18 @@ const CollectView = {
     function runEnded(run) {
       return run.status !== 'running' && run.status !== 'paused'
     }
-    function runCanRetryDetails(run) {
-      // 只有产生过列表文件的采集类型才能补采；收藏同步/导入没有可复用的列表。
+    function runCanContinue(run) {
+      // 只有产生过列表文件的采集类型才能继续；收藏同步/导入没有可复用的列表。
       return runEnded(run) && ['config', 'search', 'company', 'plan', 'sync'].includes(run.kind)
         && Number(run.missingJdCount) > 0
     }
-    async function retryRunDetails(run) {
+    async function continueRun(run) {
       try {
         await apiClient.collect.retryDetails({ source_run_id: run.id })
-        showToast(`已开始为「${run.name}」补齐缺失 JD，可在运行中任务里继续暂停/取消`, 'info')
+        showToast(`已继续「${run.name}」，正在原有进度上补齐缺失 JD`, 'info')
         await Promise.allSettled([refreshCollectStatus(), refreshRuns()])
       } catch (error) {
-        showToast(`补齐缺失 JD 失败：${error.message}`, 'bad')
+        showToast(`继续采集失败：${error.message}`, 'bad')
       }
     }
     async function cancelRun(run) {
@@ -1525,7 +1525,7 @@ const CollectView = {
     return { store, screen, step, plan, generating, syncingFavorites, cityQuery, keywords, companyList, citySuggestions, llmReady, resume, FILTER_OPTIONS,
       percentOf, fmtTime, formatEta, runProgressSummary, runStatusLabel,
       startWizard, closeWizard, addCity, removeCity, generatePlan,
-      setPlanMode, nextToConfig, toReview, launchPlan, syncFavoriteJobs, toggleRun, toggleRunData, cancelRun, deleteRunData, retryRunDetails, runEnded, runCanRetryDetails, apiClient }
+      setPlanMode, nextToConfig, toReview, launchPlan, syncFavoriteJobs, toggleRun, toggleRunData, cancelRun, deleteRunData, continueRun, runCanContinue, runEnded, apiClient }
   },
   template: `
   <div>
@@ -1545,7 +1545,7 @@ const CollectView = {
               <td><strong class="table-number">{{run.itemCount}}</strong><span class="muted"> 个岗位</span><div v-if="run.completenessKnown" class="collect-counts"><span>仅岗位描述 {{run.listOnlyCount}}</span><span>完整 JD {{run.withJdCount}}</span></div><small v-else class="muted">完整度无法追溯</small></td>
               <td><div class="run-progress-cell"><div class="progress-copy"><span class="status-badge" :class="run.status">{{runStatusLabel(run.status)}}</span><b>{{percentOf(run)}}%</b><small>{{runProgressSummary(run)}}</small></div><div class="progress"><i :style="{width:percentOf(run)+'%'}"></i></div><small v-if="run.status==='running'" class="run-eta">{{formatEta(run.etaSeconds)}}</small><small v-else-if="run.status==='paused'" class="run-eta">已暂停，预计时间停止计算</small></div></td>
               <td><label class="switch compact" :title="run.hasSourceOwnership?'控制该次采集数据是否参与岗位展示':'旧记录缺少精确岗位归属'"><input type="checkbox" :checked="run.enabled" :disabled="!run.hasSourceOwnership" @change="toggleRunData(run,$event)"><span class="switch-track"><span class="switch-thumb"></span></span><span>{{run.hasSourceOwnership?(run.enabled?'已应用':'已禁用'):'仅统计'}}</span></label></td>
-              <td><div class="row end"><button v-if="(run.status==='running' || run.status==='paused') && run.kind!=='favorite_sync'" @click="toggleRun(run)">{{run.status==='running'?'暂停':'继续'}}</button><button v-if="run.status==='running' || run.status==='paused'" class="danger-quiet" @click="cancelRun(run)">取消</button><button v-if="runCanRetryDetails(run)" title="继续本次采集，仅为仍缺职位描述的岗位补齐详情" @click="retryRunDetails(run)">补齐缺失 JD</button><button v-if="runEnded(run)" class="danger-quiet" title="永久删除本次采集及独占岗位" @click="deleteRunData(run)">删除数据</button><a class="icon-button" :href="apiClient.runs.exportUrl(run.id)" download :aria-disabled="!run.canExport" :title="run.canExport?'导出 Excel':'旧记录缺少可导出的岗位归属'" :aria-label="'导出 ' + run.name" @click="!run.canExport && $event.preventDefault()">↓</a></div></td>
+              <td><div class="row end"><button v-if="(run.status==='running' || run.status==='paused') && run.kind!=='favorite_sync'" @click="toggleRun(run)">{{run.status==='running'?'暂停':'继续'}}</button><button v-if="run.status==='running' || run.status==='paused'" class="danger-quiet" @click="cancelRun(run)">取消</button><button v-if="runCanContinue(run)" title="不新建计划，在原有进度上继续，仅补齐仍缺的职位描述" @click="continueRun(run)">继续采集</button><button v-if="runEnded(run)" class="danger-quiet" title="永久删除本次采集及独占岗位" @click="deleteRunData(run)">删除数据</button><a class="icon-button" :href="apiClient.runs.exportUrl(run.id)" download :aria-disabled="!run.canExport" :title="run.canExport?'导出 Excel':'旧记录缺少可导出的岗位归属'" :aria-label="'导出 ' + run.name" @click="!run.canExport && $event.preventDefault()">↓</a></div></td>
             </tr>
             <tr v-if="!store.runs.length"><td colspan="5"><div class="empty compact">暂无采集记录</div></td></tr>
           </tbody>
