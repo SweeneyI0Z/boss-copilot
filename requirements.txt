@@ -1,0 +1,9 @@
+# boss-copilot 运行时依赖（实测环境：Python 3.11）
+# 安装：python -m pip install -r requirements.txt
+# 打包 exe 另需 pyinstaller（仅构建期），由 build_exe.bat 自动安装，勿加入本清单。
+fastapi>=0.141.1
+uvicorn>=0.52.4
+openai>=3.7.0
+openpyxl>=3.1.5
+websocket-client>=1.9.2
+requests>=2.34.2

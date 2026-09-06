@@ -15,6 +15,7 @@
 
 ## 开发流程
 
+- 环境：Python 3.11（实测版本，Windows / macOS 均可），依赖用 `python -m pip install -r requirements.txt` 装进 `.venv`；新增或升级依赖必须同步更新 `requirements.txt` 的版本下限。
 - 全项目中文注释 / 中文 UI，新代码沿用现有惯例（纯标准库 + fastapi/openai/openpyxl/websocket-client/requests，4 空格缩进）。
 - 每个功能必须带单测；改动 `backend/` 或 `frontend/` 后必须全量回归：
 

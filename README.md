@@ -17,16 +17,19 @@
 
 ## 快速开始
 
+环境要求：**Python 3.11**（实测版本，Windows / macOS 均可）。
+
 ```bash
 cd boss-copilot
-.venv/bin/python -m pip install fastapi uvicorn openai openpyxl websocket-client requests
-.venv/bin/python -m unittest discover tests -v   # 回归（417 例，必须全绿）
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m unittest discover tests -v   # 回归（464 例，必须全绿）
 .venv/bin/uvicorn backend.main:app --port 8787
 # 浏览器打开 http://127.0.0.1:8787
 # 新人请先读下方「注意事项」，并在应用左侧导航打开「使用指南」跟随向导操作
 ```
 
-Windows 下可一键启动：双击项目根目录的 `start.bat`（或命令行 `start.bat [端口]`，默认 8787），会自动启动服务并打开浏览器，关闭窗口即停止服务。
+Windows 下可一键启动：双击项目根目录的 `start.bat`（或命令行 `start.bat [端口]`，默认 8787），会自动启动服务并打开浏览器，关闭窗口即停止服务。不想装 Python 环境的话，可按[「打包发布」](#打包发布windows-exe)章节构建单目录 exe（`boss-copilot.exe` 双击即用）。
 
 ## 注意事项
 
@@ -177,7 +180,7 @@ backend/
   interview.py   模拟面试 agent
   boss/cdp.py    账号 CDP 管理（单/双账号切换 + 代理绕过）
 frontend/        无构建 Vue3（app.js 单文件 + vendored vue.esm）
-tests/           417 个单测 + 真实登录态只读 spike 脚本
+tests/           464 个单测 + 真实登录态只读 spike 脚本
 vendor/          内置采集引擎（boss-zhipin-scraper v2.2.0 + 补丁，MIT）
 ```
 

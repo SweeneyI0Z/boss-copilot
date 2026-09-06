@@ -18,7 +18,7 @@ if exist ".venv\Scripts\python.exe" goto venv_ok
 echo [错误] 未找到虚拟环境解释器 .venv\Scripts\python.exe
 echo 请先在项目根目录执行以下命令创建虚拟环境并安装依赖：
 echo     python -m venv .venv
-echo     .venv\Scripts\python.exe -m pip install fastapi uvicorn openai openpyxl websocket-client requests
+echo     .venv\Scripts\python.exe -m pip install -r requirements.txt
 echo.
 pause
 exit /b 1

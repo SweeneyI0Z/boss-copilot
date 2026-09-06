@@ -5,7 +5,7 @@
 ## 常用命令
 
 ```bash
-# 回归测试（417 例，任何 backend/ 或 frontend/ 改动后必须全绿才可提交）
+# 回归测试（464 例，任何 backend/ 或 frontend/ 改动后必须全绿才可提交）
 .venv/bin/python -m unittest discover tests -v
 
 # 启动（浏览器打开 http://127.0.0.1:8787）
@@ -13,7 +13,7 @@
 ```
 
 - 无 lint/typecheck 配置；风格靠现有代码约束（纯标准库 + fastapi/openai/openpyxl/websocket-client/requests，4 空格缩进）。
-- 依赖直接装在 `.venv`（无 requirements.txt）；改动依赖后口头同步给用户。
+- 依赖装在 `.venv`，版本下限记录在 `requirements.txt`；改动依赖后同步更新清单并口头同步给用户。
 
 ## 架构边界
 
