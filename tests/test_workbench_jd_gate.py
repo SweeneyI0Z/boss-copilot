@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 from backend import config, greeting, llm, main, resumes  # noqa: E402
 from backend.ai_tasks import AITaskScheduler  # noqa: E402
-from backend.db import get_db, init_db, now_iso  # noqa: E402
+from backend.db import close_db, get_db, init_db, now_iso  # noqa: E402
 
 
 class NoJdWorkbenchGateTests(unittest.TestCase):
@@ -47,6 +47,7 @@ class NoJdWorkbenchGateTests(unittest.TestCase):
         if main._ai_scheduler is not None:
             main._ai_scheduler.close(wait=True, timeout=1)
         main._ai_scheduler = None
+        close_db()
         self.tmp.cleanup()
 
     def add_job(self, job_key: str, *, jd: str = None, favorite: bool = False):

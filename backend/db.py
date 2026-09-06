@@ -7,6 +7,7 @@
 import json
 import sqlite3
 import threading
+import weakref
 from datetime import datetime, timezone
 
 from . import config
@@ -18,17 +19,52 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def _close_thread_conn(conn) -> None:
+    """线程对象被回收时关闭其线程本地连接。
+
+    线程本地连接在线程死亡后要等循环 GC 才释放，Windows 上期间文件句柄
+    一直被占用；绑定到线程对象的终结器让关闭动作确定性发生。
+    """
+    try:
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+
 def get_db() -> sqlite3.Connection:
     conn = getattr(_local, "conn", None)
-    if conn is None or getattr(_local, "path", "") != str(config.DB_PATH):
+    if conn is not None and getattr(_local, "path", "") != str(config.DB_PATH):
+        close_db()
+        conn = None
+    if conn is None:
         config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(config.DB_PATH, timeout=10)
+        # 本项目约定连接严格线程本地、绝不跨线程并发使用；
+        # check_same_thread=False 仅为允许线程死亡后由终结器跨线程关闭。
+        conn = sqlite3.connect(config.DB_PATH, timeout=10,
+                               check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         _local.conn = conn
         _local.path = str(config.DB_PATH)
+        weakref.finalize(threading.current_thread(), _close_thread_conn, conn)
     return conn
+
+
+def close_db() -> None:
+    """关闭当前线程的 SQLite 连接。
+
+    Windows 不允许删除仍被打开的文件（POSIX 可以），测试与切库场景必须先
+    关闭连接，否则临时数据目录里的 WAL 文件会让目录清理失败。
+    """
+    conn = getattr(_local, "conn", None)
+    _local.conn = None
+    _local.path = None
+    if conn is not None:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
 
 
 SCHEMA = """

@@ -15,7 +15,7 @@ _TEST_HOME = tempfile.mkdtemp(prefix="boss-copilot-m16-")
 os.environ["BOSS_COPILOT_HOME"] = _TEST_HOME
 
 from backend import collector, config  # noqa: E402
-from backend.db import get_db, init_db  # noqa: E402
+from backend.db import close_db, get_db, init_db  # noqa: E402
 
 
 class _FakeProcess:
@@ -73,6 +73,7 @@ class CollectorControlTests(unittest.TestCase):
                 process.wait(timeout=0.5)
         collector.RESULT_DIR = self.original_result_dir
         collector.SCRAPER_DIR = self.original_scraper_dir
+        close_db()
         self.tmp.cleanup()
 
     def _begin_run(self):

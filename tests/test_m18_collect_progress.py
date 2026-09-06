@@ -12,7 +12,7 @@ _TEST_HOME = tempfile.mkdtemp(prefix="boss-copilot-m18-collect-")
 os.environ["BOSS_COPILOT_HOME"] = _TEST_HOME
 
 from backend import collection_runs, collector, config, strategy  # noqa: E402
-from backend.db import get_db, init_db, now_iso  # noqa: E402
+from backend.db import close_db, get_db, init_db, now_iso  # noqa: E402
 
 
 class CollectProgressTests(unittest.TestCase):
@@ -30,6 +30,7 @@ class CollectProgressTests(unittest.TestCase):
     def tearDown(self):
         self._reset_state()
         collector.RESULT_DIR = self.original_result_dir
+        close_db()
         self.tmp.cleanup()
 
     @staticmethod

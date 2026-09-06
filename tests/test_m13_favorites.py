@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from backend import config, favorites, importer, main
-from backend.db import get_db, init_db, set_setting
+from backend.db import close_db, get_db, init_db, set_setting
 
 
 class M13TestCase(unittest.TestCase):
@@ -22,6 +22,7 @@ class M13TestCase(unittest.TestCase):
 
     def tearDown(self):
         self.reset_state()
+        close_db()
         self.tmp.cleanup()
 
     @staticmethod

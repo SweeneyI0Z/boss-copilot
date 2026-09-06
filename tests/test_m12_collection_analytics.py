@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from backend import analytics, cities, collector, config, importer, main, sync
-from backend.db import get_db, init_db, now_iso
+from backend.db import close_db, get_db, init_db, now_iso
 
 
 class M12DatabaseTestCase(unittest.TestCase):
@@ -30,6 +30,7 @@ class M12DatabaseTestCase(unittest.TestCase):
             })
 
     def tearDown(self):
+        close_db()
         self.tmp.cleanup()
 
     def write_list(self, name, jobs, **meta):
@@ -82,6 +83,8 @@ class M12DatabaseTestCase(unittest.TestCase):
 
 class CollectConfigTests(M12DatabaseTestCase):
     def test_full_city_table_is_grouped_by_province(self):
+        if not (config.SCRAPER_DIR / "data" / "city_codes.json").exists():
+            self.skipTest("外部采集仓库未部署：完整城市码表不可用，内置快照由离线兜底用例覆盖")
         groups = cities.city_groups()
         names = {city["name"] for group in groups for city in group["cities"]}
         self.assertGreater(len(names), 100)
@@ -478,6 +481,8 @@ class AnalyticsTests(M12DatabaseTestCase):
 
 class ApiIntegrationTests(M12DatabaseTestCase):
     def test_collect_config_api_returns_full_city_options(self):
+        if not (config.SCRAPER_DIR / "data" / "city_codes.json").exists():
+            self.skipTest("外部采集仓库未部署：完整城市码表不可用，内置快照由离线兜底用例覆盖")
         result = main.collect_config_save({
             "keywords": ["AI Agent"], "cities": ["深圳"], "pages": 2,
             "filters": {"salary": "20-50K", "degree": ["本科"]},

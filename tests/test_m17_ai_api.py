@@ -15,7 +15,7 @@ from fastapi import HTTPException  # noqa: E402
 
 from backend import collection_runs, config, greeting, llm, main, resumes  # noqa: E402
 from backend.ai_tasks import AITaskScheduler  # noqa: E402
-from backend.db import get_db, init_db, now_iso, set_setting  # noqa: E402
+from backend.db import close_db, get_db, init_db, now_iso, set_setting  # noqa: E402
 from backend.scoring import l2  # noqa: E402
 
 
@@ -46,6 +46,7 @@ class PageTaskApiTests(unittest.TestCase):
         if main._ai_scheduler is not None:
             main._ai_scheduler.close(wait=True)
         main._ai_scheduler = None
+        close_db()
         self.tmp.cleanup()
 
     def test_enqueue_normalizes_both_score_buttons_and_deduplicates(self):
@@ -138,6 +139,7 @@ class LLMStreamingTests(unittest.TestCase):
         set_setting("llm_model", "test-model")
 
     def tearDown(self):
+        close_db()
         self.tmp.cleanup()
 
     @staticmethod
@@ -200,6 +202,7 @@ class CollectionDeleteApiTests(unittest.TestCase):
         init_db()
 
     def tearDown(self):
+        close_db()
         self.tmp.cleanup()
 
     def test_preview_and_delete_endpoint_require_matching_confirmation(self):

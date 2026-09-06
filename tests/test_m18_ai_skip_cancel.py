@@ -14,7 +14,7 @@ os.environ["BOSS_COPILOT_HOME"] = _TEST_HOME
 
 from backend import config, llm, main, resumes  # noqa: E402
 from backend.ai_tasks import AITaskScheduler  # noqa: E402
-from backend.db import get_db, init_db, now_iso  # noqa: E402
+from backend.db import close_db, get_db, init_db, now_iso  # noqa: E402
 from backend.scoring import l2  # noqa: E402
 
 
@@ -50,6 +50,7 @@ class AiSkipCancelTests(unittest.TestCase):
         if main._ai_scheduler is not None:
             main._ai_scheduler.close(wait=True, timeout=1)
         main._ai_scheduler = None
+        close_db()
         self.tmp.cleanup()
 
     def add_job(self, job_key: str):

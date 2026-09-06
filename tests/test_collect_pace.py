@@ -16,7 +16,7 @@ os.environ["BOSS_COPILOT_HOME"] = _TEST_HOME
 from fastapi import HTTPException  # noqa: E402
 
 from backend import collector, config, main  # noqa: E402
-from backend.db import get_db, get_setting, init_db, set_setting  # noqa: E402
+from backend.db import close_db, get_db, get_setting, init_db, set_setting  # noqa: E402
 
 
 def _clear_pace_setting():
@@ -35,6 +35,7 @@ class PaceResolveTests(unittest.TestCase):
         init_db()
         _clear_pace_setting()
         self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(close_db)
 
     def tearDown(self):
         _clear_pace_setting()
@@ -99,6 +100,7 @@ class ScraperEnvInjectionTests(unittest.TestCase):
         self.run_mock = patcher.start()
         self.addCleanup(patcher.stop)
         self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(close_db)
 
     def tearDown(self):
         collector.RESULT_DIR = self.original_result_dir
@@ -150,6 +152,7 @@ class SettingsApiTests(unittest.TestCase):
         init_db()
         _clear_pace_setting()
         self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(close_db)
 
     def tearDown(self):
         _clear_pace_setting()

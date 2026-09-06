@@ -14,7 +14,7 @@ _TEST_HOME = tempfile.mkdtemp(prefix="boss-copilot-m18-guide-")
 os.environ["BOSS_COPILOT_HOME"] = _TEST_HOME
 
 from backend import config, llm, main, resumes, strategy  # noqa: E402
-from backend.db import init_db, set_setting  # noqa: E402
+from backend.db import close_db, init_db, set_setting  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +41,7 @@ class StrategyStreamApiTests(unittest.TestCase):
         set_setting("llm_model", "model")
 
     def tearDown(self):
+        close_db()
         self.tmp.cleanup()
 
     def test_ndjson_stream_emits_deltas_then_saves_done_plan(self):

@@ -26,7 +26,7 @@ from pathlib import Path
 
 from . import config, importer
 from .boss import cdp
-from .db import get_db, now_iso
+from .db import close_db, get_db, now_iso
 
 # 详情补齐复用 collector 的 scraper 子进程封装与失败分类（同仓库内部约定）。
 from .collector import _run_scraper, classify_failure
@@ -630,6 +630,10 @@ def _sync_worker(run_id: int, accounts: list, max_pages: int, reader_factory) ->
         _log(f"收藏同步异常终止: {failure['message']}")
         _finish_run(run_id, report, "failed",
                     failure["message"] if failure["risk"] else "")
+    finally:
+        # 线程本地连接要等 GC 清理死线程才会释放；显式关闭让句柄确定性回收，
+        # Windows 上临时数据目录（含 WAL 文件）才能被及时删除。
+        close_db()
 
 
 def start_sync(max_pages: int = None, reader_factory=None) -> dict:

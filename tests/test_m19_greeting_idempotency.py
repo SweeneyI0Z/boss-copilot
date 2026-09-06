@@ -13,7 +13,7 @@ os.environ["BOSS_COPILOT_HOME"] = _TEST_HOME
 
 from backend import config, greeting, llm, main, resumes  # noqa: E402
 from backend.ai_tasks import AITaskScheduler  # noqa: E402
-from backend.db import get_db, init_db, now_iso, set_setting  # noqa: E402
+from backend.db import close_db, get_db, init_db, now_iso, set_setting  # noqa: E402
 
 
 def _client(response: str):
@@ -50,6 +50,7 @@ class GreetingIdempotencyTests(unittest.TestCase):
         conn.execute("DELETE FROM job_details")
         conn.execute("DELETE FROM jobs")
         conn.commit()
+        close_db()
         self.tmp.cleanup()
 
     def add_job(self, job_key: str):

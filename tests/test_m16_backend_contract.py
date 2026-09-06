@@ -6,7 +6,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from backend import collection_runs, config, greeting, main, workflow
-from backend.db import get_db, init_db, now_iso
+from backend.db import close_db, get_db, init_db, now_iso
 
 
 class BackendContractTests(unittest.TestCase):
@@ -19,6 +19,7 @@ class BackendContractTests(unittest.TestCase):
         init_db()
 
     def tearDown(self):
+        close_db()
         self.tmp.cleanup()
 
     @staticmethod

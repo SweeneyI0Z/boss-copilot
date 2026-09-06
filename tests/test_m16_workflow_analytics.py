@@ -10,7 +10,7 @@ _TEST_HOME = tempfile.mkdtemp(prefix="boss-copilot-m16-")
 os.environ["BOSS_COPILOT_HOME"] = _TEST_HOME
 
 from backend import analytics, config, dashboard, workflow  # noqa: E402
-from backend.db import get_db, init_db, now_iso  # noqa: E402
+from backend.db import close_db, get_db, init_db, now_iso  # noqa: E402
 from backend.resumes import get_default_resume  # noqa: E402
 
 
@@ -24,6 +24,7 @@ class M16DatabaseTestCase(unittest.TestCase):
         self.resume = get_default_resume()
 
     def tearDown(self):
+        close_db()
         self.tmp.cleanup()
 
     @staticmethod
