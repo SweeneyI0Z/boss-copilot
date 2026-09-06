@@ -301,6 +301,9 @@ class ApplicationAndDashboardTests(unittest.TestCase):
 
     def test_dashboard_file_freshness_prefers_source_time_over_import_time(self):
         conn = get_db()
+        # 新鲜度现以岗位库实际数据为准：先清空岗位，仅留文件导入记录。
+        conn.execute("DELETE FROM jobs")
+        conn.commit()
         conn.execute(
             "INSERT INTO collect_runs(kind,params,stats,started_at,finished_at,status,"
             "data_source_at) VALUES('xlsx_import','{}','{}',?,?, 'succeeded',?)",

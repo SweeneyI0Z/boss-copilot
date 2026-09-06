@@ -255,9 +255,22 @@ def set_enabled(run_id: int, enabled: bool) -> dict:
     return {"id": int(run_id), "enabled": bool(enabled)}
 
 
+def _missing_jd_counts(conn) -> dict:
+    """按采集记录统计仍可用但缺非空 JD 的岗位数（与补采资格口径一致）。"""
+    rows = conn.execute(
+        "SELECT m.run_id, COUNT(DISTINCT m.job_key) c FROM job_run_items m "
+        "JOIN jobs j ON j.job_key=m.job_key "
+        "LEFT JOIN job_details d ON d.job_key=m.job_key "
+        "WHERE j.status<>'excluded' AND length(trim(replace(replace(replace(replace("
+        "COALESCE(d.jd,''),char(9),''),char(10),''),char(13),''),'　','')))=0 "
+        "GROUP BY m.run_id").fetchall()
+    return {int(row["run_id"]): int(row["c"]) for row in rows}
+
+
 def list_runs(limit: int = 100) -> list[dict]:
     recover_legacy_ownership()
     conn = get_db()
+    missing_counts = _missing_jd_counts(conn)
     rows = conn.execute(
         "SELECT r.*,COUNT(DISTINCT m.job_key) item_count,"
         "COUNT(DISTINCT CASE WHEN length(trim(replace(replace(replace(replace("
@@ -294,6 +307,7 @@ def list_runs(limit: int = 100) -> list[dict]:
             item["with_jd_count"] = None
             item["list_only_count"] = None
         item["can_export"] = item["owned_item_count"] > 0
+        item["missing_jd_count"] = missing_counts.get(int(item["id"]), 0)
         result.append(item)
     return result
 

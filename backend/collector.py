@@ -1707,9 +1707,28 @@ def start_config(body: dict, resume_id=None, sync_mode: bool = False) -> dict:
                  fetch_details=cfg["fetch_details"], resume_id=cfg["resume_id"])
 
 
+def _finish_stale_paused_run() -> None:
+    """内存已无运行任务时，把遗留“暂停中”的采集记录标记为中断。
+
+    进程重启由启动钩子兜底；这里覆盖工作线程异常退出等造成的状态残留，
+    避免界面永久停在“已暂停”且继续/取消都不产生任何效果。
+    """
+    row = get_db().execute(
+        "SELECT id FROM collect_runs WHERE paused=1 AND finished_at IS NULL "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    if row is None:
+        return
+    get_db().execute(
+        "UPDATE collect_runs SET paused=0,status='interrupted',phase='finished',"
+        "finished_at=? WHERE id=?", (now_iso(), row["id"]))
+    get_db().commit()
+    _log(f"采集记录 #{row['id']} 残留“暂停中”状态，已标记为中断")
+
+
 def cancel() -> dict:
     with _state_condition:
         if not _state["running"]:
+            _finish_stale_paused_run()
             return {"ok": True, "running": False}
         if not _state.get("run_id"):
             return {"ok": False, "running": True, "paused": False,
@@ -1767,6 +1786,7 @@ def resume() -> dict:
     """继续当前采集，并恢复被挂起的 scraper 子进程（Windows 同样生效）。"""
     with _state_condition:
         if not _state["running"]:
+            _finish_stale_paused_run()
             return {"ok": True, "running": False, "paused": False}
         run_id = _state["run_id"]
         if not run_id:

@@ -129,6 +129,7 @@ def _account_status() -> dict:
 
 def _collection_status(collector_state: dict = None) -> dict:
     conn = get_db()
+    visible = visible_jobs_clause("j")
     online = conn.execute(
         "SELECT MAX(COALESCE(finished_at, started_at)) at FROM collect_runs "
         "WHERE kind NOT IN ('xlsx_import','json_import') "
@@ -139,7 +140,11 @@ def _collection_status(collector_state: dict = None) -> dict:
         "WHERE kind IN ('xlsx_import','json_import') AND finished_at IS NOT NULL "
         "ORDER BY id DESC LIMIT 1").fetchone()
     file_at = (file_row["data_source_at"] or file_row["finished_at"]) if file_row else None
-    latest = _latest_time(online, file_at)
+    # 被中断/失败的采集同样会写入岗位数据，“3 天未更新”以岗位库的实际
+    # 新鲜度为准，只看成功运行的结束时间会把当天数据误报为过期。
+    job_fresh = conn.execute(
+        f"SELECT MAX(j.last_seen_at) at FROM jobs j WHERE {visible}").fetchone()["at"]
+    latest = _latest_time(online, file_at, job_fresh)
     moment = _parse_time(latest)
     stale = True
     if moment:
