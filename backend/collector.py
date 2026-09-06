@@ -1483,9 +1483,14 @@ def _worker(run_id: int, kind: str, tasks: list, sync_mode: bool,
         account = cdp.account_for("collect")
         account_label = cdp.config.ACCOUNTS[account]["label"]
         cdp_port = cdp.config.ACCOUNTS[account]["cdp_port"]
-        launched = cdp.launch(account)
-        _log(f"{account_label} Chrome: "
-             f"{'已启动' if launched.get('ok') else launched.get('error', '启动失败')}")
+        launched = cdp.launch(account, headless=True)
+        if launched.get("ok"):
+            # 无头启动：采集全程不弹窗口；复用运行中实例时保持其原有模式
+            _log(f"{account_label} Chrome: "
+                 f"{'复用运行中实例' if launched.get('already_running') else '已启动'}"
+                 + ("（无头）" if launched.get("headless") else ""))
+        else:
+            _log(f"{account_label} Chrome: {launched.get('error', '启动失败')}")
         if not launched.get("ok"):
             raise RuntimeError(f"{account_label} Chrome 无法启动（CDP 未就绪）")
 
@@ -1821,7 +1826,7 @@ def _retry_worker(run_id: int, source_run_id: int, task: dict) -> None:
                 _state["worker_ident"] = threading.get_ident()
         account = cdp.account_for("collect")
         port = cdp.config.ACCOUNTS[account]["cdp_port"]
-        launched = cdp.launch(account)
+        launched = cdp.launch(account, headless=True)
         if not launched.get("ok"):
             raise RuntimeError("采集 Chrome 无法启动（CDP 未就绪）")
         rows = get_db().execute(

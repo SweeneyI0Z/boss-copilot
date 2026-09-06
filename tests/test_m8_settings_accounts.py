@@ -125,7 +125,7 @@ class AccountModeTests(unittest.TestCase):
         with patch.object(cdp, "is_running", return_value=False), \
              patch.object(cdp, "launch", return_value={"ok": True,
                                                         "already_running": False}), \
-             patch.object(cdp, "open_login_page", return_value={"ok": True}), \
+             patch.object(cdp, "_navigate_login_page", return_value={"ok": True}), \
              patch.object(cdp, "login_state", return_value=detected), \
              patch.object(cdp, "stop", return_value={"ok": True}) as stop:
             result = cdp.check_login_state("account_a", wait_sec=0)
@@ -141,20 +141,21 @@ class AccountModeTests(unittest.TestCase):
         with patch.object(cdp, "is_running", return_value=True), \
              patch.object(cdp, "login_state", return_value=detected), \
              patch.object(cdp, "launch") as launch, \
-             patch.object(cdp, "open_login_page") as open_page, \
+             patch.object(cdp, "_navigate_login_page") as navigate, \
              patch.object(cdp, "stop") as stop:
             result = cdp.check_login_state("account_a", wait_sec=0)
         self.assertTrue(result["logged_in"])
         self.assertFalse(result["auto_started"])
         launch.assert_not_called()
-        open_page.assert_not_called()
+        navigate.assert_not_called()
         stop.assert_not_called()
 
     def test_check_failure_still_stops_and_saves_unknown(self):
         with patch.object(cdp, "is_running", return_value=False), \
              patch.object(cdp, "launch", return_value={"ok": True,
                                                         "already_running": False}), \
-             patch.object(cdp, "open_login_page", side_effect=RuntimeError("navigate")), \
+             patch.object(cdp, "_navigate_login_page",
+                          side_effect=RuntimeError("navigate")), \
              patch.object(cdp, "stop", return_value={"ok": True}) as stop:
             result = cdp.check_login_state("account_a", wait_sec=0)
         self.assertIsNone(result["logged_in"])

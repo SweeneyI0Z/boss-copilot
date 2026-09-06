@@ -85,24 +85,131 @@ def account_for(purpose: str) -> str:
     raise ValueError(f"unknown account purpose: {purpose}")
 
 
-def launch(account: str, wait_sec: float = 15) -> dict:
-    """启动指定账号的专用 Chrome（已运行则直接返回）。"""
-    conf = config.ACCOUNTS[account]
-    if is_running(conf["cdp_port"]):
-        return {"ok": True, "already_running": True, "port": conf["cdp_port"]}
-    conf["profile_dir"].mkdir(parents=True, exist_ok=True)
+def chrome_launch_command(conf: dict, headless: bool = False,
+                          user_agent: str = "") -> list:
+    """构造账号专用 Chrome 启动命令（纯函数，便于单测）。"""
     cmd = [config.CHROME_PATH,
            f"--remote-debugging-port={conf['cdp_port']}",
            f"--user-data-dir={conf['profile_dir']}",
            "--no-first-run", "--no-default-browser-check",
            "--remote-allow-origins=*"]
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    deadline = time.time() + wait_sec
+    if headless:
+        # 真无头：不弹任何窗口。显式给定视口尺寸，避免 SPA 按无头默认
+        # 800x600 小视口渲染异常；UA 标记由 launch() 两段式启动修正。
+        cmd += ["--headless=new", "--window-size=1440,900"]
+    if user_agent:
+        cmd.append(f"--user-agent={user_agent}")
+    return cmd
+
+
+def _headless_instance_running(conf: dict) -> bool:
+    """该账号 profile 的 Chrome 是否正以无头参数运行（按进程命令行判断）。"""
+    marker = str(conf["profile_dir"])
+    for line in _chrome_process_lines().splitlines():
+        line = line.strip()
+        if marker in line and "chrome" in line.lower() and "--headless" in line:
+            return True
+    return False
+
+
+def _wait_cdp_gone(port: int, timeout: float = 10.0) -> bool:
+    """等待 CDP 端口释放；旧实例完全退出后才能重启同端口实例。"""
+    deadline = time.time() + timeout
     while time.time() < deadline:
-        if is_running(conf["cdp_port"]):
-            return {"ok": True, "already_running": False, "port": conf["cdp_port"]}
-        time.sleep(0.5)
-    return {"ok": False, "error": f"CDP {conf['cdp_port']} 未就绪", "port": conf["cdp_port"]}
+        if not is_running(port):
+            return True
+        time.sleep(0.3)
+    return False
+
+
+# 无头实例 UA 修正的进程内缓存：修正过一次后，同次后端运行内
+# 再次无头启动直接带上 --user-agent，省去两段式探测的重启开销。
+_headless_user_agent_cache: str = ""
+
+
+def _read_headless_user_agent(port: int) -> str:
+    """读取无头实例实测 UA 并去掉 HeadlessChrome 标记；无标记返回空串。
+
+    无头 UA 里的 HeadlessChrome/xxx 是风控最直接的识别特征；去掉后
+    与有头 Chrome 的 reduced UA 完全一致（主版本.0.0.0）。
+    """
+    data = _http_get_json(f"http://127.0.0.1:{port}/json/version") or {}
+    ua = str(data.get("User-Agent") or "")
+    if "HeadlessChrome" in ua:
+        return ua.replace("HeadlessChrome", "Chrome")
+    return ""
+
+
+def launch(account: str, wait_sec: float = 15, headless: bool = False) -> dict:
+    """启动指定账号的专用 Chrome（已运行则直接返回）。
+
+    headless=True 供自动采集使用：无窗口运行，UA 自动去掉 HeadlessChrome
+    标记。headless=False 遇到运行中的无头实例时，按 profile 精准关闭后以
+    有头模式重启——用户要窗口时，即便采集仍在进行也必须弹窗；进行中的
+    采集任务会因 CDP 断开而失败，属预期取舍（断连报错不命中风控分类，
+    不会触发当日熔断）。
+    """
+    conf = config.ACCOUNTS[account]
+    port = conf["cdp_port"]
+    if is_running(port):
+        if headless:
+            # 采集只复用运行中实例（无论有头无头），绝不重启打扰用户
+            return {"ok": True, "already_running": True, "port": port,
+                    "headless": _headless_instance_running(conf)}
+        if not _headless_instance_running(conf):
+            return {"ok": True, "already_running": True, "port": port,
+                    "headless": False}
+        stop(account)
+        if not _wait_cdp_gone(port):
+            return {"ok": False, "error": f"CDP {port} 旧实例关闭超时",
+                    "port": port}
+
+    conf["profile_dir"].mkdir(parents=True, exist_ok=True)
+
+    def start(headless_flags: bool, user_agent: str = "") -> None:
+        cmd = chrome_launch_command(conf, headless=headless_flags,
+                                    user_agent=user_agent)
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def wait_ready() -> bool:
+        deadline = time.time() + wait_sec
+        while time.time() < deadline:
+            if is_running(port):
+                return True
+            time.sleep(0.5)
+        return False
+
+    def started() -> dict:
+        return {"ok": True, "already_running": False, "port": port,
+                "headless": headless}
+
+    if not headless:
+        start(False)
+        if not wait_ready():
+            return {"ok": False, "error": f"CDP {port} 未就绪", "port": port}
+        return started()
+
+    # 无头两段式：先按默认参数启动，读实测 UA；带 HeadlessChrome 标记则
+    # 关闭后带 --user-agent 重启（Chrome 152 实测仍带该标记）。
+    global _headless_user_agent_cache
+    user_agent = _headless_user_agent_cache
+    start(True, user_agent)
+    if not wait_ready():
+        return {"ok": False, "error": f"CDP {port} 未就绪", "port": port}
+    if not user_agent:
+        user_agent = _read_headless_user_agent(port)
+        if not user_agent:
+            # 实测 UA 无标记（读取失败或浏览器已修复），不重启，下次再试
+            return started()
+        _headless_user_agent_cache = user_agent
+        stop(account)
+        if not _wait_cdp_gone(port):
+            return {"ok": False, "error": f"CDP {port} UA 修正重启超时",
+                    "port": port}
+        start(True, user_agent)
+        if not wait_ready():
+            return {"ok": False, "error": f"CDP {port} 未就绪", "port": port}
+    return started()
 
 
 def _chrome_process_lines() -> str:
@@ -199,12 +306,13 @@ def _ws_eval(port: int, target_id: str, js: str):
         ws.close()
 
 
-def open_login_page(account: str) -> dict:
-    """在前台标签页打开 BOSS 登录页。"""
+def _navigate_login_page(account: str) -> dict:
+    """在已运行的实例上导航到登录页（有头/无头两种模式复用）。
+
+    导航前先对该标签开启焦点仿真：BOSS 是 SPA，无前台窗口（无头实例或
+    后台标签）时不渲染，登录面板出不来，登录态 DOM 探测会全部落空。
+    """
     conf = config.ACCOUNTS[account]
-    launched = launch(account)
-    if not launched.get("ok"):
-        return launched
     try:
         websocket = _load_websocket()
         targets = _http_get_json(f"http://127.0.0.1:{conf['cdp_port']}/json") or []
@@ -213,7 +321,10 @@ def open_login_page(account: str) -> dict:
             return {"ok": False, "error": "无可用标签页"}
         ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=10)
         try:
-            ws.send(json.dumps({"id": 1, "method": "Page.navigate",
+            ws.send(json.dumps({"id": 1, "method": "Emulation.setFocusEmulationEnabled",
+                                "params": {"enabled": True}}))
+            ws.recv()
+            ws.send(json.dumps({"id": 2, "method": "Page.navigate",
                                 "params": {"url": LOGIN_URL}}))
             ws.recv()
         finally:
@@ -221,6 +332,14 @@ def open_login_page(account: str) -> dict:
     except Exception as error:  # 依赖缺失或 CDP 连接失败都要可读地回给前端
         return {"ok": False, "error": f"打开登录页失败：{error}"[:200]}
     return {"ok": True, "port": conf["cdp_port"]}
+
+
+def open_login_page(account: str) -> dict:
+    """在有头窗口打开 BOSS 登录页；无头实例会被重启为有头，保证用户能操作。"""
+    launched = launch(account)
+    if not launched.get("ok"):
+        return launched
+    return _navigate_login_page(account)
 
 
 def open_boss_job_page(job_link: str) -> dict:
@@ -348,20 +467,24 @@ def _save_login_state(account: str, result: dict) -> dict:
 
 def check_login_state(account: str, wait_sec: float = 10,
                       interval: float = 0.5) -> dict:
-    """检测登录态；Chrome 未运行时临时启动、打开登录页，完成后再停止。"""
+    """检测登录态；Chrome 未运行时以无头临时启动、导航登录页，完成后再停止。
+
+    检测是只读动作，临时实例走无头，避免为一次探测弹出打扰窗口；
+    需要人工登录时用户点「打开登录页」，仍按有头弹窗。
+    """
     conf = config.ACCOUNTS[account]
     was_running = is_running(conf["cdp_port"])
     started_here = False
     result = None
     try:
         if not was_running:
-            launched = launch(account)
+            launched = launch(account, headless=True)
             if not launched.get("ok"):
                 result = {"account": account, "running": False, "logged_in": None,
                           "hint": launched.get("error", "Chrome 启动失败")}
             else:
                 started_here = not launched.get("already_running", False)
-                opened = open_login_page(account)
+                opened = _navigate_login_page(account)
                 if not opened.get("ok"):
                     result = {"account": account, "running": True,
                               "logged_in": None,
