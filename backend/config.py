@@ -8,6 +8,14 @@ import sys
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+# PyInstaller 打包态（onedir/onefile）：随包分发的静态资源位于 sys._MEIPASS
+# （onedir 下即 _internal/ 目录），源码树的 __file__ 相对定位全部失效；
+# 代码内定位随包资源一律走 APP_ROOT，用户数据仍走 DATA_DIR（与 exe 位置解耦）。
+FROZEN = getattr(sys, "frozen", False)
+APP_ROOT = Path(getattr(sys, "_MEIPASS", "")) if FROZEN else BASE_DIR
+# 采集引擎再入旗标：打包态 collector 以 "exe 自身 --run-engine ..." 起引擎
+# 子进程，由仓库根 run.py 分发执行（开发态旗标为空，仍直跑脚本，行为不变）。
+ENGINE_REENTRY_FLAG = "--run-engine"
 _DATA_HOME_OVERRIDE = os.environ.get("BOSS_COPILOT_HOME", "").strip()
 DATA_DIR = Path(_DATA_HOME_OVERRIDE).expanduser() if _DATA_HOME_OVERRIDE else \
     Path.home() / ".boss-copilot"
@@ -50,9 +58,13 @@ CHROME_PATH = default_chrome_path()
 # BOSS_ZHIPIN_SCRAPER_HOME 仍可指向其他引擎副本（测试或自定义部署）。
 SCRAPER_DIR = Path(os.environ.get(
     "BOSS_ZHIPIN_SCRAPER_HOME",
-    str(BASE_DIR / "vendor" / "boss-zhipin-scraper"))).expanduser()
+    str(APP_ROOT / "vendor" / "boss-zhipin-scraper"))).expanduser()
 SCRAPER_PY = Path(sys.executable)
 SCRAPER_SCRIPT = SCRAPER_DIR / "scripts" / "boss_cdp_raw.py"
+# 打包态：sys.executable 是 exe 自身，需要带再入旗标让 run.py 走引擎分支；
+# 开发态：sys.executable 是 venv 解释器，直接"解释器 + 脚本路径"运行。
+SCRAPER_LAUNCH_FLAGS = (ENGINE_REENTRY_FLAG,) if FROZEN else ()
+FRONTEND_DIR = APP_ROOT / "frontend"
 
 
 def _port_open(port: int) -> bool:

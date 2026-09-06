@@ -25,6 +25,7 @@ from .db import get_db, get_setting, now_iso
 SCRAPER_DIR = config.SCRAPER_DIR
 SCRAPER_PY = config.SCRAPER_PY
 SCRAPER_SCRIPT = config.SCRAPER_SCRIPT
+SCRAPER_LAUNCH_FLAGS = config.SCRAPER_LAUNCH_FLAGS
 RESULT_DIR = config.COLLECT_RESULT_DIR
 # 列表任务间隔秒数：None＝按设置 collect_pace 解析档位间隔（M20 默认均衡档 60s）；
 # 数值＝强制覆盖（测试用旧钩子 patch.object(collector, "ITEM_GAP_SEC", …)）。
@@ -1095,7 +1096,9 @@ def _run_scraper(args: list, timeout: int, cdp_port: int,
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
     output = output_path or RESULT_DIR / (
         f"boss_jobs_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json")
-    command = [str(SCRAPER_PY), str(SCRAPER_SCRIPT), *args,
+    # 打包态：exe 自再入（run.py --run-engine）执行引擎；开发态旗标为空，
+    # 命令与历史形态逐字段一致（venv 解释器 + 脚本路径）。
+    command = [str(SCRAPER_PY), *SCRAPER_LAUNCH_FLAGS, str(SCRAPER_SCRIPT), *args,
                "--cdp-port", str(cdp_port), "--output", str(output)]
     if detail_output is not None:
         command.extend(["--detail-output", str(detail_output)])

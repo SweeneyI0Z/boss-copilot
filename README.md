@@ -89,6 +89,30 @@ Windows 下可一键启动：双击项目根目录的 `start.bat`（或命令行
 
 启动时会把旧版的 `~/.boss-zhipin-scraper/chrome-profile`、`~/.boss-zhipin-scraper/job-result` 和 `~/.boss-copilot/chrome-profile-a` 迁入统一目录。迁移是幂等的：旧 profile 正在使用或目标已经存在时会跳过，绝不覆盖目标数据。
 
+## 打包发布（Windows exe）
+
+用 PyInstaller 把项目打成 **onedir 目录版**（`boss-copilot.exe` + `_internal/` 依赖目录），免费手段中杀软误报最低的形态：不自我解压、不从临时目录执行、无 SFX 打包器特征。
+
+```bat
+:: 一次性（可选，强烈推荐）：自编译 bootloader，降误报收益最大的单项措施
+build_bootloader.bat
+
+:: 每次发布：打包并压缩出 dist\boss-copilot-win64.zip
+build_exe.bat
+```
+
+- **产物**：`dist\boss-copilot\`（整个目录一起分发）与 `dist\boss-copilot-win64.zip`。接收方解压后双击 `boss-copilot.exe` 即可，无需安装 Python。
+- **运行形态**：控制台窗口版——启动后打印访问地址（默认 `http://127.0.0.1:8787`）并自动打开浏览器；可选端口参数 `boss-copilot.exe 9000`，`--no-browser` 关闭自动打开。关窗口或 Ctrl+C 即停止服务。
+- **数据不写在程序目录**：仍全部落 `%USERPROFILE%\.boss-copilot`（`BOSS_COPILOT_HOME`/`BOSS_CHROME_PATH`/`BOSS_ZHIPIN_SCRAPER_HOME` 照旧生效），exe 可放在任意位置。
+- **构建机制**：入口 `run.py` 同时承载服务模式与采集引擎再入模式（打包后 collector 以 `boss-copilot.exe --run-engine ...` 自再入跑引擎子进程，暂停/恢复与实时进度不受影响）；打包配置见 `boss-copilot.spec`（显式禁用 UPX、内嵌版本信息资源、frontend/ 与 vendor 引擎随包分发）。
+- **杀软误报处置**（无签名 exe 的常见问题，按序操作）：
+  1. 构建期四件套已内置：自编译 bootloader（`build_bootloader.bat`）+ 禁 UPX + 版本信息资源 + PyInstaller 最新稳定版（固定 `>=6,<7`）；
+  2. **固定发布二进制**：杀软信誉与文件哈希绑定，发布后不要随意重新打包，升级版本才重建；
+  3. **主动申诉**：Microsoft Defender [文件提交](https://www.microsoft.com/en-us/wdsi/filesubmission)（以软件开发者身份）、360 申诉专区（fuwu.360.cn/shensu，样本 zip 密码 `infected`）、火绒/腾讯管家均有开发者加白通道；
+  4. **谨慎使用 VirusTotal**：会把样本分发给 70+ 厂商，未签名首发可能"越扫越红"；优先本机实测 + 厂商申诉；
+  5. **SmartScreen 首启提示**：点「更多信息 → 仍要运行」，或右键 exe → 属性 → 勾选「解除锁定」。
+- Chrome 不随包分发，仍依赖用户本机已安装的 Chrome。
+
 ## 功能与里程碑
 
 | 里程碑 | 功能 | 提交 |

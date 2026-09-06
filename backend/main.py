@@ -18,7 +18,8 @@ from .db import get_all_settings, get_db, get_setting, init_db, now_iso, set_set
 from .scoring import l1 as scoring_l1
 
 app = FastAPI(title="boss-copilot")
-FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
+# 打包态随包资源在 sys._MEIPASS（见 config.APP_ROOT），开发态即仓库根 frontend/。
+FRONTEND = config.FRONTEND_DIR
 
 
 @app.on_event("startup")
