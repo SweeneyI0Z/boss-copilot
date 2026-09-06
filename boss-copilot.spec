@@ -6,12 +6,15 @@
   是免费手段中误报最低的形态；引擎子进程从应用目录秒起。
 - console=True：双击运行保留控制台窗口，显示访问地址与运行日志。
 - upx=False：压缩壳是杀软启发式的重点特征，显式全局禁用。
+- 图标 assets/boss-copilot.ico 由 assets/make_icon.py 生成（"Bs"
+  字标；Pillow 仅生成图标时使用，见该脚本头部说明）。
 - 配合 version_info.txt 版本信息资源与（可选的）自编译 bootloader
   （build_bootloader.bat）进一步降低误报。
 """
 import os
 
 project_root = SPECPATH
+ICON = os.path.join(project_root, "assets", "boss-copilot.ico")
 
 # 随包分发的静态资源：保持与源码树相同的相对布局，
 # 运行期由 config.APP_ROOT（即 _MEIPASS）按同名相对路径定位。
@@ -69,6 +72,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=True,
+    icon=ICON,
     version=os.path.join(project_root, "version_info.txt"),
     disable_windowed_traceback=False,
 )

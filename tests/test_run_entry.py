@@ -89,20 +89,36 @@ class RunServiceTests(unittest.TestCase):
 
 
 class EngineReentryEndToEndTests(unittest.TestCase):
-    """子进程端到端：run.py --run-engine --help 等价于直接跑引擎脚本。"""
+    """子进程端到端：run.py --run-engine 等价于直接跑引擎脚本。"""
 
-    def test_engine_help_via_reentry(self):
+    def _reentry(self, *engine_args):
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
-        proc = subprocess.run(
+        return subprocess.run(
             [sys.executable, str(_REPO_ROOT / "run.py"),
-             config.ENGINE_REENTRY_FLAG, "--help"],
+             config.ENGINE_REENTRY_FLAG, *engine_args],
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", env=env, timeout=60, cwd=str(_REPO_ROOT))
+
+    def test_engine_help_via_reentry(self):
+        proc = self._reentry("--help")
         self.assertEqual(proc.returncode, 0, proc.stderr[-300:])
         # 与 test_builtin_scraper_engine 的契约对齐：增强参数仍在
         self.assertIn("--company", proc.stdout)
+        self.assertIn("--dup-stop-ratio", proc.stdout)
+
+    def test_engine_help_via_reentry_with_script_path(self):
+        """锁定 collector 的真实命令形态：--run-engine 后带脚本路径。
+
+        回归背景：打包态 collector 传 [exe, --run-engine, 脚本路径, 参数...]，
+        run.py 若不剥掉脚本路径，引擎 argparse 会报"无法识别的位置参数"
+        并以退出码 2 秒退（表现为开始采集立即失败）。
+        """
+        proc = self._reentry(str(config.SCRAPER_SCRIPT), "--help")
+        self.assertEqual(proc.returncode, 0,
+                         f"returncode={proc.returncode} stdout={proc.stdout[-300:]!s} "
+                         f"stderr={proc.stderr[-300:]!s}")
         self.assertIn("--dup-stop-ratio", proc.stdout)
 
 

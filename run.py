@@ -23,11 +23,17 @@ BROWSER_OPEN_DELAY_SEC = 1.5
 def _run_engine(engine_args: list) -> None:
     """把 vendored 采集引擎脚本当 __main__ 执行（runpy 不缓存、退出码原样透传）。
 
-    argv[0] 置为脚本路径，使引擎内 dirname(__file__) 相对定位 data/city_codes.json
-    与直接运行脚本时完全一致；SystemExit 不捕获，collector 依赖退出码判成败。
+    collector 的命令形态是 "解释器 --run-engine 脚本路径 引擎参数..."，首个
+    参数是脚本路径本身，必须剥掉再喂给引擎 argparse，否则会被当成无法识别
+    的位置参数导致引擎退出码 2（打包态"开始采集"秒失败）；argv[0] 置为
+    脚本路径，使引擎内 dirname(__file__) 相对定位 data/city_codes.json 与
+    直接运行脚本时完全一致；SystemExit 不捕获，collector 依赖退出码判成败。
     """
     from backend import config
-    sys.argv = [str(config.SCRAPER_SCRIPT)] + list(engine_args)
+    args = list(engine_args)
+    if args and args[0].lower().endswith(".py"):
+        args = args[1:]
+    sys.argv = [str(config.SCRAPER_SCRIPT)] + args
     runpy.run_path(str(config.SCRAPER_SCRIPT), run_name="__main__")
 
 
