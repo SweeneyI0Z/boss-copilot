@@ -1,7 +1,7 @@
-"""跨平台兼容测试：Windows venv 布局、子进程 UTF-8 编码与暂停/恢复的挂起语义。
+"""跨平台兼容测试：内置引擎布局、子进程 UTF-8 编码与暂停/恢复的挂起语义。
 
 背景：项目需兼容 macOS 与 Windows。Windows 无 SIGSTOP/SIGCONT、控制台默认 GBK，
-本文件锁定三处关键行为——外部采集仓库的解释器布局、scraper 子进程的编码约定、
+本文件锁定关键行为——内置采集引擎的打包布局、scraper 子进程的编码约定、
 采集暂停/恢复在 Windows 上的等价实现。
 
 跑法：.venv/bin/python -m unittest discover tests -v
@@ -10,6 +10,7 @@
 import ctypes
 import os
 import signal
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -61,23 +62,27 @@ def _stub_pace():
     return {"label": "均衡", "task_gap_sec": 60, "env": {}, "dup_stop_ratio": None}
 
 
-class ScraperPythonLayoutTests(unittest.TestCase):
-    """外部采集仓库 venv 解释器：Windows 与 POSIX 布局不同。"""
+class BuiltinEngineLayoutTests(unittest.TestCase):
+    """内置采集引擎：vendor 进本仓库，用本项目解释器直接运行。"""
 
-    def test_windows_layout_uses_scripts_dir(self):
-        python_path = config.default_scraper_python(
-            r"D:\repos\boss-zhipin-scraper", is_nt=True)
-        self.assertEqual(python_path.parts[-3:],
-                         (".venv", "Scripts", "python.exe"))
+    def test_engine_packaged_in_repo(self):
+        self.assertEqual(config.SCRAPER_DIR,
+                         config.BASE_DIR / "vendor" / "boss-zhipin-scraper")
+        self.assertTrue(config.SCRAPER_SCRIPT.exists())
 
-    def test_posix_layout_uses_bin_dir(self):
-        python_path = config.default_scraper_python("/opt/boss-zhipin-scraper",
-                                                    is_nt=False)
-        self.assertEqual(python_path.parts[-3:], (".venv", "bin", "python"))
+    def test_engine_runs_with_project_interpreter(self):
+        self.assertEqual(config.SCRAPER_PY, Path(sys.executable))
 
-    def test_module_constant_follows_current_os(self):
-        self.assertEqual(config.SCRAPER_PY,
-                         config.default_scraper_python(config.SCRAPER_DIR))
+    def test_engine_home_override_still_supported(self):
+        override = config.BASE_DIR / "somewhere-else"
+        with mock.patch.dict(os.environ,
+                             {"BOSS_ZHIPIN_SCRAPER_HOME": str(override)}):
+            import importlib
+            importlib.reload(config)
+            self.assertEqual(config.SCRAPER_DIR, override)
+        importlib.reload(config)
+        self.assertEqual(config.SCRAPER_DIR,
+                         config.BASE_DIR / "vendor" / "boss-zhipin-scraper")
 
 
 class ScraperEncodingTests(unittest.TestCase):

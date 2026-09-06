@@ -83,8 +83,6 @@ class M12DatabaseTestCase(unittest.TestCase):
 
 class CollectConfigTests(M12DatabaseTestCase):
     def test_full_city_table_is_grouped_by_province(self):
-        if not (config.SCRAPER_DIR / "data" / "city_codes.json").exists():
-            self.skipTest("外部采集仓库未部署：完整城市码表不可用，内置快照由离线兜底用例覆盖")
         groups = cities.city_groups()
         names = {city["name"] for group in groups for city in group["cities"]}
         self.assertGreater(len(names), 100)
@@ -364,10 +362,13 @@ class TwoPhaseCollectorTests(M12DatabaseTestCase):
             "pathlib.Path(sys.argv[1]).write_text('[1]', encoding='utf-8'); "
             "print('完成一条', flush=True); time.sleep(0.3)"
         )
-        result, returncode = collector._run_scraper_streamed(
-            [sys.executable, "-u", "-c", code, str(output)], 5,
-            os.environ.copy(), output, lines.append,
-            lambda path: snapshots.append(path.read_text(encoding="utf-8")))
+        # 流式机制测试不依赖外部仓库：SCRAPER_DIR 仅作为子进程 cwd，替身保证本机
+        # 未部署 ../boss-zhipin-scraper 时（Windows 常见）同样可跑
+        with patch.object(collector, "SCRAPER_DIR", Path(self.tmp.name)):
+            result, returncode = collector._run_scraper_streamed(
+                [sys.executable, "-u", "-c", code, str(output)], 5,
+                os.environ.copy(), output, lines.append,
+                lambda path: snapshots.append(path.read_text(encoding="utf-8")))
         self.assertEqual(returncode, 0)
         self.assertEqual(result, ["开始详情", "完成一条"])
         self.assertIn("完成一条", lines)
@@ -481,8 +482,6 @@ class AnalyticsTests(M12DatabaseTestCase):
 
 class ApiIntegrationTests(M12DatabaseTestCase):
     def test_collect_config_api_returns_full_city_options(self):
-        if not (config.SCRAPER_DIR / "data" / "city_codes.json").exists():
-            self.skipTest("外部采集仓库未部署：完整城市码表不可用，内置快照由离线兜底用例覆盖")
         result = main.collect_config_save({
             "keywords": ["AI Agent"], "cities": ["深圳"], "pages": 2,
             "filters": {"salary": "20-50K", "degree": ["本科"]},

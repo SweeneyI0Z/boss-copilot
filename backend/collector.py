@@ -1090,8 +1090,8 @@ def _run_scraper(args: list, timeout: int, cdp_port: int,
                "--cdp-port", str(cdp_port), "--output", str(output)]
     if detail_output is not None:
         command.extend(["--detail-output", str(detail_output)])
-    # 采集档位（M20）：均衡/快速档压缩 scraper 随机等待并开启重复内容早停；
-    # 稳妥档 env 为空字典、不传早停 flag＝外部脚本原生节奏。favorites 的
+    # 采集档位（M20）：均衡/快速档压缩引擎随机等待并开启重复内容早停；
+    # 稳妥档 env 为空字典、不传早停 flag＝引擎原生节奏。favorites 的
     # JD 补齐复用本函数，自动跟随同一档位。
     pace = resolve_collect_pace()
     if pace.get("dup_stop_ratio"):
@@ -1117,7 +1117,7 @@ def _run_scraper(args: list, timeout: int, cdp_port: int,
     if returncode != 0:
         tail = " / ".join(failure_lines[-12:])
         raise RuntimeError(f"scraper 退出码 {returncode}: {tail}")
-    # 外部脚本为保留部分列表，会捕获某些 RuntimeError 后以 0 退出；这类结果可导入，
+    # 引擎为保留部分列表，会捕获某些 RuntimeError 后以 0 退出；这类结果可导入，
     # 但绝不能被当作完整来源快照执行缺失 diff。
     warnings = [line.strip() for line in stdout
                 if "⚠️" in line and "继续执行实际职位搜索" not in line]

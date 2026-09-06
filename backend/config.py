@@ -4,6 +4,7 @@ import os
 import platform
 import shutil
 import socket
+import sys
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -43,17 +44,14 @@ def default_chrome_path(system=None, environ=None) -> str:
 
 
 CHROME_PATH = default_chrome_path()
+# 内置采集引擎：vendor 自 boss-zhipin-scraper v2.2.0（MIT，见 vendor/ 内 LICENSE），
+# 并带 SCRAPER_* 节奏注入、--company 公司定向与 --dup-stop-ratio 翻页早停补丁。
+# 以本项目 venv 解释器直接运行，不再依赖外部仓库与独立 venv；
+# BOSS_ZHIPIN_SCRAPER_HOME 仍可指向其他引擎副本（测试或自定义部署）。
 SCRAPER_DIR = Path(os.environ.get(
-    "BOSS_ZHIPIN_SCRAPER_HOME", str(BASE_DIR.parent / "boss-zhipin-scraper"))).expanduser()
-
-
-def default_scraper_python(scraper_dir, is_nt=None) -> Path:
-    """外部采集仓库 venv 解释器路径；Windows 布局为 Scripts/python.exe。"""
-    nt = (os.name == "nt") if is_nt is None else is_nt
-    return Path(scraper_dir) / ".venv" / ("Scripts/python.exe" if nt else "bin/python")
-
-
-SCRAPER_PY = default_scraper_python(SCRAPER_DIR)
+    "BOSS_ZHIPIN_SCRAPER_HOME",
+    str(BASE_DIR / "vendor" / "boss-zhipin-scraper"))).expanduser()
+SCRAPER_PY = Path(sys.executable)
 SCRAPER_SCRIPT = SCRAPER_DIR / "scripts" / "boss_cdp_raw.py"
 
 
@@ -143,9 +141,9 @@ DEFAULT_SETTINGS = {
 }
 
 # ── 采集节奏三档（M20）──
-# 单一真相源：task_gap_sec 是列表子任务之间的强制间隔；env 会注入 scraper 子进程
-# （SCRAPER_*，外部仓库内置默认=原硬编码值）；dup_stop_ratio 为翻页重复早停阈值，
-# None 表示不传该 flag。standard 档不注入任何内容＝scraper 原生节奏。
+# 单一真相源：task_gap_sec 是列表子任务之间的强制间隔；env 会注入内置引擎子进程
+# （SCRAPER_*，引擎缺省值=上游原生节奏）；dup_stop_ratio 为翻页重复早停阈值，
+# None 表示不传该 flag。standard 档不注入任何内容＝引擎原生节奏。
 # 均衡/快速档会成倍提高请求频率、增加风控信号概率（命中后当日熔断），切换前知悉。
 COLLECT_PACES = {
     "standard": {
