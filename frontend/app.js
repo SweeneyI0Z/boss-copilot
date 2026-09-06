@@ -600,6 +600,25 @@ async function runLoaders(loaders) {
   return results.flatMap((result, index) => result.status === 'rejected'
     ? [`${loaders[index][0]}：${result.reason && result.reason.message || '加载失败'}`] : [])
 }
+
+// -- 采集数据实时刷新 ---------------------------------------------------
+// 各视图可注册带自身状态的刷新器（如数据分析的筛选参数）；未注册时按路由映射刷新。
+const viewReloaders = {}
+const VIEW_DATA_LOADERS = {
+  '/dashboard': [['总览', refreshDashboard], ['岗位', refreshJobs]],
+  '/jobs': [['岗位', refreshJobs]],
+  '/jobcard': [['岗位', refreshJobs]],
+}
+const LIVE_VIEW_REFRESH_MS = 10000
+let collectDataVersionSeen = null
+let lastLiveViewRefreshAt = 0
+
+async function refreshActiveViewData() {
+  const reloader = viewReloaders[route.value]
+  if (reloader) { await reloader(); return }
+  const loaders = VIEW_DATA_LOADERS[route.value]
+  if (loaders) await runLoaders(loaders)
+}
 async function bootstrap() {
   store.ui.bootstrapLoading = true
   store.ui.bootstrapError = ''
@@ -636,6 +655,14 @@ async function refreshRuntime() {
     ])
   }
   observedRuntimeActive = active
+  // 采集运行中：data_version 变化表示有新岗位/JD 落库，按最小间隔节流刷新当前活跃视图
+  const version = Number((store.collect.status || {}).data_version || 0)
+  if (active && version && version !== collectDataVersionSeen
+      && Date.now() - lastLiveViewRefreshAt >= LIVE_VIEW_REFRESH_MS) {
+    collectDataVersionSeen = version
+    lastLiveViewRefreshAt = Date.now()
+    await refreshActiveViewData()
+  }
 }
 
 const aiStreams = []
@@ -1741,6 +1768,8 @@ const AnalyticsView = {
       })
       await loadAnalytics()
     }
+    // 采集进度/路由切换的刷新必须保留本视图的筛选状态，注册专用刷新器
+    viewReloaders['/analytics'] = loadAnalytics
     return {
       filters, dimensions: ANALYTICS_DIMENSIONS, salaryPresets: ANALYTICS_SALARY_PRESETS,
       meta, summary, charts, funnelStages, activeChips, activePreset, loading,
@@ -2517,6 +2546,13 @@ const App = {
       await bootstrap()
       connectAiStreams()
       runtimeTimer = window.setInterval(refreshRuntime, 5000)
+      // 切换页面即加载目标视图数据：采集运行中的新数据不必退出重进
+      watch(route, next => {
+        const reloader = viewReloaders[next]
+        if (reloader) { reloader(); return }
+        const loaders = VIEW_DATA_LOADERS[next]
+        if (loaders) runLoaders(loaders)
+      })
       // 后端连接异常时不弹引导，优先展示错误信息
       if (!store.ui.bootstrapError) tryStartOnboarding()
     })

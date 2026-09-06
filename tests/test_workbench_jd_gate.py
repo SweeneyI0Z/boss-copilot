@@ -180,8 +180,8 @@ class FrontendWorkbenchGateContracts(unittest.TestCase):
         self.assertIn("该岗位已有招呼语，已保留原结果", self.app)
 
     def test_cache_version_pins_current_tag(self):
-        self.assertNotIn("?v=m24-workbench-gate", self.index)
-        self.assertIn("app.js?v=win-account-fix", self.index)
+        self.assertNotIn("?v=win-account-fix", self.index)
+        self.assertIn("app.js?v=collect-live-updates", self.index)
 
 
 if __name__ == "__main__":

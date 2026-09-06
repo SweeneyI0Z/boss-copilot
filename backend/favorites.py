@@ -29,7 +29,7 @@ from .boss import cdp
 from .db import close_db, get_db, now_iso
 
 # 详情补齐复用 collector 的 scraper 子进程封装与失败分类（同仓库内部约定）。
-from .collector import _run_scraper, classify_failure
+from .collector import _bump_data_version, _run_scraper, classify_failure
 
 FAVORITE_URL = "https://www.zhipin.com/web/geek/recommend?tab=4&sub=1&tag=4&page={page}"
 DEFAULT_MAX_PAGES = 5
@@ -736,6 +736,7 @@ def _detail_retry_worker(run_id: int, source_run_id: int, merged: Path,
     def import_snapshot(path: Path) -> None:
         nonlocal completed
         importer.import_scraper_details(str(path))
+        _bump_data_version()
         current_completed = total - len(_missing_jd_keys(target_keys))
         if current_completed > completed:
             completed = current_completed

@@ -92,6 +92,7 @@ _state = {
     "phase_started_at": None, "phase_pause_baseline": 0.0,
     "eta_model": None,
     "progress": _new_progress(),
+    "data_version": 0,
 }
 
 
@@ -355,7 +356,14 @@ def _state_snapshot() -> dict:
         "cancel_requested": bool(_state["cancel"]),
         "risk_signal": _state["risk_signal"],
         "progress": _progress_snapshot_locked(), "log": list(_state["log"][-40:]),
+        "data_version": int(_state.get("data_version") or 0),
     }
+
+
+def _bump_data_version() -> None:
+    """数据已增量落库（新岗位或 JD 更新）；前端据此节流刷新活跃视图。"""
+    with _state_condition:
+        _state["data_version"] = int(_state.get("data_version") or 0) + 1
 
 
 def _job_completeness(keys) -> tuple[set, set]:
@@ -407,6 +415,7 @@ def _attach_run_jobs(run_id: int, job_keys, source: str) -> None:
         "INSERT OR IGNORE INTO job_run_items(run_id,job_key,source,created_at) "
         "VALUES(?,?,?,?)", [(int(run_id), key, source, ts) for key in keys])
     conn.commit()
+    _bump_data_version()
 
 
 def _finished_progress(run, tasks: list, data_run_id: int) -> tuple[dict, int]:
@@ -1398,6 +1407,7 @@ def _run_detail_phase(run_id: int, files: list[Path], task_ids: list[int],
     def import_snapshot(path: Path) -> None:
         nonlocal completed
         importer.import_scraper_details(str(path))
+        _bump_data_version()
         _, complete_now = _job_completeness(eligible)
         _, display_complete_now = _job_completeness(display_eligible)
         current_completed = max(0, len(complete_now) - initial_complete)
