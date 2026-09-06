@@ -50,6 +50,17 @@ def _http_get_json(url: str, timeout=3):
         return None
 
 
+def _load_websocket():
+    """加载 CDP WebSocket 依赖；缺失时给出可执行的修复指引。"""
+    try:
+        import websocket
+        return websocket
+    except ImportError as error:
+        raise RuntimeError(
+            "缺少依赖 websocket-client，请在项目虚拟环境执行："
+            "python -m pip install websocket-client") from error
+
+
 def is_running(port: int) -> bool:
     return _http_get_json(f"http://127.0.0.1:{port}/json/version") is not None
 
@@ -125,7 +136,9 @@ def stop(account: str) -> dict:
             continue
         pid_text = line.split(None, 1)[0]
         try:
-            kill_cmd = ["taskkill", "/PID", pid_text, "/T"] if os.name == "nt" \
+            # Windows 必须带 /F 强杀：不带时只发 WM_CLOSE，后台/无窗口进程会幸存，
+            # 端口继续被占用，后续启动与登录态检测全部落空。
+            kill_cmd = ["taskkill", "/PID", pid_text, "/T", "/F"] if os.name == "nt" \
                 else ["kill", pid_text]
             subprocess.run(kill_cmd, check=False, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL)
@@ -141,10 +154,15 @@ def status() -> dict:
     out = {}
     for name, conf in config.ACCOUNTS.items():
         running = is_running(conf["cdp_port"])
+        probe_error = ""
         if running:
-            live = login_state(name)
-            if live.get("logged_in") is not None:
-                _save_login_state(name, live)
+            try:
+                live = login_state(name)
+                if live.get("logged_in") is not None:
+                    _save_login_state(name, live)
+            except Exception as error:
+                # 单账号登录态探测失败（如缺依赖）只记录原因，不拖垮整个账号页
+                probe_error = str(error)[:200]
         roles = []
         if name == collect_account:
             roles.append("采集")
@@ -157,6 +175,7 @@ def status() -> dict:
             "running": running,
             "browser": browser_version(conf["cdp_port"]) if running else "",
             "login_state": saved_login_state(name),
+            "login_error": probe_error,
         }
     return out
 
@@ -165,7 +184,7 @@ def status() -> dict:
 
 def _ws_eval(port: int, target_id: str, js: str):
     """在指定 session 上执行 JS 并取值（websocket-client 延迟导入）。"""
-    import websocket
+    websocket = _load_websocket()
     targets = _http_get_json(f"http://127.0.0.1:{port}/json") or []
     page = next((t for t in targets if t.get("id") == target_id), None)
     if not page:
@@ -186,18 +205,21 @@ def open_login_page(account: str) -> dict:
     launched = launch(account)
     if not launched.get("ok"):
         return launched
-    import websocket
-    targets = _http_get_json(f"http://127.0.0.1:{conf['cdp_port']}/json") or []
-    page = next((t for t in targets if t.get("type") == "page"), None)
-    if not page:
-        return {"ok": False, "error": "无可用标签页"}
-    ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=10)
     try:
-        ws.send(json.dumps({"id": 1, "method": "Page.navigate",
-                            "params": {"url": LOGIN_URL}}))
-        ws.recv()
-    finally:
-        ws.close()
+        websocket = _load_websocket()
+        targets = _http_get_json(f"http://127.0.0.1:{conf['cdp_port']}/json") or []
+        page = next((t for t in targets if t.get("type") == "page"), None)
+        if not page:
+            return {"ok": False, "error": "无可用标签页"}
+        ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=10)
+        try:
+            ws.send(json.dumps({"id": 1, "method": "Page.navigate",
+                                "params": {"url": LOGIN_URL}}))
+            ws.recv()
+        finally:
+            ws.close()
+    except Exception as error:  # 依赖缺失或 CDP 连接失败都要可读地回给前端
+        return {"ok": False, "error": f"打开登录页失败：{error}"[:200]}
     return {"ok": True, "port": conf["cdp_port"]}
 
 
@@ -271,7 +293,7 @@ def login_state(account: str) -> dict:
     if not is_running(conf["cdp_port"]):
         return {"account": account, "running": False, "logged_in": None,
                 "hint": "Chrome 未启动，请先点击「启动」或「打开登录页」"}
-    import websocket
+    websocket = _load_websocket()
     targets = _http_get_json(f"http://127.0.0.1:{conf['cdp_port']}/json") or []
     pages = [t for t in targets
              if t.get("type") == "page" and "zhipin.com" in (t.get("url") or "")]

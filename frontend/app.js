@@ -40,11 +40,17 @@ class ApiError extends Error {
 }
 
 async function apiRequest(path, { method = 'GET', body, headers = {} } = {}) {
-  const response = await fetch(path, {
-    method,
-    headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  })
+  let response
+  try {
+    response = await fetch(path, {
+      method,
+      headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    })
+  } catch (error) {
+    // fetch 在网络层失败（服务未启动/连接被重置）只会抛 TypeError，翻译成可操作的提示
+    throw new ApiError('无法连接本地后端，请确认服务窗口已开启（关闭 start.bat 窗口即停止服务）', 0)
+  }
   const contentType = response.headers.get('content-type') || ''
   let payload = null
   if (contentType.includes('application/json')) {
@@ -924,6 +930,8 @@ const DashboardView = {
         if (action === 'check') {
           showToast(result.logged_in === true ? `${account.label}登录状态已确认`
             : (result.hint || `${account.label}登录状态尚未确认`), result.logged_in === true ? 'ok' : 'warn')
+        } else if (result && result.ok === false) {
+          showToast(`${account.label}操作失败：${result.error || '未知原因'}`, 'bad')
         } else {
           const labels = { launch: '已启动', login: '已打开登录页', stop: '已停止' }
           showToast(`${account.label}${labels[action]}`, action === 'stop' ? 'info' : 'ok')
@@ -2320,13 +2328,19 @@ const AccountsView = {
     async function accountAction(account, action) {
       busy.value = `${account.key}-${action}`
       try {
-        if (action === 'launch') await apiClient.accounts.launch(account.key)
-        else if (action === 'login') await apiClient.accounts.login(account.key)
-        else if (action === 'check') await apiClient.accounts.check(account.key)
-        else await apiClient.accounts.stop(account.key)
+        let result
+        if (action === 'launch') result = await apiClient.accounts.launch(account.key)
+        else if (action === 'login') result = await apiClient.accounts.login(account.key)
+        else if (action === 'check') result = await apiClient.accounts.check(account.key)
+        else result = await apiClient.accounts.stop(account.key)
         await refreshAccounts()
         const labels = { launch: '已启动', login: '已打开登录页', check: '登录态检测完成', stop: '已停止' }
-        showToast(`${account.label}${labels[action]}`, action === 'stop' ? 'info' : 'ok')
+        // 后端返回 ok:false 表示操作未真正完成（如 CDP 未就绪），如实提示而不是谎报成功
+        if (action !== 'check' && result && result.ok === false) {
+          showToast(`${account.label}操作失败：${result.error || '未知原因'}`, 'bad')
+        } else {
+          showToast(`${account.label}${labels[action]}`, action === 'stop' ? 'info' : 'ok')
+        }
       } catch (error) {
         showToast(`${account.label}操作失败：${error.message}`, 'bad')
       } finally { busy.value = '' }

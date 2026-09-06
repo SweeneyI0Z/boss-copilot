@@ -129,9 +129,12 @@ class PauseSignalRoutingTests(unittest.TestCase):
 
     def test_dead_process_returns_false_without_side_effect(self):
         dead = FakeProcess(returncode=0)
-        self.assertFalse(collector._signal_process(dead, signal.SIGSTOP))
+        # Windows 无 SIGSTOP/SIGCONT，用暂停/恢复哨兵验证同一“已死进程不动手”语义
+        pause = collector._SIG_PAUSE if os.name == "nt" else signal.SIGSTOP
+        resume = collector._SIG_RESUME if os.name == "nt" else signal.SIGCONT
+        self.assertFalse(collector._signal_process(dead, pause))
         self.assertEqual(dead.sent, [])
-        self.assertFalse(collector._signal_process(None, signal.SIGSTOP))
+        self.assertFalse(collector._signal_process(None, resume))
 
     def test_windows_routing_maps_sentinels_to_suspend_resume(self):
         suspended_flags = []
